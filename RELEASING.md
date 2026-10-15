@@ -74,6 +74,17 @@ Branch from the tag, fix, bump the patch version, add a CHANGELOG section,
 and dispatch the workflow on that branch. The release commit and tag land on
 the hotfix branch; merge it forward afterwards.
 
+### Letro iOS hotfixes
+
+For an iOS-only hotfix, run the release workflow with `dry_run` checked and
+validate its `release-v<version>` artifact. Copy that artifact's generated
+`Package.swift` and `Sources/MatrixRtc` into the release branch, checking that
+the manifest points at `p-num/matrix-rust-rtc` and its checksum matches the
+archive. Commit and tag those exact files, then attach the tested xcframework
+zip and its checksum to that tag's GitHub prerelease. Record the workflow run
+and source commit in the release notes. Do not rebuild between validation and
+publication; leave Android remote publication disabled for an iOS-only release.
+
 ## Local equivalents
 
 ```bash
