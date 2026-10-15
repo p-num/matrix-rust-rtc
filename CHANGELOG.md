@@ -8,6 +8,12 @@ log only.
 
 ## Unreleased
 
+## v0.5.0-rc.4-letro.1 - 2026-10-15
+
+### Fixed
+
+- Update rustls to 0.23.46 for the native media transport.
+
 ## v0.5.0-rc.4 - 2026-10-13
 
 ### Breaking
