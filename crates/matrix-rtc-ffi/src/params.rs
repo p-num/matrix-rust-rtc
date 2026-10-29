@@ -94,6 +94,10 @@ pub struct FfiJoinSessionParams {
     /// room-wide call, `room`.
     #[uniffi(default = None)]
     pub application_slot_id: Option<String>,
+    /// The membership's `m.call.intent`, independently of whether this join
+    /// sends a notification. Quiet joins must advertise their media intent too.
+    #[uniffi(default = None)]
+    pub call_intent: Option<String>,
     /// What the join publishes on, if anything. Usually
     /// [`FfiJoinTransport::Advertised`].
     pub transport: FfiJoinTransport,
@@ -220,13 +224,14 @@ impl FfiJoinSessionParams {
         };
 
         format!(
-            "[slot {}] transport={} keep_alive={:?}ms encryption={} notify={:?}",
+            "[slot {}] transport={} keep_alive={:?}ms encryption={} intent={:?} notify={:?}",
             self.application_slot_id
                 .as_deref()
                 .unwrap_or(matrix_rtc_core::ROOM_APPLICATION_SLOT_ID),
             transport,
             self.keep_alive_timeout_ms,
             self.encryption_config.is_some(),
+            self.call_intent,
             self.notify.as_ref().map(|notify| notify.notification_type),
         )
     }
@@ -247,6 +252,19 @@ impl FfiJoinSessionParams {
         join.keep_alive_timeout_ms = self.keep_alive_timeout_ms;
         join.sticky_duration_ms = self.sticky_duration_ms;
         join.degraded_lifetime_ms = self.degraded_lifetime_ms;
+        // Older hosts stated intent only on starts. Quiet joins must carry it
+        // explicitly; changing notification policy would ring existing callers.
+        let intent = self.call_intent.or_else(|| {
+            self.notify
+                .as_ref()
+                .and_then(|notify| notify.intent.clone())
+        });
+        if let Some(intent) = intent {
+            join.application.extra.insert(
+                "m.call.intent".to_owned(),
+                serde_json::Value::String(intent),
+            );
+        }
         options.notify = self.notify.map(Into::into);
         options.reactions = self.reactions.map(Into::into);
         options

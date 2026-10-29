@@ -116,11 +116,8 @@ const ROOM_CALL_ID: &str = crate::ROOM_APPLICATION_SLOT_ID;
 /// SDK's own default. Ruma makes the field required; old builds omitted it.
 const DEFAULT_EXPIRES_MS: u64 = 4 * 60 * 60 * 1000;
 
-/// The `m.call.intent` to publish when the core supplies none, which is always:
-/// MSC4143 dropped the field, so nothing upstream of here has an opinion.
-///
-/// `audio` and `video` are the two values (ruma's `CallIntent`, snake_case).
-/// `video` because every caller of this crate publishes a camera track.
+/// Preserve the legacy video default for hosts that do not state an intent.
+/// An explicit application intent takes precedence, including audio-only joins.
 const DEFAULT_CALL_INTENT: &str = "video";
 
 /// Wall-clock milliseconds since the Unix epoch.
@@ -594,8 +591,8 @@ impl RoomStateDialect {
         // Required, not optional: this generation validates it and logs
         // "RTC membership has invalid m.call.intent" when it is absent, after
         // which its consensus-intent calculation has nothing to work with. The
-        // core carries no intent of its own (MSC4143 dropped it), so absent
-        // means "we publish video", which is what this crate's callers do.
+        // application intent is optional for newer hosts, so retain video
+        // only as the fallback for older hosts that do not state one.
         if let Some(object) = content.as_object_mut() {
             let intent = spec
                 .pointer("/application/m.call.intent")
@@ -1207,8 +1204,7 @@ mod tests {
     }
 
     /// This generation validates `m.call.intent` and logs
-    /// "RTC membership has invalid m.call.intent" when it is missing — which it
-    /// always was, because the core carries no intent for us to copy.
+    /// "RTC membership has invalid m.call.intent" when it is missing.
     #[test]
     fn a_join_always_states_a_call_intent() {
         let legacy = dialect().member_content(&content(SPEC_JOIN), None);

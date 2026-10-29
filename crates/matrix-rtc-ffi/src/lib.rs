@@ -829,6 +829,7 @@ mod tests {
     fn join_params() -> FfiJoinSessionParams {
         FfiJoinSessionParams {
             application_slot_id: None,
+            call_intent: None,
             transport: FfiJoinTransport::Publish {
                 livekit_service_url: SFU.to_owned(),
             },
@@ -843,6 +844,107 @@ mod tests {
 
     fn no_reason() -> FfiLeaveSessionParams {
         FfiLeaveSessionParams { leave_reason: None }
+    }
+
+    #[test]
+    fn audio_start_advertises_audio_membership_without_changing_notification() {
+        let mut params = join_params();
+        params.notify = Some(FfiNotifyConfig {
+            notification_type: FfiNotificationType::Ring,
+            intent: Some("audio".to_owned()),
+            lifetime_ms: None,
+            mention_user_ids: Vec::new(),
+            mention_room: true,
+        });
+        let options = params.into_call();
+        assert_eq!(
+            options.join.application.extra.get("m.call.intent"),
+            Some(&serde_json::json!("audio"))
+        );
+        assert_eq!(options.notify.unwrap().intent.as_deref(), Some("audio"));
+    }
+
+    #[tokio::test]
+    async fn quiet_joins_publish_the_selected_intent_in_every_membership_format() {
+        for format in [
+            FfiMembershipFormat::Current,
+            FfiMembershipFormat::Sticky2025,
+            FfiMembershipFormat::RoomState,
+        ] {
+            for intent in ["audio", "video"] {
+                let mock = MockHost::new();
+                let client = RtcClient::new(mock.clone());
+                let room = open(
+                    &client,
+                    &mock,
+                    Some(format),
+                    false,
+                    vec![open_slot(None)],
+                    Vec::new(),
+                )
+                .await;
+                let call = room
+                    .clone()
+                    .join_call(FfiJoinSessionParams {
+                        call_intent: Some(intent.to_owned()),
+                        ..join_params()
+                    })
+                    .await
+                    .expect("quiet join");
+                let sends = mock.sends();
+                let membership = sends
+                    .iter()
+                    .find(|send| {
+                        matches!(send.carrier, Carrier::Sticky | Carrier::State)
+                            && (send.event_type.ends_with("rtc.member")
+                                || send.event_type == STATE_MEMBER_EVENT_TYPE)
+                    })
+                    .expect("membership was published");
+                let actual = membership
+                    .content
+                    .get("m.call.intent")
+                    .or_else(|| membership.content.pointer("/application/m.call.intent"));
+                assert_eq!(
+                    actual,
+                    Some(&serde_json::json!(intent)),
+                    "format {format:?}, publication {}",
+                    membership.content
+                );
+                assert!(
+                    !sends
+                        .iter()
+                        .any(|send| send.event_type.contains("notification"))
+                );
+                call.leave(no_reason()).await.expect("leave");
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_membership_intent_does_not_depend_on_notification_intent() {
+        let mut params = join_params();
+        params.call_intent = Some("audio".to_owned());
+        params.notify = Some(FfiNotifyConfig {
+            notification_type: FfiNotificationType::Notification,
+            intent: Some("video".to_owned()),
+            lifetime_ms: None,
+            mention_user_ids: Vec::new(),
+            mention_room: true,
+        });
+        let options = params.into_call();
+        assert_eq!(
+            options.join.application.extra.get("m.call.intent"),
+            Some(&serde_json::json!("audio"))
+        );
+        assert_eq!(options.notify.unwrap().intent.as_deref(), Some("video"));
+        assert!(
+            !join_params()
+                .into_call()
+                .join
+                .application
+                .extra
+                .contains_key("m.call.intent")
+        );
     }
 
     fn beats(mock: &MockHost) -> usize {

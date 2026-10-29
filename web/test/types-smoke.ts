@@ -106,6 +106,8 @@ export async function smoke(
     switch (event.type) {
       case 'key_imported':
         return `${event.member_id}/${event.identity}@${event.key_index}`;
+      case 'own_media_connection_state':
+        return event.degraded ? 'own media reconnecting' : 'own media recovered';
       case 'active_speakers':
         return event.speakers.map((speaker) => speaker.member_id).join(',');
       case 'ended':

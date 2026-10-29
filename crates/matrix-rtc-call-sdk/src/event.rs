@@ -11,8 +11,9 @@
 //! Events reference participants by `member_id` only — obtain frames through
 //! [`CallEngine::remote_track`](crate::engine::CallEngine::remote_track).
 //!
-//! Events are plain data (`Clone + PartialEq`) so they can be broadcast to any
-//! number of subscribers and later cross the FFI boundary unchanged.
+//! Event DTOs decouple call facts from transport SDKs and platform bindings.
+//! They are plain data (`Clone + PartialEq`), broadcast to any number of
+//! subscribers and later passed across the FFI boundary.
 
 use matrix_rtc_core::KeyRejection;
 
@@ -198,8 +199,11 @@ pub enum CallEvent {
     /// membership. It gets no subscription (and could not be decrypted
     /// anyway); surfaced for diagnostics.
     UnknownParticipant { identity: String },
-    /// Media connection health: `degraded` while a transport reconnects.
+    /// Media connection health: `degraded` while any transport reconnects.
     MediaConnectionState { degraded: bool },
+    /// Only our publishing connection is reconnecting; peer-focus failures do not change this.
+    /// This is media health, not Matrix sync or membership health.
+    OwnMediaConnectionState { degraded: bool },
     /// The call is over; no further events follow.
     Ended { reason: EndedReason },
 }

@@ -11,6 +11,7 @@
 //! frames, publishing, and constraints stay in livekit-js.
 //! The shared `CallEngine` still owns roster reconciliation and the
 //! multi-focus connection pool; its actor runs on the JS microtask queue.
+//! Event DTOs decouple the JavaScript surface from transport SDK types.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -463,6 +464,10 @@ enum WasmCallEvent {
     MediaConnectionState {
         degraded: bool,
     },
+    /// Own publishing focus only; Matrix connectivity is a separate concern.
+    OwnMediaConnectionState {
+        degraded: bool,
+    },
     Ended {
         /// `left`, or the transport's disconnect description.
         reason: String,
@@ -598,6 +603,9 @@ impl From<CallEvent> for WasmCallEvent {
             },
             CallEvent::UnknownParticipant { identity } => Self::UnknownParticipant { identity },
             CallEvent::MediaConnectionState { degraded } => Self::MediaConnectionState { degraded },
+            CallEvent::OwnMediaConnectionState { degraded } => {
+                Self::OwnMediaConnectionState { degraded }
+            }
             CallEvent::Ended { reason } => Self::Ended {
                 reason: match reason {
                     EndedReason::Left => "left".to_owned(),

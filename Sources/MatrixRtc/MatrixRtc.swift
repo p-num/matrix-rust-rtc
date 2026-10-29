@@ -5700,6 +5700,11 @@ public struct FfiJoinSessionParams {
      */
     public var applicationSlotId: String?
     /**
+     * The membership's `m.call.intent`, independently of whether this join
+     * sends a notification. Quiet joins must advertise their media intent too.
+     */
+    public var callIntent: String?
+    /**
      * What the join publishes on, if anything. Usually
      * [`FfiJoinTransport::Advertised`].
      */
@@ -5760,6 +5765,10 @@ public struct FfiJoinSessionParams {
          * room-wide call, `room`.
          */applicationSlotId: String? = nil, 
         /**
+         * The membership's `m.call.intent`, independently of whether this join
+         * sends a notification. Quiet joins must advertise their media intent too.
+         */callIntent: String? = nil, 
+        /**
          * What the join publishes on, if anything. Usually
          * [`FfiJoinTransport::Advertised`].
          */transport: FfiJoinTransport, 
@@ -5805,6 +5814,7 @@ public struct FfiJoinSessionParams {
          * Unset is enabled with Element Call's three-second window.
          */reactions: FfiReactionsConfig? = nil) {
         self.applicationSlotId = applicationSlotId
+        self.callIntent = callIntent
         self.transport = transport
         self.keepAliveTimeoutMs = keepAliveTimeoutMs
         self.stickyDurationMs = stickyDurationMs
@@ -5823,6 +5833,9 @@ extension FfiJoinSessionParams: Sendable {}
 extension FfiJoinSessionParams: Equatable, Hashable {
     public static func ==(lhs: FfiJoinSessionParams, rhs: FfiJoinSessionParams) -> Bool {
         if lhs.applicationSlotId != rhs.applicationSlotId {
+            return false
+        }
+        if lhs.callIntent != rhs.callIntent {
             return false
         }
         if lhs.transport != rhs.transport {
@@ -5851,6 +5864,7 @@ extension FfiJoinSessionParams: Equatable, Hashable {
 
     public func hash(into hasher: inout Hasher) {
         hasher.combine(applicationSlotId)
+        hasher.combine(callIntent)
         hasher.combine(transport)
         hasher.combine(keepAliveTimeoutMs)
         hasher.combine(stickyDurationMs)
@@ -5871,6 +5885,7 @@ public struct FfiConverterTypeFfiJoinSessionParams: FfiConverterRustBuffer {
         return
             try FfiJoinSessionParams(
                 applicationSlotId: FfiConverterOptionString.read(from: &buf), 
+                callIntent: FfiConverterOptionString.read(from: &buf), 
                 transport: FfiConverterTypeFfiJoinTransport.read(from: &buf), 
                 keepAliveTimeoutMs: FfiConverterOptionUInt64.read(from: &buf), 
                 stickyDurationMs: FfiConverterOptionUInt64.read(from: &buf), 
@@ -5883,6 +5898,7 @@ public struct FfiConverterTypeFfiJoinSessionParams: FfiConverterRustBuffer {
 
     public static func write(_ value: FfiJoinSessionParams, into buf: inout [UInt8]) {
         FfiConverterOptionString.write(value.applicationSlotId, into: &buf)
+        FfiConverterOptionString.write(value.callIntent, into: &buf)
         FfiConverterTypeFfiJoinTransport.write(value.transport, into: &buf)
         FfiConverterOptionUInt64.write(value.keepAliveTimeoutMs, into: &buf)
         FfiConverterOptionUInt64.write(value.stickyDurationMs, into: &buf)
@@ -9372,6 +9388,12 @@ public enum FfiCallEvent {
     case mediaConnectionState(degraded: Bool
     )
     /**
+     * Only our publishing connection is reconnecting, independent of peer-focus health.
+     * Does not report Matrix sync or membership health.
+     */
+    case ownMediaConnectionState(degraded: Bool
+    )
+    /**
      * The call is over; no further events follow.
      */
     case ended(reason: FfiEndedReason
@@ -9435,7 +9457,10 @@ public struct FfiConverterTypeFfiCallEvent: FfiConverterRustBuffer {
         case 14: return .mediaConnectionState(degraded: try FfiConverterBool.read(from: &buf)
         )
         
-        case 15: return .ended(reason: try FfiConverterTypeFfiEndedReason.read(from: &buf)
+        case 15: return .ownMediaConnectionState(degraded: try FfiConverterBool.read(from: &buf)
+        )
+        
+        case 16: return .ended(reason: try FfiConverterTypeFfiEndedReason.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -9534,8 +9559,13 @@ public struct FfiConverterTypeFfiCallEvent: FfiConverterRustBuffer {
             FfiConverterBool.write(degraded, into: &buf)
             
         
-        case let .ended(reason):
+        case let .ownMediaConnectionState(degraded):
             writeInt(&buf, Int32(15))
+            FfiConverterBool.write(degraded, into: &buf)
+            
+        
+        case let .ended(reason):
+            writeInt(&buf, Int32(16))
             FfiConverterTypeFfiEndedReason.write(reason, into: &buf)
             
         }
