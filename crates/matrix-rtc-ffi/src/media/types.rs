@@ -4,7 +4,8 @@
 // Please see LICENSE in the repository root for full details.
 
 //! FFI DTOs mirroring the transport-agnostic media model, plus the
-//! host-implemented OpenID token provider.
+//! host-implemented OpenID token provider. These DTOs keep platform bindings independent
+//! of transport SDK types.
 
 use std::time::Duration;
 
@@ -683,6 +684,9 @@ pub enum FfiCallEvent {
     UnknownParticipant { identity: String },
     /// Media health: `degraded` while any transport connection reconnects.
     MediaConnectionState { degraded: bool },
+    /// Only our publishing connection is reconnecting, independent of peer-focus health.
+    /// Does not report Matrix sync or membership health.
+    OwnMediaConnectionState { degraded: bool },
     /// The call is over; no further events follow.
     Ended { reason: FfiEndedReason },
 }
@@ -781,6 +785,9 @@ impl FfiCallEvent {
             },
             Event::UnknownParticipant { identity } => Self::UnknownParticipant { identity },
             Event::MediaConnectionState { degraded } => Self::MediaConnectionState { degraded },
+            Event::OwnMediaConnectionState { degraded } => {
+                Self::OwnMediaConnectionState { degraded }
+            }
             Event::Ended { reason } => Self::Ended {
                 reason: match reason {
                     matrix_rtc_call_sdk::EndedReason::Left => FfiEndedReason::Left,

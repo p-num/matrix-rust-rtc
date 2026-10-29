@@ -197,6 +197,29 @@ describe('web media roster over a fake transport delegate', () => {
     expect(streamEvents[1].type).toBe('stream_muted');
     expect(log.rosters.length).toBeGreaterThan(0);
 
+    // The published event separates our own reconnect from an unrelated focus outage.
+    const ownSink = log.sinks[log.connects.findIndex((c) => c.connectionKey === OWN_FOCUS)];
+    const peerSink = log.sinks[log.connects.findIndex((c) => c.connectionKey === PEER_FOCUS)];
+    const ownHealth = () => log.events.filter((event) => event.type === 'own_media_connection_state');
+    const aggregateHealth = () => log.events.filter((event) => event.type === 'media_connection_state');
+    peerSink.reconnecting();
+    await waitFor(() => aggregateHealth().at(-1)?.degraded === true, 'aggregate media degradation');
+    expect(ownHealth()).toEqual([]);
+    ownSink.reconnecting();
+    ownSink.reconnecting();
+    await waitFor(() => ownHealth().length === 1, 'own publishing connection degradation');
+    expect(ownHealth()).toEqual([{ type: 'own_media_connection_state', degraded: true }]);
+    ownSink.reconnected();
+    await waitFor(() => ownHealth().length === 2, 'own publishing connection recovery');
+    expect(ownHealth()).toEqual([
+      { type: 'own_media_connection_state', degraded: true },
+      { type: 'own_media_connection_state', degraded: false },
+    ]);
+    expect(aggregateHealth().at(-1).degraded).toBe(true);
+    peerSink.reconnected();
+    await waitFor(() => aggregateHealth().at(-1)?.degraded === false, 'peer-focus recovery');
+    expect(ownHealth()).toHaveLength(2);
+
     // A transport-level leave is diagnostics, never roster truth.
     sink.remoteLeft(peer.rtc_identity);
     expect(session.participants().length).toBe(3);

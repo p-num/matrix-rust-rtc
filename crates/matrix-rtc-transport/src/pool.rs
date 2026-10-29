@@ -40,7 +40,8 @@
 //! [`PoolMessage`]s from the inbox [`MediaPool::new`] returns, and applies the
 //! [`PoolEvent`]s each call hands back. Owning the ordering is what lets that
 //! actor keep its own state (a roster) consistent with the media, which a pool
-//! running beside it could not. Connects and timers run on
+//! running beside it could not. Pool event DTOs decouple these facts from
+//! transport SDKs and platform bindings. Connects and timers run on
 //! [`matrix_rtc_core::executor`] and report back through the inbox.
 
 use std::collections::{HashMap, HashSet};
@@ -146,6 +147,8 @@ pub enum PoolEvent {
     /// Whether any connection is impaired (reconnecting or failing to
     /// connect). Reported on transitions only.
     Degraded(bool),
+    /// Only the connection we publish on is reconnecting. Independent of peer-focus health.
+    OwnMediaConnectionState { degraded: bool },
     /// The own-focus connection is gone; nothing we publish reaches anyone.
     OwnConnectionLost { message: String },
 }
@@ -1066,14 +1069,28 @@ impl MediaPool {
 
     fn mark_degraded(&mut self, key: &str) {
         let was_clear = self.degraded_keys.is_empty();
-        if self.degraded_keys.insert(key.to_owned()) && was_clear {
+        if !self.degraded_keys.insert(key.to_owned()) {
+            return;
+        }
+        if was_clear {
             self.out.push(PoolEvent::Degraded(true));
+        }
+        if self.pool.get(key).is_some_and(|entry| entry.is_own) {
+            self.out
+                .push(PoolEvent::OwnMediaConnectionState { degraded: true });
         }
     }
 
     fn clear_degraded(&mut self, key: &str) {
-        if self.degraded_keys.remove(key) && self.degraded_keys.is_empty() {
+        if !self.degraded_keys.remove(key) {
+            return;
+        }
+        if self.degraded_keys.is_empty() {
             self.out.push(PoolEvent::Degraded(false));
+        }
+        if self.pool.get(key).is_some_and(|entry| entry.is_own) {
+            self.out
+                .push(PoolEvent::OwnMediaConnectionState { degraded: false });
         }
     }
 }

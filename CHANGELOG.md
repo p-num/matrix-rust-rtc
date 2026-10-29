@@ -8,6 +8,13 @@ log only.
 
 ## Unreleased
 
+## v0.5.0-rc.4-letro.2 - 2026-10-29
+
+### Fixed
+
+- Preserve voice/video membership intent independently of ringing on native joins (p-num/element-x-ios#316).
+- Report the native publishing connection's recovery independently of peer-focus outages (p-num/element-x-ios#316).
+
 ## v0.5.0-rc.4-letro.1 - 2026-10-15
 
 ### Fixed

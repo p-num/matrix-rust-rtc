@@ -334,6 +334,104 @@ async fn transport_events_are_reported_per_member() {
     );
 }
 
+#[tokio::test]
+async fn own_reconnect_health_is_deduplicated_separately_from_the_aggregate() {
+    let mut fx = Fixture::new();
+    let own = fx.adopt();
+    own.send(ConnectionEvent::Reconnecting).unwrap();
+    own.send(ConnectionEvent::Reconnecting).unwrap();
+    own.send(ConnectionEvent::Reconnected).unwrap();
+    own.send(ConnectionEvent::Reconnected).unwrap();
+    assert_eq!(
+        fx.drain().await,
+        vec![
+            PoolEvent::Degraded(true),
+            PoolEvent::OwnMediaConnectionState { degraded: true },
+            PoolEvent::Degraded(false),
+            PoolEvent::OwnMediaConnectionState { degraded: false },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn own_media_can_recover_while_a_peer_focus_is_still_degraded() {
+    let mut fx = Fixture::new();
+    let own = fx.adopt();
+    fx.pool
+        .apply_snapshot(&[member_on("own", OWN_FOCUS), member_on("carol", PEER_FOCUS)]);
+    fx.drain().await;
+    let peer = fx.sender(PEER_FOCUS);
+
+    // Remote trouble changes only aggregate health, not our publishing connection.
+    peer.send(ConnectionEvent::Reconnecting).unwrap();
+    peer.send(ConnectionEvent::Reconnecting).unwrap();
+    assert_eq!(fx.drain().await, vec![PoolEvent::Degraded(true)]);
+
+    // Our transitions must still be visible while aggregate health stays degraded.
+    own.send(ConnectionEvent::Reconnecting).unwrap();
+    assert_eq!(
+        fx.drain().await,
+        vec![PoolEvent::OwnMediaConnectionState { degraded: true }]
+    );
+    own.send(ConnectionEvent::Reconnected).unwrap();
+    assert_eq!(
+        fx.drain().await,
+        vec![PoolEvent::OwnMediaConnectionState { degraded: false }]
+    );
+    peer.send(ConnectionEvent::Reconnected).unwrap();
+    assert_eq!(fx.drain().await, vec![PoolEvent::Degraded(false)]);
+}
+
+#[tokio::test]
+async fn replaced_connection_events_cannot_change_the_current_own_media_health() {
+    let mut fx = Fixture::new();
+    let _old = fx.adopt();
+    let old_generation = fx.pool.connection_generation;
+    let current = fx.adopt();
+
+    let stale = |event| {
+        PoolMessage(Message::Connection {
+            connection_key: OWN_FOCUS.to_owned(),
+            generation: old_generation,
+            event,
+        })
+    };
+    assert!(
+        fx.pool
+            .handle(stale(ConnectionEvent::Reconnecting))
+            .is_empty()
+    );
+    current.send(ConnectionEvent::Reconnecting).unwrap();
+    assert_eq!(
+        fx.drain().await,
+        vec![
+            PoolEvent::Degraded(true),
+            PoolEvent::OwnMediaConnectionState { degraded: true },
+        ]
+    );
+    assert!(
+        fx.pool
+            .handle(stale(ConnectionEvent::Reconnected))
+            .is_empty()
+    );
+    assert!(
+        fx.pool
+            .handle(stale(ConnectionEvent::Closed {
+                message: "old connection".to_owned(),
+            }))
+            .is_empty()
+    );
+    assert!(fx.pool.own_connection().is_some());
+    current.send(ConnectionEvent::Reconnected).unwrap();
+    assert_eq!(
+        fx.drain().await,
+        vec![
+            PoolEvent::Degraded(false),
+            PoolEvent::OwnMediaConnectionState { degraded: false },
+        ]
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_peer_focus_is_connected_and_reconnected_when_it_drops() {
     let mut fx = Fixture::new();

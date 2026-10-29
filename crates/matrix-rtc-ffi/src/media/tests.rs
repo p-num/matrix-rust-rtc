@@ -18,14 +18,32 @@ use std::sync::Arc;
 
 use super::session::{MediaSessionConfig, connect_media_session};
 use super::types::{
-    FfiLocalState, FfiMediaConstraints, FfiQualityLimitation, FfiSendStats, FfiStreamKind,
-    FfiStreamRef, FfiTileId, FfiTileRoster, FfiVideoDetail, zip_stream_stats,
+    FfiCallEvent, FfiLocalState, FfiMediaConstraints, FfiQualityLimitation, FfiSendStats,
+    FfiStreamKind, FfiStreamRef, FfiTileId, FfiTileRoster, FfiVideoDetail, zip_stream_stats,
 };
 use super::{MediaFfiError, runtime};
 
 /// TCP port 9 (discard) is reliably closed on dev machines: connections are
 /// refused immediately, keeping the failure path fast.
 const DEAD_SFU_URL: &str = "http://127.0.0.1:9";
+
+#[test]
+fn own_media_connection_health_is_distinct_from_aggregate_health_over_ffi() {
+    for degraded in [true, false] {
+        assert!(matches!(
+            FfiCallEvent::relayed(matrix_rtc_call_sdk::CallEvent::OwnMediaConnectionState {
+                degraded,
+            }),
+            Some(FfiCallEvent::OwnMediaConnectionState { degraded: actual }) if actual == degraded
+        ));
+        assert!(matches!(
+            FfiCallEvent::relayed(matrix_rtc_call_sdk::CallEvent::MediaConnectionState {
+                degraded,
+            }),
+            Some(FfiCallEvent::MediaConnectionState { degraded: actual }) if actual == degraded
+        ));
+    }
+}
 
 fn config() -> MediaSessionConfig {
     MediaSessionConfig::default()
@@ -78,6 +96,7 @@ fn joined_call(mock: &Arc<MockHost>, transport: FfiJoinTransport) -> (Arc<RtcRoo
             .clone()
             .join_call(FfiJoinSessionParams {
                 application_slot_id: None,
+                call_intent: None,
                 transport,
                 keep_alive_timeout_ms: None,
                 sticky_duration_ms: None,

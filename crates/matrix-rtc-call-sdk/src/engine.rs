@@ -1023,6 +1023,9 @@ impl Actor {
                 PoolEvent::Degraded(degraded) => {
                     self.emit(CallEvent::MediaConnectionState { degraded });
                 }
+                PoolEvent::OwnMediaConnectionState { degraded } => {
+                    self.emit(CallEvent::OwnMediaConnectionState { degraded });
+                }
                 PoolEvent::OwnConnectionLost { message } => {
                     self.end(EndedReason::ConnectionClosed { message });
                 }
@@ -3139,8 +3142,59 @@ mod tests {
         );
         assert_eq!(
             next_event(&mut fx.events).await,
+            CallEvent::OwnMediaConnectionState { degraded: true }
+        );
+        assert_eq!(
+            next_event(&mut fx.events).await,
             CallEvent::MediaConnectionState { degraded: false }
         );
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::OwnMediaConnectionState { degraded: false }
+        );
+        assert!(matches!(
+            fx.events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn own_media_recovery_is_relayed_without_waiting_for_remote_recovery() {
+        let mut fx = fixture();
+        let own = adopt(&fx);
+        fx.memberships
+            .send(vec![
+                member("own", "@alice:example.org"),
+                member_on("bob", "@bob:example.org", PEER_FOCUS),
+            ])
+            .unwrap();
+        rostered(&fx, &["own", "bob"]).await;
+        wait_until(|| peer_sender(&fx, PEER_FOCUS).is_some()).await;
+        let peer = peer_sender(&fx, PEER_FOCUS).unwrap();
+        peer.send(ConnectionEvent::Reconnecting).unwrap();
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::MediaConnectionState { degraded: true }
+        );
+        own.send(ConnectionEvent::Reconnecting).unwrap();
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::OwnMediaConnectionState { degraded: true }
+        );
+        own.send(ConnectionEvent::Reconnected).unwrap();
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::OwnMediaConnectionState { degraded: false }
+        );
+        peer.send(ConnectionEvent::Reconnected).unwrap();
+        assert_eq!(
+            next_event(&mut fx.events).await,
+            CallEvent::MediaConnectionState { degraded: false }
+        );
+        assert!(matches!(
+            fx.events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test(start_paused = true)]
