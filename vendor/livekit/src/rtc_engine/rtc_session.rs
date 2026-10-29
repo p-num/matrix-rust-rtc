@@ -798,19 +798,20 @@ impl RtcSession {
 
     /// Close the PeerConnections and the SignalClient
     pub async fn close(&self, reason: DisconnectReason) {
-        // Close the tasks
         let handle = self.handle.lock().take();
-        if let Some(handle) = handle {
+        if let Some(handle) = &handle {
             let _ = handle.close_tx.send(true);
+        }
+
+        // Mark terminal, stop both PCs and cancel signal waits before joining
+        // an event worker that may itself be awaiting reconnect signaling.
+        self.inner.close(reason).await;
+        if let Some(handle) = handle {
             let _ = handle.rtc_task.await;
             let _ = handle.signal_task.await;
             let _ = handle.dc_task.await;
             let _ = handle.dt_sender_task.await;
         }
-
-        // Close the PeerConnections after the task
-        // So if a sensitive operation is running, we can wait for it
-        self.inner.close(reason).await;
     }
 
     pub async fn publish_data(
@@ -1924,6 +1925,11 @@ impl SessionInner {
         self.closed.store(true, Ordering::Release);
         self.pc_state_notify.notify_waiters();
 
+        self.publisher_pc.close();
+        if let Some(ref sub_pc) = self.subscriber_pc {
+            sub_pc.close();
+        }
+
         self.signal_client
             .send(proto::signal_request::Message::Leave(proto::LeaveRequest {
                 action: proto::leave_request::Action::Disconnect.into(),
@@ -1933,10 +1939,6 @@ impl SessionInner {
             .await;
 
         self.signal_client.close().await;
-        self.publisher_pc.close();
-        if let Some(ref sub_pc) = self.subscriber_pc {
-            sub_pc.close();
-        }
     }
 
     async fn simulate_scenario(self: &Arc<Self>, scenario: SimulateScenario) -> EngineResult<()> {

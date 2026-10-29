@@ -356,7 +356,7 @@ impl Fixture {
         self.event_task.abort();
         let absent = delete_private_room(&self.admin, &self.room).await;
         if let Some(proxy) = &mut self.proxy {
-            proxy.shutdown().await;
+            disposed &= proxy.shutdown().await;
         }
         ensure!(
             first_close && owners && second_close && disposed && absent,
@@ -505,7 +505,6 @@ async fn close_resuming(fixture: &Fixture) -> Result<()> {
         held_at.elapsed() < Duration::from_secs(3),
         "resume response hold exceeded the cancellation window"
     );
-    proxy.release();
     timeout(LIMIT, close)
         .await
         .context("engine close during resume timed out")?
@@ -513,5 +512,9 @@ async fn close_resuming(fixture: &Fixture) -> Result<()> {
     fixture.owners_done().await?;
     fixture.absent().await?;
     proxy.closed().await?;
-    fixture.no_installed_task()
+    fixture.no_installed_task()?;
+    // Cancellation must dispose its admitted stream without receiving the
+    // held response; releasing fixture bytes cannot manufacture cleanup.
+    proxy.release();
+    Ok(())
 }

@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Routes signaling while preserving the distinction between transport recovery
+//! and terminal Leave. Protocol DTOs stay inside this API boundary.
+
 use std::{
     borrow::Cow,
     fmt::Debug,
@@ -31,7 +34,7 @@ use livekit_runtime::{interval, sleep, Instant, JoinHandle};
 use parking_lot::Mutex;
 use prost::Message;
 use thiserror::Error;
-use tokio::sync::{mpsc, Mutex as AsyncMutex, RwLock as AsyncRwLock};
+use tokio::sync::{mpsc, watch, Mutex as AsyncMutex, RwLock as AsyncRwLock};
 
 #[cfg(feature = "signal-client-tokio")]
 use tokio_tungstenite::tungstenite::Error as WsError;
@@ -166,6 +169,7 @@ struct SignalInner {
     stream: AsyncRwLock<Option<SignalStream>>,
     token: Mutex<String>, // Token can be refreshed
     reconnecting: AtomicBool,
+    terminal: watch::Sender<Option<proto::LeaveRequest>>,
     queue: AsyncMutex<Vec<proto::signal_request::Message>>,
     url: String,
     options: SignalOptions,
@@ -243,17 +247,26 @@ impl SignalClient {
     /// has fully recovered (PC connected, SyncState sent) to drain the queue and
     /// re-enable normal sends.
     pub async fn restart(&self) -> SignalResult<proto::ReconnectResponse> {
+        if self.inner.is_terminal() {
+            return Err(SignalError::SendError);
+        }
         self.close().await;
 
         let (reconnect_response, stream_events) = self.inner.restart().await?;
-        let signal_task = livekit_runtime::spawn(signal_task(
-            self.inner.clone(),
-            self.emitter.clone(),
-            stream_events,
-        ));
-
-        *self.handle.lock() = Some(signal_task);
-        Ok(reconnect_response)
+        {
+            let mut handle = self.handle.lock();
+            if !self.inner.is_terminal() {
+                let signal_task = livekit_runtime::spawn(signal_task(
+                    self.inner.clone(),
+                    self.emitter.clone(),
+                    stream_events,
+                ));
+                *handle = Some(signal_task);
+                return Ok(reconnect_response);
+            }
+        }
+        self.inner.close(true).await;
+        Err(SignalError::SendError)
     }
 
     /// Mark the signal as fully reconnected: drains the queue and clears the
@@ -323,7 +336,11 @@ impl SignalClient {
     /// resume the flag is true even after the new stream has been installed,
     /// and we want this check to return `true` in that case.
     pub async fn is_connected(&self) -> bool {
-        self.inner.stream.read().await.is_some()
+        tokio::select! {
+            biased;
+            _ = self.inner.terminated() => false,
+            stream = self.inner.stream.read() => stream.is_some(),
+        }
     }
 }
 
@@ -407,6 +424,7 @@ impl SignalInner {
             stream: AsyncRwLock::new(Some(stream)),
             token: Mutex::new(token.to_owned()),
             reconnecting: AtomicBool::new(false),
+            terminal: watch::channel(None).0,
             queue: Default::default(),
             options,
             url: url.to_string(),
@@ -470,12 +488,19 @@ impl SignalInner {
         proto::ReconnectResponse,
         mpsc::UnboundedReceiver<Box<proto::signal_response::Message>>,
     )> {
+        if self.is_terminal() {
+            return Err(SignalError::SendError);
+        }
         // Set reconnecting BEFORE we touch the stream, so concurrent `send` calls
         // see the right state and route queueable messages to the queue (rather
         // than racing on a brief stream=None / reconnecting=false window).
         self.reconnecting.store(true, Ordering::Release);
 
-        let mut stream_guard = self.stream.write().await;
+        let mut stream_guard = tokio::select! {
+            biased;
+            _ = self.terminated() => return Err(SignalError::SendError),
+            stream = self.stream.write() => stream,
+        };
         if let Some(old_stream) = stream_guard.take() {
             old_stream.close(false).await;
         }
@@ -493,34 +518,58 @@ impl SignalInner {
         )
         .unwrap();
 
-        let result = async {
-            let (new_stream, mut events) =
-                SignalStream::connect(lk_url, &token, self.options.connect_timeout).await?;
-            let reconnect_response = get_reconnect_response(&mut events).await?;
-            SignalResult::Ok((new_stream, reconnect_response, events))
-        }
-        .await;
-
-        match result {
-            Ok((new_stream, reconnect_response, events)) => {
-                *stream_guard = Some(new_stream);
-                drop(stream_guard);
-                // Note: NOT clearing `reconnecting` here. Caller must invoke
-                // `set_reconnected()` after the resume has fully recovered.
-                Ok((reconnect_response, events))
-            }
-            Err(err) => {
-                // Connect / get_reconnect_response failed. Stream slot stays None.
-                // Reset the flag so the next reconnect attempt can re-enter.
-                drop(stream_guard);
+        // SignalStream spawns I/O only in the final, non-suspending part of
+        // connect. Before it returns, cancellation owns just the socket future;
+        // afterwards this scope explicitly closes and joins the exact stream.
+        // The engine retains this whole resume attempt until cleanup finishes.
+        // Arbitrary caller cancellation instead uses receiver-loss shutdown;
+        // it requests I/O termination without promising a synchronous join.
+        let connected = tokio::select! {
+            biased;
+            _ = self.terminated() => return Err(SignalError::SendError),
+            connected = SignalStream::connect(lk_url, &token, self.options.connect_timeout) => connected,
+        };
+        let (new_stream, mut events) = match connected {
+            Ok(connected) => connected,
+            Err(error) => {
                 self.reconnecting.store(false, Ordering::Release);
-                Err(err)
+                return Err(error);
+            }
+        };
+        let response = tokio::select! {
+            biased;
+            _ = self.terminated() => Err(SignalError::SendError),
+            response = get_reconnect_response(&mut events) => response,
+        };
+        let reconnect_response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                drop(stream_guard);
+                self.dispose_stream(new_stream).await;
+                self.reconnecting.store(false, Ordering::Release);
+                return Err(error);
+            }
+        };
+
+        // Holding the watch read guard seals this synchronous installation
+        // against the terminal sender. No watch guard survives an await.
+        {
+            let terminal = self.terminal.borrow();
+            if terminal.is_none() {
+                *stream_guard = Some(new_stream);
+                return Ok((reconnect_response, events));
             }
         }
+        drop(stream_guard);
+        self.dispose_stream(new_stream).await;
+        Err(SignalError::SendError)
     }
 
     /// See [`SignalClient::set_reconnected`].
     pub async fn set_reconnected(&self) {
+        if self.is_terminal() {
+            return;
+        }
         // Order: clear the flag FIRST, then flush. This way any sends that race
         // with the flush see `reconnecting=false` and go through the normal path
         // (which itself flushes the queue), and we don't have queueable sends
@@ -531,7 +580,11 @@ impl SignalInner {
 
     /// Close the connection
     pub async fn close(&self, notify_close: bool) {
-        if let Some(stream) = self.stream.write().await.take() {
+        // Terminal intent interrupts read-owned sends and constructor waits,
+        // but must not cancel this queued writer. Close retains ownership until
+        // it can take and join any stream still installed behind those readers.
+        let stream = self.stream.write().await.take();
+        if let Some(stream) = stream {
             stream.close(notify_close).await;
         }
     }
@@ -544,6 +597,29 @@ impl SignalInner {
     /// - Queueable signals are accumulated in the queue and drained by
     ///   [`Self::set_reconnected`] after the resume has fully recovered.
     pub async fn send(&self, signal: proto::signal_request::Message) {
+        if let proto::signal_request::Message::Leave(leave) = &signal {
+            if leave.action() == proto::leave_request::Action::Disconnect {
+                self.terminal.send_if_modified(|terminal| {
+                    if terminal.is_some() {
+                        return false;
+                    }
+                    *terminal = Some(leave.clone());
+                    true
+                });
+                // Never wait behind a constructor to establish terminal intent.
+                // That constructor observes the same watch and disposes its
+                // exact candidate. A missing old stream is not resumed for Leave.
+                if let Ok(stream) = self.stream.try_read() {
+                    if let Some(stream) = stream.as_ref() {
+                        let _ = stream.send(signal).await;
+                    }
+                }
+                return;
+            }
+        }
+        if self.is_terminal() {
+            return;
+        }
         let pass_through = is_pass_through(&signal);
         let reconnecting = self.reconnecting.load(Ordering::Acquire);
 
@@ -563,8 +639,18 @@ impl SignalInner {
         // until the new stream is installed, so this awaits and then writes via
         // the new stream. Same code path for the steady-state send — the lock is
         // free and we send immediately.
-        if let Some(stream) = self.stream.read().await.as_ref() {
-            if let Err(SignalError::SendError) = stream.send(signal.clone()).await {
+        let stream = tokio::select! {
+            biased;
+            _ = self.terminated() => return,
+            stream = self.stream.read() => stream,
+        };
+        if let Some(stream) = stream.as_ref() {
+            let sent = tokio::select! {
+                biased;
+                _ = self.terminated() => return,
+                sent = stream.send(signal.clone()) => sent,
+            };
+            if let Err(SignalError::SendError) = sent {
                 if !pass_through {
                     self.queue.lock().await.push(signal);
                 } else {
@@ -580,20 +666,53 @@ impl SignalInner {
     }
 
     pub async fn flush_queue(&self) {
-        let mut queue = self.queue.lock().await;
+        let mut queue = tokio::select! {
+            biased;
+            _ = self.terminated() => return,
+            queue = self.queue.lock() => queue,
+        };
         if queue.is_empty() {
             return;
         }
 
-        if let Some(stream) = self.stream.read().await.as_ref() {
+        let stream = tokio::select! {
+            biased;
+            _ = self.terminated() => return,
+            stream = self.stream.read() => stream,
+        };
+        if let Some(stream) = stream.as_ref() {
             for signal in queue.drain(..) {
                 // log::warn!("sending queued signal: {:?}", signal);
 
-                if let Err(err) = stream.send(signal).await {
+                let sent = tokio::select! {
+                    biased;
+                    _ = self.terminated() => return,
+                    sent = stream.send(signal) => sent,
+                };
+                if let Err(err) = sent {
                     log::error!("failed to send queued signal: {}", err); // Lost message
                 }
             }
         }
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.terminal.borrow().is_some()
+    }
+
+    async fn terminated(&self) {
+        let mut terminal = self.terminal.subscribe();
+        let _ = terminal.wait_for(Option::is_some).await;
+    }
+
+    async fn dispose_stream(&self, stream: SignalStream) {
+        let leave = self.terminal.borrow().clone();
+        if let Some(leave) = leave {
+            let _ = stream
+                .send(proto::signal_request::Message::Leave(leave))
+                .await;
+        }
+        stream.close(true).await;
     }
 
     /// Increment request_id for user-initiated requests and [`RequestResponse`][`proto::RequestResponse`]s
@@ -989,6 +1108,7 @@ mod tests {
             stream: AsyncRwLock::new(None),
             token: Mutex::new(String::new()),
             reconnecting: AtomicBool::new(false),
+            terminal: watch::channel(None).0,
             queue: Default::default(),
             url: "wss://localhost:7880".to_string(),
             options: SignalOptions::default(),
@@ -996,6 +1116,52 @@ mod tests {
             request_id: AtomicU32::new(1),
             single_pc_mode_active: false,
         })
+    }
+
+    #[cfg(feature = "signal-client-tokio")]
+    #[tokio::test]
+    async fn terminal_leave_does_not_wait_for_reconnect_stream_lock() {
+        let inner = make_stub_inner();
+        let _connecting = inner.stream.write().await;
+        let sender = inner.clone();
+        let mut leave = tokio::spawn(async move {
+            sender.send(proto::signal_request::Message::Leave(proto::LeaveRequest {
+                action: proto::leave_request::Action::Disconnect.into(),
+                ..Default::default()
+            })).await;
+        });
+        let finished = tokio::time::timeout(Duration::from_millis(100), &mut leave).await;
+        if finished.is_err() {
+            leave.abort();
+            let _ = leave.await;
+        }
+        assert!(matches!(finished, Ok(Ok(()))), "terminal Leave blocked behind a reconnect");
+        assert!(inner.is_terminal());
+        assert!(matches!(inner.restart().await, Err(SignalError::SendError)));
+    }
+
+    #[cfg(feature = "signal-client-tokio")]
+    #[tokio::test]
+    async fn terminal_leave_interrupts_a_blocked_pass_through_send() {
+        let inner = make_stub_inner();
+        let _connecting = inner.stream.write().await;
+        let sender = inner.clone();
+        let mut offer = tokio::spawn(async move {
+            sender.send(proto::signal_request::Message::Offer(
+                proto::SessionDescription::default(),
+            )).await;
+        });
+        tokio::task::yield_now().await;
+        inner.send(proto::signal_request::Message::Leave(proto::LeaveRequest {
+            action: proto::leave_request::Action::Disconnect.into(),
+            ..Default::default()
+        })).await;
+        let finished = tokio::time::timeout(Duration::from_millis(100), &mut offer).await;
+        if finished.is_err() {
+            offer.abort();
+            let _ = offer.await;
+        }
+        assert!(matches!(finished, Ok(Ok(()))), "blocked Offer did not observe terminal Leave");
     }
 
     #[cfg(feature = "signal-client-tokio")]

@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Coordinates room state and participant events over the owned RTC engine.
+//! Terminal close seals recovery state before the room's workers are stopped.
+
 pub use crate::utils::take_cell::TakeCell;
 use bmrng::unbounded::UnboundedRequestReceiver;
 use futures_util::{Stream, StreamExt};
@@ -37,7 +40,7 @@ use livekit_runtime::JoinHandle;
 use parking_lot::RwLock;
 pub use proto::DisconnectReason;
 use proto::SignalTarget;
-use std::{collections::HashMap, fmt::Debug, sync::Arc, time::Duration};
+use std::{collections::HashMap, fmt::Debug, sync::{Arc, atomic::{AtomicBool, Ordering}}, time::Duration};
 use thiserror::Error;
 use tokio::sync::{
     broadcast,
@@ -486,6 +489,11 @@ pub(crate) struct RoomSession {
     rtc_engine: Arc<RtcEngine>,
     sid_promise: Promise<RoomSid>,
     info: RwLock<RoomInfo>,
+    // Correctness checks and the terminal store serialize under info.write().
+    // Outside reads only skip recovery work before that final checked boundary.
+    closing: AtomicBool,
+    #[cfg(all(test, feature = "__lk-e2e-test"))]
+    restart_jobs_scheduled: std::sync::atomic::AtomicUsize,
     dispatcher: Dispatcher<RoomEvent>,
     options: RoomOptions,
     active_speakers: RwLock<Vec<Participant>>,
@@ -701,6 +709,9 @@ impl Room {
                 reliable_dc_options: Default::default(),
             }),
             remote_participants: Default::default(),
+            closing: AtomicBool::new(false),
+            #[cfg(all(test, feature = "__lk-e2e-test"))]
+            restart_jobs_scheduled: Default::default(),
             active_speakers: Default::default(),
             options: options.clone(),
             rtc_engine: rtc_engine.clone(),
@@ -820,6 +831,40 @@ impl Room {
 
     pub async fn close(&self) -> RoomResult<()> {
         self.inner.close(DisconnectReason::ClientInitiated).await
+    }
+
+    #[cfg(all(test, feature = "__lk-e2e-test"))]
+    pub(crate) async fn probe_closed_engine_for_test(&self) -> RoomResult<()> {
+        self.inner
+            .rtc_engine
+            .probe_closed_reconnection_for_test()
+            .await?;
+        Ok(())
+    }
+
+    #[cfg(all(test, feature = "__lk-e2e-test"))]
+    pub(crate) fn probe_closed_recovery_for_test(&self) -> RoomResult<()> {
+        let mut events = self.subscribe();
+        let before = self.inner.restart_jobs_scheduled.load(Ordering::Acquire);
+        let (tx, mut resuming) = oneshot::channel();
+        self.inner.handle_resuming(tx);
+        let (tx, mut resumed) = oneshot::channel();
+        self.inner.handle_resumed(tx);
+        let (tx, mut restarting) = oneshot::channel();
+        self.inner.handle_restarting(tx);
+        let (tx, mut restarted) = oneshot::channel();
+        self.inner.handle_restarted(tx);
+        if resuming.try_recv().is_err() || resumed.try_recv().is_err()
+            || restarting.try_recv().is_err() || restarted.try_recv().is_err() {
+            return Err(RoomError::Internal("late recovery handler lost its acknowledgement".into()));
+        }
+        if self.connection_state() != ConnectionState::Disconnected || events.try_recv().is_ok() {
+            return Err(RoomError::Internal("late recovery resurrected a completed Room.close".into()));
+        }
+        if self.inner.restart_jobs_scheduled.load(Ordering::Acquire) != before {
+            return Err(RoomError::Internal("late Restarted scheduled republishing after close".into()));
+        }
+        Ok(())
     }
 
     pub async fn close_with_reason(&self, reason: DisconnectReason) -> RoomResult<()> {
@@ -1094,6 +1139,10 @@ impl RoomSession {
 
     async fn close(&self, reason: DisconnectReason) -> RoomResult<()> {
         let Some(handle) = self.handle.lock().await.take() else { Err(RoomError::AlreadyClosed)? };
+        {
+            let _info = self.info.write();
+            self.closing.store(true, Ordering::Release);
+        }
 
         // remove published tracks
         for (sid, _) in self.local_participant.track_publications().iter() {
@@ -1112,6 +1161,9 @@ impl RoomSession {
         let _ = handle.remote_dt_task.await;
         let _ = handle.room_handle.await;
 
+        // Engine Disconnected may lose the room-task select to close_rx. Close
+        // itself owns the final state/event before dropping all subscribers.
+        self.finish_disconnected(reason);
         self.dispatcher.clear();
         Ok(())
     }
@@ -1121,6 +1173,9 @@ impl RoomSession {
     /// Returns true if the state changed
     fn update_connection_state(&self, state: ConnectionState) -> bool {
         let mut info = self.info.write();
+        if self.closing.load(Ordering::Acquire) && state != ConnectionState::Disconnected {
+            return false;
+        }
         if info.state == state {
             return false;
         }
@@ -1543,18 +1598,14 @@ impl RoomSession {
     }
 
     fn handle_resuming(self: &Arc<Self>, tx: oneshot::Sender<()>) {
-        if self.update_connection_state(ConnectionState::Reconnecting) {
-            self.dispatcher.dispatch(&RoomEvent::Reconnecting);
-        }
-
+        self.begin_recovery();
         let _ = tx.send(());
     }
 
     fn handle_resumed(self: &Arc<Self>, tx: oneshot::Sender<()>) {
-        self.update_connection_state(ConnectionState::Connected);
-        self.dispatcher.dispatch(&RoomEvent::Reconnected);
-
+        let recovered = self.finish_recovery();
         let _ = tx.send(());
+        if !recovered { return; }
 
         let local_participant = self.local_participant.clone();
         livekit_runtime::spawn(async move {
@@ -1580,21 +1631,20 @@ impl RoomSession {
     }
 
     fn handle_restarting(self: &Arc<Self>, tx: oneshot::Sender<()>) {
+        if self.closing.load(Ordering::Acquire) { let _ = tx.send(()); return; }
         // Remove existing participants/subscriptions on full reconnect
         let participants = self.remote_participants.read().clone();
         for (_, participant) in participants.iter() {
             self.clone().handle_participant_disconnect(participant.clone());
         }
 
-        if self.update_connection_state(ConnectionState::Reconnecting) {
-            self.dispatcher.dispatch(&RoomEvent::Reconnecting);
-        }
-
+        self.begin_recovery();
         let _ = tx.send(());
     }
 
     fn handle_restarted(self: &Arc<Self>, tx: oneshot::Sender<()>) {
         let _ = tx.send(());
+        if self.closing.load(Ordering::Acquire) { return; }
 
         // Ensure the SFU knows about existing data track publications.
         _ = self.local_dt_input.send(dt::local::InputEvent::RepublishTracks);
@@ -1611,13 +1661,17 @@ impl RoomSession {
 
         // Spawining a new task because we need to wait for the RtcEngine to close the reconnection
         // lock.
+        #[cfg(all(test, feature = "__lk-e2e-test"))]
+        self.restart_jobs_scheduled.fetch_add(1, Ordering::AcqRel);
         livekit_runtime::spawn({
             let session = self.clone();
             async move {
+                if session.closing.load(Ordering::Acquire) { return; }
                 let mut set = tokio::task::JoinSet::new();
 
                 for (_, publication) in published_tracks {
-                    let track = publication.track().unwrap();
+                    if session.closing.load(Ordering::Acquire) { break; }
+                    let Some(track) = publication.track() else { continue; };
 
                     let lp = session.local_participant.clone();
                     let republish_session = session.clone();
@@ -1660,10 +1714,32 @@ impl RoomSession {
 
                 local_participant.update_track_subscription_permissions().await;
 
-                session.update_connection_state(ConnectionState::Connected);
-                session.dispatcher.dispatch(&RoomEvent::Reconnected);
+                session.finish_recovery();
             }
         });
+    }
+
+    fn begin_recovery(&self) {
+        let mut info = self.info.write();
+        if self.closing.load(Ordering::Acquire) || info.state == ConnectionState::Reconnecting {
+            return;
+        }
+        info.state = ConnectionState::Reconnecting;
+        self.dispatcher.dispatch(&RoomEvent::ConnectionStateChanged(ConnectionState::Reconnecting));
+        self.dispatcher.dispatch(&RoomEvent::Reconnecting);
+    }
+
+    fn finish_recovery(&self) -> bool {
+        let mut info = self.info.write();
+        if self.closing.load(Ordering::Acquire) { return false; }
+        if info.state != ConnectionState::Connected {
+            info.state = ConnectionState::Connected;
+            self.dispatcher.dispatch(&RoomEvent::ConnectionStateChanged(ConnectionState::Connected));
+        }
+        // State and its associated event share close's seal; an earlier check
+        // followed by an unlocked dispatch could resurrect the closed room.
+        self.dispatcher.dispatch(&RoomEvent::Reconnected);
+        true
     }
 
     fn handle_signal_restarted(
@@ -1680,9 +1756,7 @@ impl RoomSession {
     }
 
     fn handle_disconnected(self: &Arc<Self>, reason: DisconnectReason) {
-        if self.update_connection_state(ConnectionState::Disconnected) {
-            self.dispatcher.dispatch(&RoomEvent::Disconnected { reason });
-        }
+        self.finish_disconnected(reason);
 
         log::info!("disconnected from room with reason: {:?}", reason);
         if reason != DisconnectReason::ClientInitiated {
@@ -1692,6 +1766,18 @@ impl RoomSession {
                     let _ = inner.close(reason).await;
                 }
             });
+        }
+    }
+
+    fn finish_disconnected(&self, reason: DisconnectReason) {
+        let mut info = self.info.write();
+        // A server-terminal event also seals recovery before its asynchronous
+        // Room.close task starts. It cannot be followed by queued Resumed work.
+        self.closing.store(true, Ordering::Release);
+        if info.state != ConnectionState::Disconnected {
+            info.state = ConnectionState::Disconnected;
+            self.dispatcher.dispatch(&RoomEvent::ConnectionStateChanged(ConnectionState::Disconnected));
+            self.dispatcher.dispatch(&RoomEvent::Disconnected { reason });
         }
     }
 

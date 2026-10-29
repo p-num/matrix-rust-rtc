@@ -13,8 +13,8 @@
 // limitations under the License.
 
 // Locally modified for MatrixRTC signal-stream ownership; see PATCHES.md.
-//! Owns WebSocket I/O while the private signal-event consumer remains alive.
-//! Receiver loss requests closure through the existing writer shutdown path.
+//! Owns WebSocket I/O until its consumer or local transport requests shutdown.
+//! Closing joins both tasks without waiting for the remote close handshake.
 
 use bytes::Bytes;
 use futures_util::{
@@ -26,7 +26,7 @@ use livekit_runtime::{JoinHandle, TcpStream};
 use prost::Message as ProtoMessage;
 use std::{env, io, time::Duration};
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 #[cfg(feature = "signal-client-tokio")]
 use base64;
@@ -71,7 +71,12 @@ enum InternalMessage {
     Pong {
         ping_data: Bytes,
     },
-    Close,
+}
+
+#[derive(Clone, Debug)]
+enum Shutdown {
+    Transport { notify_close: bool },
+    Disconnect(proto::LeaveRequest),
 }
 
 /// SignalStream hold the WebSocket connection
@@ -80,6 +85,9 @@ enum InternalMessage {
 #[derive(Debug)]
 pub(super) struct SignalStream {
     internal_tx: mpsc::Sender<InternalMessage>,
+    shutdown: watch::Sender<Option<Shutdown>>,
+    #[cfg(test)]
+    observed_pings: watch::Receiver<usize>,
     read_handle: JoinHandle<()>,
     write_handle: JoinHandle<()>,
 }
@@ -326,19 +334,45 @@ impl SignalStream {
 
         let (emitter, events) = mpsc::unbounded_channel();
         let (internal_tx, internal_rx) = mpsc::channel::<InternalMessage>(8);
-        let write_handle = livekit_runtime::spawn(Self::write_task(internal_rx, ws_writer));
-        let read_handle =
-            livekit_runtime::spawn(Self::read_task(internal_tx.clone(), ws_reader, emitter));
+        let (shutdown, shutdown_rx) = watch::channel(None);
+        let (reader_done, reader_done_rx) = watch::channel(false);
+        #[cfg(test)]
+        let (observed_pings, observed_pings_rx) = watch::channel(0);
+        let write_handle = livekit_runtime::spawn(Self::write_task(
+            internal_rx,
+            ws_writer,
+            shutdown.clone(),
+            shutdown_rx.clone(),
+            reader_done_rx,
+        ));
+        let read_handle = livekit_runtime::spawn(Self::read_task(
+            internal_tx.clone(),
+            ws_reader,
+            emitter,
+            shutdown.clone(),
+            shutdown_rx,
+            reader_done,
+            #[cfg(test)]
+            observed_pings,
+        ));
 
-        Ok((Self { internal_tx, read_handle, write_handle }, events))
+        Ok((
+            Self {
+                internal_tx,
+                shutdown,
+                #[cfg(test)]
+                observed_pings: observed_pings_rx,
+                read_handle,
+                write_handle,
+            },
+            events,
+        ))
     }
 
     /// Close the websocket
-    /// It sends a CloseFrame to the server before closing
+    /// A responsive writer sends Close; backpressure cannot retain either task.
     pub async fn close(self, notify_close: bool) {
-        if notify_close {
-            let _ = self.internal_tx.send(InternalMessage::Close).await;
-        }
+        request_shutdown(&self.shutdown, Shutdown::Transport { notify_close });
         let _ = self.write_handle.await;
         let _ = self.read_handle.await;
     }
@@ -346,8 +380,20 @@ impl SignalStream {
     /// Send a SignalRequest to the websocket
     /// It also waits for the message to be sent
     pub async fn send(&self, signal: proto::signal_request::Message) -> SignalResult<()> {
+        if let proto::signal_request::Message::Leave(leave) = &signal {
+            if leave.action() == proto::leave_request::Action::Disconnect {
+                request_shutdown(&self.shutdown, Shutdown::Disconnect(leave.clone()));
+                // The writer owns the final best-effort Leave and releases all
+                // pending send acknowledgements before its receiver is dropped.
+                self.internal_tx.closed().await;
+                return Ok(());
+            }
+        }
         let (send, recv) = oneshot::channel();
-        let msg = InternalMessage::Signal { signal, response_chn: send };
+        let msg = InternalMessage::Signal {
+            signal,
+            response_chn: send,
+        };
         let _ = self.internal_tx.send(msg).await;
         recv.await.map_err(|_| SignalError::SendError)?
     }
@@ -357,29 +403,86 @@ impl SignalStream {
     async fn write_task(
         mut internal_rx: mpsc::Receiver<InternalMessage>,
         mut ws_writer: SplitSink<WebSocket, Message>,
+        shutdown: watch::Sender<Option<Shutdown>>,
+        mut shutdown_rx: watch::Receiver<Option<Shutdown>>,
+        mut reader_done: watch::Receiver<bool>,
     ) {
-        while let Some(msg) = internal_rx.recv().await {
+        let mut close = loop {
+            let msg = tokio::select! {
+                biased;
+                close = requested_shutdown(&mut shutdown_rx) => break close,
+                msg = internal_rx.recv() => match msg {
+                    Some(msg) => msg,
+                    None => break Shutdown::Transport { notify_close: true },
+                },
+            };
             match msg {
-                InternalMessage::Signal { signal, response_chn } => {
-                    let data = proto::SignalRequest { message: Some(signal) }.encode_to_vec();
-
-                    if let Err(err) = ws_writer.send(Message::Binary(data.into())).await {
-                        let _ = response_chn.send(Err(err.into()));
-                        break;
+                InternalMessage::Signal {
+                    signal,
+                    response_chn,
+                } => {
+                    let data = proto::SignalRequest {
+                        message: Some(signal),
                     }
-
-                    let _ = response_chn.send(Ok(()));
+                    .encode_to_vec();
+                    let result = tokio::select! {
+                        biased;
+                        close = requested_shutdown(&mut shutdown_rx) => {
+                            let _ = response_chn.send(Err(SignalError::SendError));
+                            break close;
+                        }
+                        result = ws_writer.send(Message::Binary(data.into())) => result,
+                    };
+                    let failed = result.is_err();
+                    let _ = response_chn.send(result.map_err(Into::into));
+                    if failed {
+                        break Shutdown::Transport { notify_close: true };
+                    }
                 }
                 InternalMessage::Pong { ping_data } => {
-                    if let Err(err) = ws_writer.send(Message::Pong(ping_data)).await {
+                    let result = tokio::select! {
+                        biased;
+                        close = requested_shutdown(&mut shutdown_rx) => break close,
+                        result = ws_writer.send(Message::Pong(ping_data)) => result,
+                    };
+                    if let Err(err) = result {
                         log::error!("failed to send pong message: {:?}", err);
                     }
                 }
-                InternalMessage::Close => break,
+            }
+        };
+
+        request_shutdown(&shutdown, close.clone());
+        // A concurrent terminal request always wins over a temporary close.
+        if let Some(Shutdown::Disconnect(leave)) = shutdown.borrow().as_ref() {
+            close = Shutdown::Disconnect(leave.clone());
+        }
+        if let Shutdown::Disconnect(leave) = &close {
+            let data = proto::SignalRequest {
+                message: Some(proto::signal_request::Message::Leave(leave.clone())),
+            }
+            .encode_to_vec();
+            // Try the final protocol write first. Once our reader has stopped,
+            // an unwritable socket cannot keep local shutdown alive. Delivery
+            // during a network partition is best effort, never an acknowledgement.
+            tokio::select! {
+                biased;
+                _ = ws_writer.send(Message::Binary(data.into())) => {},
+                _ = reader_finished(&mut reader_done) => {},
             }
         }
-
-        let _ = ws_writer.close().await;
+        if !matches!(
+            close,
+            Shutdown::Transport {
+                notify_close: false
+            }
+        ) {
+            tokio::select! {
+                biased;
+                _ = ws_writer.close() => {},
+                _ = reader_finished(&mut reader_done) => {},
+            }
+        }
     }
 
     /// This task is used to read incoming messages from the websocket
@@ -390,10 +493,15 @@ impl SignalStream {
         internal_tx: mpsc::Sender<InternalMessage>,
         mut ws_reader: SplitStream<WebSocket>,
         emitter: mpsc::UnboundedSender<Box<proto::signal_response::Message>>,
+        shutdown: watch::Sender<Option<Shutdown>>,
+        mut shutdown_rx: watch::Receiver<Option<Shutdown>>,
+        reader_done: watch::Sender<bool>,
+        #[cfg(test)] observed_pings: watch::Sender<usize>,
     ) {
         loop {
             let msg = tokio::select! {
                 biased;
+                _ = requested_shutdown(&mut shutdown_rx) => break,
                 // Failed or cancelled constructors can drop the receiver before
                 // publishing this stream. Its detached I/O still needs to close.
                 _ = emitter.closed() => break,
@@ -412,7 +520,14 @@ impl SignalStream {
                     }
                 }
                 Ok(Message::Ping(data)) => {
-                    let _ = internal_tx.send(InternalMessage::Pong { ping_data: data }).await;
+                    #[cfg(test)]
+                    observed_pings.send_modify(|count| *count += 1);
+                    tokio::select! {
+                        biased;
+                        _ = requested_shutdown(&mut shutdown_rx) => break,
+                        _ = emitter.closed() => break,
+                        _ = internal_tx.send(InternalMessage::Pong { ping_data: data }) => {},
+                    }
                     continue;
                 }
                 Ok(Message::Close(close)) => {
@@ -430,6 +545,36 @@ impl SignalStream {
             }
         }
 
-        let _ = internal_tx.send(InternalMessage::Close).await;
+        request_shutdown(&shutdown, Shutdown::Transport { notify_close: true });
+        reader_done.send_replace(true);
     }
 }
+
+fn request_shutdown(sender: &watch::Sender<Option<Shutdown>>, request: Shutdown) {
+    sender.send_if_modified(|current| {
+        if matches!(current, Some(Shutdown::Disconnect(_))) {
+            return false;
+        }
+        if current.is_some() && matches!(request, Shutdown::Transport { .. }) {
+            return false;
+        }
+        *current = Some(request);
+        true
+    });
+}
+
+async fn requested_shutdown(receiver: &mut watch::Receiver<Option<Shutdown>>) -> Shutdown {
+    receiver
+        .wait_for(Option::is_some)
+        .await
+        .ok()
+        .and_then(|value| value.clone())
+        .unwrap_or(Shutdown::Transport { notify_close: true })
+}
+
+async fn reader_finished(receiver: &mut watch::Receiver<bool>) {
+    let _ = receiver.wait_for(|done| *done).await;
+}
+
+#[cfg(all(test, feature = "signal-client-tokio"))]
+mod shutdown_tests;

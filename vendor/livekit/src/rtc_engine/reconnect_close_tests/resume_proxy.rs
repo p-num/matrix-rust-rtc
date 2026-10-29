@@ -8,7 +8,10 @@
 
 use anyhow::{ensure, Context, Result};
 use std::{
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tokio::{
@@ -31,6 +34,7 @@ pub(super) struct ResumeProxy {
     release: parking_lot::Mutex<Option<oneshot::Sender<()>>>,
     closed: Mutex<oneshot::Receiver<bool>>,
     task: JoinHandle<()>,
+    stop: Option<oneshot::Sender<()>>,
 }
 
 impl ResumeProxy {
@@ -60,10 +64,12 @@ impl ResumeProxy {
             release: release_rx,
             closed,
         })));
+        let (stop, mut stopped) = oneshot::channel();
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
             loop {
                 tokio::select! {
+                    _ = &mut stopped => break,
                     accepted = listener.accept() => match accepted {
                         Ok((client, _)) => {
                             let authority = authority.clone();
@@ -77,6 +83,7 @@ impl ResumeProxy {
                     _ = connections.join_next(), if !connections.is_empty() => {}
                 }
             }
+            connections.shutdown().await;
         });
         Ok(Self {
             url,
@@ -84,6 +91,7 @@ impl ResumeProxy {
             release: parking_lot::Mutex::new(Some(release)),
             closed: Mutex::new(closed_rx),
             task,
+            stop: Some(stop),
         })
     }
 
@@ -114,16 +122,30 @@ impl ResumeProxy {
         Ok(())
     }
 
-    pub(super) async fn shutdown(&mut self) {
+    pub(super) async fn shutdown(&mut self) -> bool {
         self.release();
-        self.task.abort();
-        let _ = (&mut self.task).await;
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if matches!(
+            timeout(Duration::from_secs(5), &mut self.task).await,
+            Ok(Ok(()))
+        ) {
+            true
+        } else {
+            self.task.abort();
+            let _ = (&mut self.task).await;
+            false
+        }
     }
 }
 
 impl Drop for ResumeProxy {
     fn drop(&mut self) {
         self.release();
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
         self.task.abort();
     }
 }
@@ -192,24 +214,131 @@ async fn forward(
         .await
         .context("real signal tasks did not answer the ownership probe")??;
         let _ = held.reached.send(upgraded_at);
-        let _ = held.release.await;
-        let result = async {
-            client.write_all(&payload[..count]).await?;
-            tokio::io::copy_bidirectional(&mut client, &mut backend).await
-        }
-        .await;
-        // A closure witness is emitted only after both owned relay sockets
-        // have been dropped, and only for the observed resume connection.
+        let close_seen = Arc::new(AtomicBool::new(false));
+        let receipt = Arc::new(parking_lot::Mutex::new(Some(held.closed)));
+        let (mut client_read, mut client_write) = client.split();
+        let (mut backend_read, mut backend_write) = backend.split();
+        let from_client = async {
+            let mut bytes = [0_u8; 8192];
+            let mut frames = Vec::new();
+            let mut backend_writable = true;
+            loop {
+                match client_read.read(&mut bytes).await {
+                    Ok(0) => {
+                        closure_receipt(&receipt, close_seen.load(Ordering::Acquire));
+                        let _ = backend_write.shutdown().await;
+                        break;
+                    }
+                    Ok(count) => {
+                        match observe_close(&mut frames, &bytes[..count]) {
+                            Ok(true) => close_seen.store(true, Ordering::Release),
+                            Ok(false) => {}
+                            Err(_) => {
+                                closure_receipt(&receipt, false);
+                                break;
+                            }
+                        }
+                        if backend_writable
+                            && backend_write.write_all(&bytes[..count]).await.is_err()
+                        {
+                            // Destination errors cannot prove client closure.
+                            // Keep observing its exact socket until Close+EOF.
+                            backend_writable = false;
+                        }
+                    }
+                    Err(error) => {
+                        closure_receipt(
+                            &receipt,
+                            close_seen.load(Ordering::Acquire)
+                                && error.kind() == std::io::ErrorKind::ConnectionReset,
+                        );
+                        break;
+                    }
+                }
+            }
+        };
+        let from_backend = async {
+            let _ = held.release.await;
+            if !close_seen.load(Ordering::Acquire)
+                && client_write.write_all(&payload[..count]).await.is_ok()
+            {
+                let mut bytes = [0_u8; 8192];
+                loop {
+                    match backend_read.read(&mut bytes).await {
+                        Ok(0) => break,
+                        Ok(count) => {
+                            if close_seen.load(Ordering::Acquire)
+                                || client_write.write_all(&bytes[..count]).await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        };
+        tokio::join!(from_client, from_backend);
+        // Keep both complete relay sockets owned until explicit fixture
+        // shutdown. Only the independent client Close+EOF/reset can pass.
+        std::future::pending::<()>().await;
         drop(client);
         drop(backend);
-        let _ = held.closed.send(result.is_ok());
-        result.context("resume relay ended with an I/O failure")?;
     } else {
         tokio::io::copy_bidirectional(&mut client, &mut backend)
             .await
             .context("test relay forwarding failed")?;
     }
     Ok(())
+}
+
+fn closure_receipt(receipt: &Arc<parking_lot::Mutex<Option<oneshot::Sender<bool>>>>, clean: bool) {
+    if let Some(sender) = receipt.lock().take() {
+        let _ = sender.send(clean);
+    }
+}
+
+fn observe_close(buffer: &mut Vec<u8>, bytes: &[u8]) -> Result<bool> {
+    buffer.extend_from_slice(bytes);
+    let mut close = false;
+    loop {
+        if buffer.len() < 2 {
+            break;
+        }
+        let opcode = buffer[0] & 0x0f;
+        ensure!(
+            buffer[0] & 0xf0 == 0x80 && buffer[1] & 0x80 != 0 && matches!(opcode, 2 | 8 | 9 | 10),
+            "unexpected client WebSocket frame"
+        );
+        let marker = buffer[1] & 0x7f;
+        let header = match marker {
+            126 => 4,
+            127 => 10,
+            _ => 2,
+        };
+        if buffer.len() < header {
+            break;
+        }
+        let length = match marker {
+            126 => u64::from(u16::from_be_bytes([buffer[2], buffer[3]])),
+            127 => u64::from_be_bytes(buffer[2..10].try_into().unwrap()),
+            value => u64::from(value),
+        };
+        ensure!(
+            length <= 1_048_576 && (opcode < 8 || length <= 125),
+            "client WebSocket frame exceeds private relay bound"
+        );
+        let total = header + 4 + length as usize;
+        if buffer.len() < total {
+            break;
+        }
+        if opcode == 8 {
+            ensure!(length != 1, "client Close payload was malformed");
+            close = true;
+        }
+        buffer.drain(..total);
+    }
+    Ok(close)
 }
 
 async fn ping_round_trip(client: &mut TcpStream, backend: &mut TcpStream) -> Result<()> {

@@ -55,6 +55,9 @@ mod rtc_session;
 mod reconnect_close_tests;
 
 #[cfg(all(test, feature = "__lk-e2e-test"))]
+mod room_close_tests;
+
+#[cfg(all(test, feature = "__lk-e2e-test"))]
 mod initial_join_timeout_tests;
 
 pub(crate) type EngineEmitter = mpsc::UnboundedSender<EngineEvent>;
@@ -384,6 +387,62 @@ impl RtcEngine {
 
     pub async fn close(&self, reason: DisconnectReason) {
         self.inner.close(reason).await
+    }
+
+    #[cfg(all(test, feature = "__lk-e2e-test"))]
+    pub(crate) async fn probe_closed_reconnection_for_test(&self) -> EngineResult<()> {
+        let mut owners = self.inner.owned_attempts.subscribe();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            // A zero owner count can precede the outer task's final turn. Join
+            // that scheduling boundary too, without holding its read lock while
+            // a still-pending recovery task needs the write side to finish.
+            let _recovery = loop {
+                owners.wait_for(|count| *count == 0).await.map_err(|_| {
+                    EngineError::Internal("closed-engine owner witness disappeared".into())
+                })?;
+                let recovery = self.inner.reconnecting_lock.read().await;
+                if !self.inner.running_handle.read().reconnecting {
+                    break recovery;
+                }
+                drop(recovery);
+                tokio::task::yield_now().await;
+            };
+            let (session, full_reconnect) = {
+                let handle = self.inner.running_handle.read();
+                if !handle.closed
+                    || handle.can_reconnect
+                    || handle.engine_task.is_some()
+                    || *owners.borrow() != 0
+                {
+                    return Err(EngineError::Internal(
+                        "completed close retained an engine recovery owner".into(),
+                    ));
+                }
+                (handle.session.clone(), handle.full_reconnect)
+            };
+            // Exercise the actual closed gate for both recovery modes. This
+            // function marks reconnecting synchronously before spawning a job;
+            // these assertions concern fresh recovery admission, not OS packet
+            // arrival times from an already-started socket constructor.
+            self.inner.reconnection_needed(true, false);
+            self.inner.reconnection_needed(true, true);
+            let handle = self.inner.running_handle.read();
+            if !handle.closed
+                || handle.can_reconnect
+                || handle.reconnecting
+                || handle.engine_task.is_some()
+                || handle.full_reconnect != full_reconnect
+                || !Arc::ptr_eq(&session, &handle.session)
+                || *owners.borrow() != 0
+            {
+                return Err(EngineError::Internal(
+                    "closed engine admitted a fresh recovery trigger".into(),
+                ));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| EngineError::Internal("closed-engine recovery owners did not drain".into()))?
     }
 
     pub async fn publish_data(
