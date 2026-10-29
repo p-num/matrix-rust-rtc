@@ -23,6 +23,7 @@ POINTER="Please see LICENSE in the repository root for full details."
 # uniffi-generated Swift, which every codegen run overwrites.
 is_exempt() {
     case "$1" in
+    vendor/livekit/* | vendor/livekit-api/*) return 0 ;; # Preserve upstream Apache-2.0 notices.
     mobile/android/gradlew | \
         mobile/android/gradle/wrapper/gradle-wrapper.jar | \
         mobile/android/gradle/wrapper/gradle-wrapper.properties | \

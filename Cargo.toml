@@ -15,6 +15,7 @@ members = [
     "crates/matrix-rtc-transport",
     "uniffi-bindgen",
 ]
+exclude = ["vendor/livekit", "vendor/livekit-api"]
 resolver = "2"
 
 # Every member sets `publish = false`: distribution is the mobile artifacts
@@ -22,7 +23,7 @@ resolver = "2"
 # livekit and matrix-sdk crates could not be published anyway — they pin matrix-sdk
 # by git rev, which the registry rejects.
 [workspace.package]
-version = "0.5.0-rc.4-letro.2"
+version = "0.5.0-rc.4-letro.3"
 edition = "2024"
 license = "AGPL-3.0-only OR LicenseRef-Element-Commercial"
 
@@ -86,7 +87,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # (`rustls-platform-verifier`) plumbed through livekit-api, which calls
 # `connect_async` without a connector and so cannot accept one today — an
 # upstream change, not a local knob.
-livekit = { version = "0.7", features = [
+livekit = { version = "=0.7.48", features = [
     "rustls-tls-native-roots",
     "rustls-tls-webpki-roots",
 ] }
@@ -108,5 +109,7 @@ matrix-sdk-ui = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "
 # same. Source: matrix-org/matrix-rust-sdk@c6ad52e Cargo.toml — keep in step when
 # bumping the rev above.
 [patch.crates-io]
+livekit = { path = "vendor/livekit" }
+livekit-api = { path = "vendor/livekit-api" }
 async-compat = { git = "https://github.com/element-hq/async-compat", rev = "5a27c8b290f1f1dcfc0c4ec22c464e38528aa591" }
 const_panic = { git = "https://github.com/jplatte/const_panic", rev = "e0b317a9a7bde2d48a7d15b6a60d70e4a41d3b5f" }
