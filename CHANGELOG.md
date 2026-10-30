@@ -8,6 +8,12 @@ log only.
 
 ## Unreleased
 
+## v0.5.0-rc.4-letro.3 - 2026-10-29
+
+### Fixed
+
+- Close abandoned native call transports after media recovery or a signaling timeout.
+
 ## v0.5.0-rc.4-letro.2 - 2026-10-29
 
 ### Fixed

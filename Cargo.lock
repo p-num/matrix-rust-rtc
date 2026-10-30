@@ -2398,8 +2398,6 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 [[package]]
 name = "livekit"
 version = "0.7.48"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3db88772d10f8ef1ab43a0aa0634a1d4807d0567b65665274af3e084589dbec6"
 dependencies = [
  "base64 0.22.1",
  "bmrng",
@@ -2427,8 +2425,6 @@ dependencies = [
 [[package]]
 name = "livekit-api"
 version = "0.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4d063f66ee1faf1c654a2bd59eba2e3f3eefc63772d957f2702c0724903db8a"
 dependencies = [
  "base64 0.21.7",
  "bytes",
@@ -2683,7 +2679,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-rtc-call"
-version = "0.5.0-rc.4-letro.2"
+version = "0.5.0-rc.4-letro.3"
 dependencies = [
  "async-trait",
  "log",
@@ -2698,7 +2694,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-rtc-call-sdk"
-version = "0.5.0-rc.4-letro.2"
+version = "0.5.0-rc.4-letro.3"
 dependencies = [
  "async-trait",
  "clap",
@@ -2724,7 +2720,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-rtc-core"
-version = "0.5.0-rc.4-letro.2"
+version = "0.5.0-rc.4-letro.3"
 dependencies = [
  "async-trait",
  "base64 0.21.7",
@@ -2745,7 +2741,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-rtc-ffi"
-version = "0.5.0-rc.4-letro.2"
+version = "0.5.0-rc.4-letro.3"
 dependencies = [
  "android_logger",
  "async-trait",
@@ -2768,7 +2764,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-rtc-livekit"
-version = "0.5.0-rc.4-letro.2"
+version = "0.5.0-rc.4-letro.3"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -2786,7 +2782,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-rtc-matrix-sdk"
-version = "0.5.0-rc.4-letro.2"
+version = "0.5.0-rc.4-letro.3"
 dependencies = [
  "async-trait",
  "log",
@@ -2800,7 +2796,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-rtc-transport"
-version = "0.5.0-rc.4-letro.2"
+version = "0.5.0-rc.4-letro.3"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2816,7 +2812,7 @@ dependencies = [
 
 [[package]]
 name = "matrix-rtc-wasm"
-version = "0.5.0-rc.4-letro.2"
+version = "0.5.0-rc.4-letro.3"
 dependencies = [
  "async-trait",
  "console_error_panic_hook",

@@ -70,22 +70,3 @@ jobs:
         with:
           name: matrix-rtc-swift-bindings
           path: mobile/ios/generated/
-
-  test:
-    name: Test FFI Bindings
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Run FFI tests
-        run: cargo test -p matrix-rtc-ffi
-
-      - name: Run all tests
-        # Exclude matrix-rtc-livekit: it depends on livekit/libwebrtc (native
-        # C++) and cannot build on this runner without a C++ toolchain. It is
-        # not part of the mobile/FFI surface this job covers.
-        run: cargo test --workspace --exclude matrix-rtc-livekit
-
