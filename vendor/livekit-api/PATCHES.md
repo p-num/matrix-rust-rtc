@@ -97,9 +97,9 @@ The sibling [LiveKit patch note](../livekit/PATCHES.md) records current-source
 **80/80 tests**, including all **12 local-SFU cases**, in 68.07 seconds
 (76.14-second command). Those cases require explicit private loopback SFU
 credentials and a running server, with no prerequisite skip. The test-only
-oracle correction preserves the four production-file hashes: recovery-owner
-and gate rejection distinguish client ownership from later observation of
-buffered HTTP bytes. All accepted candidates, including header-pending ones,
+oracle correction: the four production corrections remain unchanged; cfg(test)-only
+wrappers change containing-file hashes. Recovery-owner and gate rejection
+distinguish client ownership from later observation of buffered HTTP bytes. All accepted candidates, including header-pending ones,
 require positive EOF/reset before the **first** fixture release and at the final
 recheck. This does not promise that buffered network bytes can be revoked or
 measure literal OS connection starts. Already-closed old signaling permits

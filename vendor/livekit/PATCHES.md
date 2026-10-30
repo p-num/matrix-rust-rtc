@@ -67,8 +67,9 @@ tests** in 4.01 seconds (5.13-second command). Both current-source runs and the
 new focused pre-101 API control are independently accepted in
 `terminal-causal-oracles-api35-vendor80-independent-proof-20261029.json`, with
 all 211 input hashes matched and actual executable lineage verified. Their
-latest oracle refinement is test-only; the four production correction hashes
-remain unchanged, including API `mod.rs` `ed82f625…`.
+latest oracle refinement is test-only. The four production corrections remain
+unchanged; cfg(test)-only wrappers change containing-file hashes. API `mod.rs`
+remains `ed82f625…`.
 
 | Group | Cases | Boundary |
 |---|---:|---|
