@@ -275,18 +275,6 @@ impl From<FfiStabilityConfig> for matrix_rtc_call_sdk::StabilityConfig {
     }
 }
 
-/// Why the call ended.
-#[derive(Clone, Debug, uniffi::Enum)]
-pub enum FfiEndedReason {
-    /// We left deliberately.
-    Left,
-    /// The slot was closed, which ended the call without us asking.
-    SlotClosed,
-    /// The connection to our own focus closed and will not be
-    /// re-established.
-    ConnectionClosed { message: String },
-}
-
 /// Whether a participant's frames are encrypting and decrypting cleanly
 /// (mirrors `matrix_rtc_transport::FrameEncryptionState`).
 ///
@@ -682,13 +670,9 @@ pub enum FfiCallEvent {
     /// A transport-level participant with no signalled membership; it gets
     /// no subscription. Diagnostics only.
     UnknownParticipant { identity: String },
-    /// Media health: `degraded` while any transport connection reconnects.
-    MediaConnectionState { degraded: bool },
     /// Only our publishing connection is reconnecting, independent of peer-focus health.
     /// Does not report Matrix sync or membership health.
     OwnMediaConnectionState { degraded: bool },
-    /// The call is over; no further events follow.
-    Ended { reason: FfiEndedReason },
 }
 
 impl FfiCallEvent {
@@ -784,19 +768,9 @@ impl FfiCallEvent {
                 sound,
             },
             Event::UnknownParticipant { identity } => Self::UnknownParticipant { identity },
-            Event::MediaConnectionState { degraded } => Self::MediaConnectionState { degraded },
             Event::OwnMediaConnectionState { degraded } => {
                 Self::OwnMediaConnectionState { degraded }
             }
-            Event::Ended { reason } => Self::Ended {
-                reason: match reason {
-                    matrix_rtc_call_sdk::EndedReason::Left => FfiEndedReason::Left,
-                    matrix_rtc_call_sdk::EndedReason::SlotClosed => FfiEndedReason::SlotClosed,
-                    matrix_rtc_call_sdk::EndedReason::ConnectionClosed { message } => {
-                        FfiEndedReason::ConnectionClosed { message }
-                    }
-                },
-            },
         })
     }
 }

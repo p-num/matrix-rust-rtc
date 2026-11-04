@@ -36,12 +36,6 @@ fn own_media_connection_health_is_distinct_from_aggregate_health_over_ffi() {
             }),
             Some(FfiCallEvent::OwnMediaConnectionState { degraded: actual }) if actual == degraded
         ));
-        assert!(matches!(
-            FfiCallEvent::relayed(matrix_rtc_call_sdk::CallEvent::MediaConnectionState {
-                degraded,
-            }),
-            Some(FfiCallEvent::MediaConnectionState { degraded: actual }) if actual == degraded
-        ));
     }
 }
 
@@ -102,7 +96,7 @@ fn joined_call(mock: &Arc<MockHost>, transport: FfiJoinTransport) -> (Arc<RtcRoo
                 sticky_duration_ms: None,
                 degraded_lifetime_ms: None,
                 encryption_config: None,
-                notify: None,
+                kind: crate::FfiCallKind::Group { notify: None },
                 reactions: None,
             })
             .await

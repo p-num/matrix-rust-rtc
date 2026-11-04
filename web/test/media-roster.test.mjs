@@ -201,9 +201,9 @@ describe('web media roster over a fake transport delegate', () => {
     const ownSink = log.sinks[log.connects.findIndex((c) => c.connectionKey === OWN_FOCUS)];
     const peerSink = log.sinks[log.connects.findIndex((c) => c.connectionKey === PEER_FOCUS)];
     const ownHealth = () => log.events.filter((event) => event.type === 'own_media_connection_state');
-    const aggregateHealth = () => log.events.filter((event) => event.type === 'media_connection_state');
+    const aggregateHealth = () => call.status;
     peerSink.reconnecting();
-    await waitFor(() => aggregateHealth().at(-1)?.degraded === true, 'aggregate media degradation');
+    await waitFor(() => aggregateHealth().degraded === true, 'aggregate media degradation');
     expect(ownHealth()).toEqual([]);
     ownSink.reconnecting();
     ownSink.reconnecting();
@@ -215,9 +215,9 @@ describe('web media roster over a fake transport delegate', () => {
       { type: 'own_media_connection_state', degraded: true },
       { type: 'own_media_connection_state', degraded: false },
     ]);
-    expect(aggregateHealth().at(-1).degraded).toBe(true);
+    expect(aggregateHealth().degraded).toBe(true);
     peerSink.reconnected();
-    await waitFor(() => aggregateHealth().at(-1)?.degraded === false, 'peer-focus recovery');
+    await waitFor(() => aggregateHealth().degraded === false, 'peer-focus recovery');
     expect(ownHealth()).toHaveLength(2);
 
     // A transport-level leave is diagnostics, never roster truth.

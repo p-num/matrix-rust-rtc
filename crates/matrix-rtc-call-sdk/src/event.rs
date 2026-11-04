@@ -57,22 +57,6 @@ pub struct SpeakingMember {
     pub level: f32,
 }
 
-/// Why the call ended.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum EndedReason {
-    /// We left the call deliberately.
-    Left,
-    /// The slot was closed, which ended our participation without us asking.
-    SlotClosed,
-    /// The connection to our own focus (the one we publish on) closed and
-    /// will not be re-established. Peer-focus connections closing do not end
-    /// the call — they reconnect.
-    ConnectionClosed {
-        /// Transport-provided description (e.g. the LiveKit disconnect reason).
-        message: String,
-    },
-}
-
 /// An event on the unified call stream.
 ///
 /// `PartialEq` but not `Eq`: an audio level is an `f32`.
@@ -199,11 +183,7 @@ pub enum CallEvent {
     /// membership. It gets no subscription (and could not be decrypted
     /// anyway); surfaced for diagnostics.
     UnknownParticipant { identity: String },
-    /// Media connection health: `degraded` while any transport reconnects.
-    MediaConnectionState { degraded: bool },
     /// Only our publishing connection is reconnecting; peer-focus failures do not change this.
     /// This is media health, not Matrix sync or membership health.
     OwnMediaConnectionState { degraded: bool },
-    /// The call is over; no further events follow.
-    Ended { reason: EndedReason },
 }
