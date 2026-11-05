@@ -17,12 +17,14 @@
 //! `livekit_alias`), while every other focus needs its own subscribe-side
 //! connection.
 
+use std::any::Any;
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use livekit::e2ee::EncryptionType;
 use livekit::id::ParticipantIdentity;
 use livekit::options::TrackPublishOptions;
 use livekit::prelude::{
@@ -43,10 +45,13 @@ use livekit::webrtc::video_frame::{
 use livekit::webrtc::video_source::native::NativeVideoSource;
 use livekit::webrtc::video_source::{RtcVideoSource, VideoResolution};
 use livekit::webrtc::video_stream::native::NativeVideoStream;
+use livekit_signaling::SignalError;
+use matrix_rtc_transport::livekit::TokenServiceError;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::watch;
 
 use matrix_rtc_core::MatrixBackend;
-use matrix_rtc_core::{JoinedMembership, RtcIdentityMapper, RtcTransport};
+use matrix_rtc_core::{IdentitySubject, JoinedMembership, RtcIdentityMapper, RtcTransport};
 use matrix_rtc_transport::{
     AudioFrame, ConnectionContext, ConnectionEvent, FrameEncryptionState, I420Buffer,
     LocalTrackHandle, MediaStreamKind, MediaTransport, OwnFocusTransport, PublishOptions,
@@ -55,10 +60,11 @@ use matrix_rtc_transport::{
     TransportError, VideoDetail, VideoFrame, VideoRotation,
 };
 
-use crate::identity::pseudonymous_identity;
 use crate::session::LiveKitSession;
-use crate::token::MemberClaims;
-use crate::{LiveKitTransportConfig, TokenEndpoint, connect_e2ee};
+use crate::{
+    LiveKitTarget, LiveKitTransportConfig, SfuToken, acquire_token, e2ee_room_options,
+    identity_mapper,
+};
 
 /// Sample rate remote audio is resampled to before crossing the transport
 /// boundary, matching what the recording helpers in [`crate::media`] use.
@@ -68,42 +74,42 @@ const AUDIO_CHANNELS: i32 = 1;
 /// The MSC4195 LiveKit backend of [`MediaTransport`].
 ///
 /// One instance serves a whole call: [`MediaTransport::connect`] can be
-/// invoked once per focus, and every connection shares the same E2EE
-/// `KeyProvider` handle (keys are indexed by pseudonymous identity, which is
-/// globally unique per membership, so one ring serves all foci).
+/// invoked once per focus. Every connection has its own E2EE `KeyProvider`,
+/// since LiveKit keeps the SFU's SIF trailer there, and every key is installed
+/// in each (keys are indexed by participant identity, which is unique per
+/// membership, so the same keys serve all foci).
+///
+/// A connection key names a [`LiveKitTarget`]: how its token is obtained (the
+/// legacy JWT service, or the homeserver) and for which SFU.
 pub struct LiveKitMediaTransport {
     http: reqwest::Client,
     backend: Arc<dyn MatrixBackend>,
-    key_provider: livekit::e2ee::key_provider::KeyProvider,
+    key_providers: crate::Msc4195KeyProviders,
     auto_subscribe: bool,
-    /// How a `(user, device, member_id)` triple becomes an SFU participant
-    /// identity. The MSC4195 hash by default.
+    /// How a member becomes an SFU participant identity: the one its published
+    /// transport's token flow mints, by default.
     ///
     /// MUST be the same value installed on the core's encryption manager. A
     /// divergence does not error — it silences: every `identity_map` lookup
     /// misses, so peers sit in the roster with no media and their keys are
-    /// installed under an identity the SFU never assigned. See [`matrix_rtc_core::compat`].
+    /// installed under an identity the SFU never assigned.
     identity_mapper: RtcIdentityMapper,
-    /// Which authorisation-service dialect to speak. MSC4195 `/get_token` by
-    /// default.
-    token_endpoint: TokenEndpoint,
 }
 
 impl LiveKitMediaTransport {
-    /// `key_provider` MUST be the same handle given to the
+    /// `key_providers` MUST be the same handle given to the
     /// [`crate::MediaKeyBridge`] importing the core's media keys.
     pub fn new(
         http: reqwest::Client,
         backend: Arc<dyn MatrixBackend>,
-        key_provider: livekit::e2ee::key_provider::KeyProvider,
+        key_providers: crate::Msc4195KeyProviders,
     ) -> Self {
         Self {
             http,
             backend,
-            key_provider,
+            key_providers,
             auto_subscribe: true,
-            identity_mapper: Arc::new(pseudonymous_identity),
-            token_endpoint: TokenEndpoint::default(),
+            identity_mapper: identity_mapper(),
         }
     }
 
@@ -117,20 +123,12 @@ impl LiveKitMediaTransport {
 
     /// Substitute the participant-identity derivation.
     ///
-    /// A builder rather than a `new` parameter: the MSC4195 derivation is the
-    /// default and every spec-current caller leaves it alone. The caller that
-    /// does substitute it, `matrix_rtc_call_sdk::attach_livekit`, passes the same `Arc` it
-    /// gives the core's encryption manager, which is the point: the derivation
-    /// sites must not skew. Temporary; see [`matrix_rtc_core::compat`].
+    /// A builder rather than a `new` parameter: the transport-driven derivation
+    /// is the default. `matrix_rtc_call_sdk::attach_livekit` passes the same
+    /// `Arc` it gives the core's encryption manager, which is the point: the
+    /// derivation sites must not skew.
     pub fn with_identity_mapper(mut self, identity_mapper: RtcIdentityMapper) -> Self {
         self.identity_mapper = identity_mapper;
-        self
-    }
-
-    /// Substitute the authorisation-service dialect. Temporary; see
-    /// [`matrix_rtc_core::compat`].
-    pub fn with_token_endpoint(mut self, token_endpoint: TokenEndpoint) -> Self {
-        self.token_endpoint = token_endpoint;
         self
     }
 }
@@ -143,7 +141,7 @@ impl OwnFocusTransport for LiveKitMediaTransport {
 
     async fn connect_own(
         &self,
-        livekit_service_url: &str,
+        connection_key: &str,
         ctx: &ConnectionContext,
     ) -> Result<
         (
@@ -152,45 +150,53 @@ impl OwnFocusTransport for LiveKitMediaTransport {
         ),
         TransportError,
     > {
+        let connection = self.prepare_own(connection_key, ctx);
+        let events = connection.reconnect(false).await?;
+        Ok((connection, events))
+    }
+
+    fn prepare_own(
+        &self,
+        connection_key: &str,
+        ctx: &ConnectionContext,
+    ) -> LiveKitTransportConnection {
+        // A bare URL, as a host connecting outside a call may pass, names a
+        // legacy JWT service.
+        let target = LiveKitTarget::from_connection_key(connection_key).unwrap_or_else(|| {
+            LiveKitTarget::SfuGet {
+                service_url: connection_key.to_owned(),
+            }
+        });
+        let own_identity = target.own_identity(
+            &ctx.member.user_id,
+            &ctx.member.device_id,
+            &ctx.member.member_id,
+        );
         let config = LiveKitTransportConfig {
-            livekit_service_url: livekit_service_url.to_owned(),
+            target,
             room_id: ctx.room_id.clone(),
             slot_id: ctx.slot_id.clone(),
-            member: MemberClaims {
-                id: ctx.member.member_id.clone(),
-                claimed_user_id: ctx.member.user_id.clone(),
-                claimed_device_id: ctx.member.device_id.clone(),
-            },
-            token_endpoint: self.token_endpoint,
+            member_id: ctx.member.member_id.clone(),
+            device_id: ctx.member.device_id.clone(),
         };
-        let connection = connect_e2ee(
-            &self.http,
-            &config,
-            self.backend.as_ref(),
-            self.key_provider.clone(),
-            self.auto_subscribe,
-        )
-        .await
-        .map_err(|error| TransportError::Connect(error.to_string()))?;
-
-        // The receiver returned by the room connect carries events from the
-        // very beginning (nothing can be missed); hand it to the translator.
-        let (events_tx, events_rx) = unbounded_channel();
-        tokio::spawn(translate_room_events(connection.events, events_tx));
-
-        Ok((
-            LiveKitTransportConnection {
-                connection_key: livekit_service_url.to_owned(),
-                session: Arc::new(connection.session),
-                own_identity: (self.identity_mapper)(
-                    &ctx.member.user_id,
-                    &ctx.member.device_id,
-                    &ctx.member.member_id,
-                ),
-                local_key_index: Arc::new(Mutex::new(None)),
-            },
-            events_rx,
-        ))
+        LiveKitTransportConnection {
+            connection_key: connection_key.to_owned(),
+            shared: Arc::new(ConnectionShared {
+                session: watch::Sender::new(None),
+                own_identity,
+                local_key_index: Mutex::new(None),
+                local_tracks: Mutex::new(Vec::new()),
+                connector: Connector {
+                    http: self.http.clone(),
+                    backend: self.backend.clone(),
+                    key_provider: self.key_providers.connection_provider(),
+                    auto_subscribe: self.auto_subscribe,
+                    config: Mutex::new(config),
+                    token: Mutex::new(None),
+                },
+                installs: Mutex::new(0),
+            }),
+        }
     }
 }
 
@@ -200,29 +206,29 @@ impl MediaTransport for LiveKitMediaTransport {
         "livekit"
     }
 
-    fn connection_key(&self, transport: &RtcTransport) -> Option<String> {
-        match transport {
-            RtcTransport::LiveKit(livekit) => Some(livekit.livekit_service_url.clone()),
-            RtcTransport::Unsupported(_) => None,
+    fn connection_key(&self, transport: &RtcTransport, publisher_user_id: &str) -> Option<String> {
+        matrix_rtc_transport::livekit::connection_key(transport, publisher_user_id)
+    }
+
+    fn shares_identity(&self, a: &str, b: &str) -> bool {
+        match (
+            LiveKitTarget::from_connection_key(a),
+            LiveKitTarget::from_connection_key(b),
+        ) {
+            (Some(a), Some(b)) => a.same_flow(&b),
+            _ => false,
         }
     }
 
     fn remote_identity(&self, member: &JoinedMembership) -> Option<String> {
-        // MSC4195: identity = hash(user, device, member_id); the device is the
-        // one that encrypted the member event (MSC4143 dropped
-        // `claimed_device_id`), or — on the pre-sticky legacy path — the one the
-        // member event merely claims. Either way, without an attributable device
-        // there is no identity to expect on the SFU, and no device to address a
-        // media key to.
-        //
-        // Through the mapper rather than `pseudonymous_identity` directly, so a
-        // legacy call derives peer identities exactly as it derives its own.
-        let device_id = member.origin.sender_device_id()?;
-        Some((self.identity_mapper)(
-            &member.sender,
-            device_id,
-            &member.member_id,
-        ))
+        // Through the mapper rather than a derivation of its own, so peers'
+        // identities are derived exactly as the core addresses their keys.
+        (self.identity_mapper)(&IdentitySubject {
+            user_id: &member.sender,
+            device_id: member.origin.sender_device_id(),
+            member_id: &member.member_id,
+            transports: &member.transports,
+        })
     }
 
     async fn connect(
@@ -241,35 +247,144 @@ impl MediaTransport for LiveKitMediaTransport {
     }
 }
 
-/// One live SFU connection.
+/// One SFU connection, behind a handle that outlives each connect (034 R24).
 ///
-/// A cheap clonable handle: the caller can keep one clone (for raw session
+/// A cheap clonable handle: the caller keeps one clone (for raw session
 /// access and the final close) while another is owned by the engine's pool.
+/// The LiveKit room behind it is replaced on every [`TransportConnection::
+/// reconnect`], and every local publication made through it is carried onto
+/// the new room, so the host's capture handles never go stale.
 #[derive(Clone)]
 pub struct LiveKitTransportConnection {
     connection_key: String,
-    session: Arc<LiveKitSession>,
-    /// Our own MSC4195 participant identity on this connection.
+    shared: Arc<ConnectionShared>,
+}
+
+struct ConnectionShared {
+    /// The connected room; `None` before the first connect.
+    session: watch::Sender<Option<Arc<LiveKitSession>>>,
+    /// Our own participant identity on this connection: what its target's
+    /// token flow mints. A take-over keeps it, since only a target of the same
+    /// flow is ever taken over.
     own_identity: String,
     /// The key index our own frames must carry, once a rotation has activated.
     ///
     /// Held because a frame cryptor is created per published track and starts at
-    /// index 0: a track published after a rotation would otherwise be stamped
-    /// with an index no peer holds a key for.
-    local_key_index: Arc<Mutex<Option<u8>>>,
+    /// index 0: a track published after a rotation, or republished on a new
+    /// room, would otherwise be stamped with an index no peer holds a key for.
+    local_key_index: Mutex<Option<u8>>,
+    /// Every publication made through this handle, republished on each new
+    /// room. Weak: an unpublished or dropped one simply goes.
+    local_tracks: Mutex<Vec<Weak<LiveKitLocalTrack>>>,
+    connector: Connector,
+    /// Bumped by every take-over, under which a connected room is installed:
+    /// a reconnect that started before one is abandoned (034 R25).
+    installs: Mutex<u64>,
+}
+
+/// What [`TransportConnection::hand_over`] gives: the connected room and how
+/// to reach its focus again.
+struct Handover {
+    session: Arc<LiveKitSession>,
+    config: LiveKitTransportConfig,
+    token: Option<SfuToken>,
+}
+
+/// What a (re)connect needs: the token exchange and the room options.
+struct Connector {
+    http: reqwest::Client,
+    backend: Arc<dyn MatrixBackend>,
+    /// This connection's own: a reconnect sets the SFU's trailer on it again.
+    key_provider: crate::ConnectionKeyProvider,
+    auto_subscribe: bool,
+    /// The focus connects go to; a take-over moves it (034 R25).
+    config: Mutex<LiveKitTransportConfig>,
+    /// The token the last connect used, reused until the SFU rejects it.
+    token: Mutex<Option<SfuToken>>,
+}
+
+impl Connector {
+    async fn token(&self, fresh: bool) -> Result<SfuToken, TransportError> {
+        let cached = self.token.lock().expect("token mutex poisoned").clone();
+        if let Some(token) = cached.filter(|_| !fresh) {
+            return Ok(token);
+        }
+        let config = self.config.lock().expect("config mutex poisoned").clone();
+        let acquired = acquire_token(&self.http, &config, self.backend.as_ref())
+            .await
+            .map_err(classify_token_error)?;
+        *self.token.lock().expect("token mutex poisoned") = Some(acquired.clone());
+        Ok(acquired)
+    }
+}
+
+/// A token failure: a 4xx from the JWT service, a 4xx other than a rate limit
+/// from the homeserver (a 404 there: it lacks MSC4195), or a host refusal, is a
+/// refusal; anything else may pass.
+fn classify_token_error(error: crate::Error) -> TransportError {
+    match &error {
+        crate::Error::Service(TokenServiceError::Rejected { status, .. })
+            if (400..500).contains(status) =>
+        {
+            TransportError::Refused(error.to_string())
+        }
+        crate::Error::Backend(backend)
+            if backend.is_permanent()
+                || backend
+                    .status
+                    .is_some_and(|status| (400..500).contains(&status) && status != 429) =>
+        {
+            TransportError::Refused(error.to_string())
+        }
+        _ => TransportError::Connect(error.to_string()),
+    }
+}
+
+/// An SFU connect failure: a 401 is the token, as is a 404. Our own SFU's
+/// token service creates the room when it issues our token (`auto_create`
+/// off), so a 404 there means the SFU restarted and forgot it, and a fresh
+/// token creates it again (on a peer's SFU taken over under 034 R25, its token
+/// service may not create rooms for us: the second 404 is then a refusal).
+/// Another 4xx is a refusal; anything else may pass.
+fn classify_room_error(error: crate::Error) -> TransportError {
+    if let crate::Error::Room(livekit::RoomError::Engine(
+        livekit::rtc_engine::EngineError::Signal(SignalError::Client(status, _)),
+    )) = &error
+    {
+        return match status.as_u16() {
+            401 | 404 => TransportError::TokenRejected(error.to_string()),
+            _ => TransportError::Refused(error.to_string()),
+        };
+    }
+    TransportError::Connect(error.to_string())
 }
 
 impl LiveKitTransportConnection {
-    /// The underlying session, for the `LiveKitCall` facade's transition-period raw
-    /// accessors.
-    pub fn session(&self) -> &LiveKitSession {
-        &self.session
+    /// The connected session, for the `LiveKitCall` facade's transition-period
+    /// raw accessors; `None` before the first connect.
+    pub fn session(&self) -> Option<Arc<LiveKitSession>> {
+        self.current_session()
+    }
+
+    /// Waits until a session is connected and returns it.
+    pub async fn wait_connected(&self) -> Arc<LiveKitSession> {
+        let mut session = self.shared.session.subscribe();
+        let connected = session
+            .wait_for(Option::is_some)
+            .await
+            .expect("the sender lives in the handle");
+        connected.clone().expect("waited for it")
+    }
+
+    fn current_session(&self) -> Option<Arc<LiveKitSession>> {
+        self.shared.session.borrow().clone()
     }
 
     /// Re-assert the current index on our senders, for a track published after a
     /// rotation: its cryptor is new, and new cryptors start at index 0.
     fn reassert_local_key_index(&self) {
         let current = *self
+            .shared
             .local_key_index
             .lock()
             .expect("local key index mutex poisoned");
@@ -279,10 +394,13 @@ impl LiveKitTransportConnection {
     }
 
     fn apply_local_key_index(&self, key_index: u8) {
+        let Some(session) = self.current_session() else {
+            log::debug!("not connected; key index {key_index} applies at the connect");
+            return;
+        };
         let mut switched = 0usize;
-        for ((identity, _track_sid), cryptor) in self.session.room().e2ee_manager().frame_cryptors()
-        {
-            if identity.as_str() == self.own_identity {
+        for ((identity, _track_sid), cryptor) in session.room().e2ee_manager().frame_cryptors() {
+            if identity.as_str() == self.shared.own_identity {
                 cryptor.set_key_index(i32::from(key_index));
                 switched += 1;
             }
@@ -295,6 +413,28 @@ impl LiveKitTransportConnection {
             );
         } else {
             log::debug!("our own frames now carry key index {key_index} ({switched} cryptor(s))");
+        }
+    }
+
+    /// Carries every live publication onto the room just connected, with the
+    /// mute it holds.
+    async fn republish_local_tracks(&self, session: &Arc<LiveKitSession>) {
+        let tracks: Vec<Arc<LiveKitLocalTrack>> = {
+            let mut tracks = self
+                .shared
+                .local_tracks
+                .lock()
+                .expect("local tracks mutex poisoned");
+            tracks.retain(|track| track.strong_count() > 0);
+            tracks.iter().filter_map(Weak::upgrade).collect()
+        };
+        for track in tracks {
+            if track.closed.load(Ordering::Acquire) {
+                continue;
+            }
+            if let Err(error) = track.publish_on(session).await {
+                log::warn!("could not republish our {:?}: {error}", track.kind);
+            }
         }
     }
 }
@@ -310,64 +450,144 @@ impl TransportConnection for LiveKitTransportConnection {
     /// its frame cryptor and changes only here.
     fn set_local_key_index(&self, key_index: u8) {
         *self
+            .shared
             .local_key_index
             .lock()
             .expect("local key index mutex poisoned") = Some(key_index);
         self.apply_local_key_index(key_index);
     }
 
+    /// Connects a new room with the token of the last connect (or a fresh one)
+    /// and the same key provider, so the key ring is intact; the previous room
+    /// is closed, and our publications are carried over.
+    async fn reconnect(
+        &self,
+        fresh_token: bool,
+    ) -> Result<UnboundedReceiver<ConnectionEvent>, TransportError> {
+        let connector = &self.shared.connector;
+        let started = *self
+            .shared
+            .installs
+            .lock()
+            .expect("installs mutex poisoned");
+        let token = connector.token(fresh_token).await?;
+        let connection = LiveKitSession::connect_with_options(
+            &token,
+            e2ee_room_options(
+                connector.key_provider.provider().clone(),
+                connector.auto_subscribe,
+            ),
+        )
+        .await
+        .map_err(classify_room_error)?;
+
+        let session = Arc::new(connection.session);
+        let previous = {
+            let installs = self
+                .shared
+                .installs
+                .lock()
+                .expect("installs mutex poisoned");
+            if *installs != started {
+                drop(installs);
+                close_room(session);
+                return Err(TransportError::Closed(
+                    "abandoned: the handle took another connection over".into(),
+                ));
+            }
+            self.shared.session.send_replace(Some(session.clone()))
+        };
+        if let Some(previous) = previous {
+            close_room(previous);
+        }
+        // The receiver returned by the room connect carries events from the
+        // very beginning (nothing can be missed); hand it to the translator.
+        let (events_tx, events_rx) = unbounded_channel();
+        tokio::spawn(translate_room_events(
+            connection.events,
+            events_tx,
+            self.clone(),
+            Arc::downgrade(&session),
+        ));
+        self.republish_local_tracks(&session).await;
+        self.reassert_local_key_index();
+        Ok(events_rx)
+    }
+
+    fn hand_over(&self) -> Option<Box<dyn Any>> {
+        let session = self.current_session()?;
+        let connector = &self.shared.connector;
+        Some(Box::new(Handover {
+            session,
+            config: connector
+                .config
+                .lock()
+                .expect("config mutex poisoned")
+                .clone(),
+            token: connector
+                .token
+                .lock()
+                .expect("token mutex poisoned")
+                .clone(),
+        }))
+    }
+
+    /// Installs the handed-over room as this handle's, abandoning any
+    /// reconnect in flight; our publications are carried onto it in the
+    /// background, as after a reconnect.
+    fn take_over(&self, handover: Box<dyn Any>) -> Result<(), TransportError> {
+        let handover = handover.downcast::<Handover>().map_err(|_| {
+            TransportError::Unsupported("not a LiveKit connection's handover".into())
+        })?;
+        let Handover {
+            session,
+            config,
+            token,
+        } = *handover;
+        log::info!(
+            "our own handle takes over the room of {}",
+            config.target.describe()
+        );
+        let previous = {
+            let mut installs = self
+                .shared
+                .installs
+                .lock()
+                .expect("installs mutex poisoned");
+            *installs += 1;
+            let connector = &self.shared.connector;
+            *connector.config.lock().expect("config mutex poisoned") = config;
+            *connector.token.lock().expect("token mutex poisoned") = token;
+            self.shared.session.send_replace(Some(session.clone()))
+        };
+        if let Some(previous) = previous {
+            close_room(previous);
+        }
+        let this = self.clone();
+        tokio::spawn(async move {
+            this.republish_local_tracks(&session).await;
+            this.reassert_local_key_index();
+        });
+        Ok(())
+    }
+
+    /// Before the first connect the publication is held, and goes out with
+    /// it; afterwards it is published at once, and carried onto every later
+    /// room.
     async fn publish(
         &self,
         options: PublishOptions,
     ) -> Result<Arc<dyn LocalTrackHandle>, TransportError> {
         let kind = options.kind;
-        let source_kind = livekit_track_source(kind);
-        // Muted before publishing, not after: livekit puts `track.is_muted()`
-        // into the `AddTrackRequest`, so the track is announced muted in the
-        // same request. Muting once the publish resolved would leave a window
-        // with a live unmuted track at the SFU — a hot mic.
-        let muted = options.muted;
-        match kind {
+        let source = match kind {
             MediaStreamKind::Microphone | MediaStreamKind::ScreenShareAudio => {
                 let config = options.audio.unwrap_or_default();
-                let source = NativeAudioSource::new(
+                LocalSource::Audio(NativeAudioSource::new(
                     AudioSourceOptions::default(),
                     config.sample_rate,
                     config.num_channels,
                     1000,
-                );
-                let track = LocalAudioTrack::create_audio_track(
-                    "audio",
-                    RtcAudioSource::Native(source.clone()),
-                );
-                if muted {
-                    track.mute();
-                }
-                let published = LocalTrack::Audio(track.clone());
-                self.session
-                    .room()
-                    .local_participant()
-                    .publish_track(
-                        LocalTrack::Audio(track),
-                        TrackPublishOptions {
-                            source: source_kind,
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .map_err(|error| TransportError::Connect(error.to_string()))?;
-                // A frame cryptor is created per published track, at index 0.
-                // If we have already rotated, this one must be moved onto the
-                // current index or its frames carry a key nobody holds.
-                self.reassert_local_key_index();
-                Ok(Arc::new(LiveKitLocalTrack {
-                    kind,
-                    source: LocalSource::Audio(source),
-                    track: published,
-                    session: Arc::clone(&self.session),
-                    closed: AtomicBool::new(false),
-                    retraction_failed: AtomicBool::new(false),
-                }))
+                ))
             }
             MediaStreamKind::Camera | MediaStreamKind::ScreenShare => {
                 let config = options.video.ok_or_else(|| {
@@ -375,52 +595,47 @@ impl TransportConnection for LiveKitTransportConnection {
                         "publishing video requires a VideoSourceConfig".into(),
                     )
                 })?;
-                let source = NativeVideoSource::new(
-                    VideoResolution {
-                        width: config.width,
-                        height: config.height,
-                    },
-                    matches!(kind, MediaStreamKind::ScreenShare),
-                );
-                let track = LocalVideoTrack::create_video_track(
-                    "video",
-                    RtcVideoSource::Native(source.clone()),
-                );
-                if muted {
-                    track.mute();
-                }
-                let published = LocalTrack::Video(track.clone());
-                // Below 480px livekit computes a single simulcast encoding
-                // (rid "q" only) — a degenerate shape the SFU delivered no
-                // frames for in testing. One layer wants a plain encoding.
-                let simulcast = options.simulcast && u32::max(config.width, config.height) >= 480;
-                self.session
-                    .room()
-                    .local_participant()
-                    .publish_track(
-                        LocalTrack::Video(track),
-                        TrackPublishOptions {
-                            source: source_kind,
-                            simulcast,
-                            ..Default::default()
+                LocalSource::Video {
+                    source: NativeVideoSource::new(
+                        VideoResolution {
+                            width: config.width,
+                            height: config.height,
                         },
-                    )
-                    .await
-                    .map_err(|error| TransportError::Connect(error.to_string()))?;
-                self.reassert_local_key_index();
-                Ok(Arc::new(LiveKitLocalTrack {
-                    kind,
-                    source: LocalSource::Video(source),
-                    track: published,
-                    session: Arc::clone(&self.session),
-                    closed: AtomicBool::new(false),
-                    retraction_failed: AtomicBool::new(false),
-                }))
+                        matches!(kind, MediaStreamKind::ScreenShare),
+                    ),
+                    // Below 480px livekit computes a single simulcast encoding
+                    // (rid "q" only) — a degenerate shape the SFU delivered no
+                    // frames for in testing. One layer wants a plain encoding.
+                    simulcast: options.simulcast && u32::max(config.width, config.height) >= 480,
+                }
             }
-            MediaStreamKind::Data => Err(TransportError::Unsupported(
-                "data publishing is not implemented yet".into(),
-            )),
+            MediaStreamKind::Data => {
+                return Err(TransportError::Unsupported(
+                    "data publishing is not implemented yet".into(),
+                ));
+            }
+        };
+        let track = Arc::new(LiveKitLocalTrack {
+            kind,
+            source,
+            published: Mutex::new(None),
+            muted: AtomicBool::new(options.muted),
+            closed: AtomicBool::new(false),
+            retraction_failed: AtomicBool::new(false),
+        });
+        if let Some(session) = self.current_session() {
+            track.publish_on(&session).await?;
+            // A frame cryptor is created per published track, at index 0.
+            // If we have already rotated, this one must be moved onto the
+            // current index or its frames carry a key nobody holds.
+            self.reassert_local_key_index();
         }
+        self.shared
+            .local_tracks
+            .lock()
+            .expect("local tracks mutex poisoned")
+            .push(Arc::downgrade(&track));
+        Ok(track)
     }
 
     async fn apply_constraints(
@@ -431,7 +646,10 @@ impl TransportConnection for LiveKitTransportConnection {
     ) -> Result<(), TransportError> {
         // The participant or publication being gone is not an error: the
         // engine re-applies constraints when the stream (re)appears.
-        let participants = self.session.room().remote_participants();
+        let Some(session) = self.current_session() else {
+            return Ok(());
+        };
+        let participants = session.room().remote_participants();
         let Some(participant) = participants.get(&ParticipantIdentity::from(identity)) else {
             return Ok(());
         };
@@ -498,7 +716,10 @@ impl TransportConnection for LiveKitTransportConnection {
     /// the postcondition callers want ("this connection is not open") already
     /// holds, so reporting a failure only makes a clean hangup look broken.
     async fn close(&self) -> Result<(), TransportError> {
-        match self.session.room().close().await {
+        let Some(session) = self.current_session() else {
+            return Ok(());
+        };
+        match session.room().close().await {
             Ok(()) => Ok(()),
             Err(livekit::RoomError::AlreadyClosed) => {
                 log::debug!(
@@ -512,22 +733,37 @@ impl TransportConnection for LiveKitTransportConnection {
     }
 }
 
-/// The native source behind a local publication.
+/// Closes a room this handle no longer uses, in the background.
+fn close_room(session: Arc<LiveKitSession>) {
+    tokio::spawn(async move {
+        if let Err(error) = session.room().close().await {
+            log::debug!("closing the previous room: {error}");
+        }
+    });
+}
+
+/// The native source behind a local publication, which outlives every room
+/// it is published on.
 enum LocalSource {
     Audio(NativeAudioSource),
-    Video(NativeVideoSource),
+    Video {
+        source: NativeVideoSource,
+        simulcast: bool,
+    },
 }
 
 /// A local LiveKit publication accepting raw frames from the application.
+/// The source is the stable part; the LiveKit track over it is created anew
+/// for each room it is published on (034 R24).
 struct LiveKitLocalTrack {
     kind: MediaStreamKind,
     source: LocalSource,
-    /// The published track, kept so it can be muted. Cheap to clone — LiveKit's
-    /// track types are handles.
-    track: LocalTrack,
-    /// The session this was published on, kept so the publication can be
-    /// retracted. The room never holds this wrapper, so no cycle.
-    session: Arc<LiveKitSession>,
+    /// The track published now and the session it is on, kept so it can be
+    /// muted and retracted; `None` before the first connect. The room never
+    /// holds this wrapper, so no cycle.
+    published: Mutex<Option<(LocalTrack, Arc<LiveKitSession>)>>,
+    /// The mute the transport was last told: applied to every room.
+    muted: AtomicBool,
     /// Set once `unpublish` succeeds — not before: a failed retraction
     /// leaves the publication live at the SFU, and the handle must stay
     /// usable to feed, mute, and retry it. Captures landing in the source
@@ -543,18 +779,86 @@ struct LiveKitLocalTrack {
     retraction_failed: AtomicBool,
 }
 
+impl LiveKitLocalTrack {
+    /// Publishes a new track over the source on `session`, muted as held.
+    ///
+    /// Muted before publishing, not after: livekit puts `track.is_muted()`
+    /// into the `AddTrackRequest`, so the track is announced muted in the
+    /// same request. Muting once the publish resolved would leave a window
+    /// with a live unmuted track at the SFU — a hot mic.
+    async fn publish_on(&self, session: &Arc<LiveKitSession>) -> Result<(), TransportError> {
+        let muted = self.muted.load(Ordering::Acquire);
+        let source_kind = livekit_track_source(self.kind);
+        let (track, options) = match &self.source {
+            LocalSource::Audio(source) => {
+                let track = LocalAudioTrack::create_audio_track(
+                    "audio",
+                    RtcAudioSource::Native(source.clone()),
+                );
+                if muted {
+                    track.mute();
+                }
+                (
+                    LocalTrack::Audio(track),
+                    TrackPublishOptions {
+                        source: source_kind,
+                        ..Default::default()
+                    },
+                )
+            }
+            LocalSource::Video { source, simulcast } => {
+                let track = LocalVideoTrack::create_video_track(
+                    "video",
+                    RtcVideoSource::Native(source.clone()),
+                );
+                if muted {
+                    track.mute();
+                }
+                (
+                    LocalTrack::Video(track),
+                    TrackPublishOptions {
+                        source: source_kind,
+                        simulcast: *simulcast,
+                        ..Default::default()
+                    },
+                )
+            }
+        };
+        session
+            .room()
+            .local_participant()
+            .publish_track(track.clone(), options)
+            .await
+            .map_err(|error| TransportError::Connect(error.to_string()))?;
+        *self.published.lock().expect("published mutex poisoned") =
+            Some((track, Arc::clone(session)));
+        Ok(())
+    }
+
+    fn current_track(&self) -> Option<LocalTrack> {
+        self.published
+            .lock()
+            .expect("published mutex poisoned")
+            .as_ref()
+            .map(|(track, _)| track.clone())
+    }
+}
+
 #[async_trait]
 impl LocalTrackHandle for LiveKitLocalTrack {
     fn kind(&self) -> MediaStreamKind {
         self.kind
     }
 
+    /// Held for the rooms it is published on later, too.
     fn set_muted(&self, muted: bool) -> Result<(), TransportError> {
-        match (&self.track, muted) {
-            (LocalTrack::Audio(track), true) => track.mute(),
-            (LocalTrack::Audio(track), false) => track.unmute(),
-            (LocalTrack::Video(track), true) => track.mute(),
-            (LocalTrack::Video(track), false) => track.unmute(),
+        self.muted.store(muted, Ordering::Release);
+        match (self.current_track(), muted) {
+            (Some(LocalTrack::Audio(track)), true) => track.mute(),
+            (Some(LocalTrack::Audio(track)), false) => track.unmute(),
+            (Some(LocalTrack::Video(track)), true) => track.mute(),
+            (Some(LocalTrack::Video(track)), false) => track.unmute(),
+            (None, _) => {}
         }
         Ok(())
     }
@@ -567,9 +871,18 @@ impl LocalTrackHandle for LiveKitLocalTrack {
     /// work, without rollback), not the SFU, so it stays an error rather than
     /// reporting a retraction that may never have happened.
     async fn unpublish(&self) -> Result<(), TransportError> {
-        let sid = self.track.sid();
-        match self
-            .session
+        let published = self
+            .published
+            .lock()
+            .expect("published mutex poisoned")
+            .clone();
+        let Some((track, session)) = published else {
+            // Never went out: nothing to retract, and no room gets it later.
+            self.closed.store(true, Ordering::Release);
+            return Ok(());
+        };
+        let sid = track.sid();
+        match session
             .room()
             .local_participant()
             .unpublish_track(&sid)
@@ -623,7 +936,7 @@ impl LocalTrackHandle for LiveKitLocalTrack {
                 "this publication was unpublished".into(),
             ));
         }
-        let LocalSource::Video(source) = &self.source else {
+        let LocalSource::Video { source, .. } = &self.source else {
             return Err(TransportError::Unsupported(
                 "this publication does not accept video frames".into(),
             ));
@@ -639,10 +952,11 @@ impl LocalTrackHandle for LiveKitLocalTrack {
     }
 
     async fn send_stats(&self) -> Option<SendStats> {
-        if !matches!(self.source, LocalSource::Video(_)) {
+        if !matches!(self.source, LocalSource::Video { .. }) {
             return None;
         }
-        let stats = match self.track.get_stats().await {
+        let track = self.current_track()?;
+        let stats = match track.get_stats().await {
             Ok(stats) => stats,
             Err(error) => {
                 log::debug!("could not read send stats: {error}");
@@ -690,9 +1004,13 @@ impl LocalTrackHandle for LiveKitLocalTrack {
 /// Translate the LiveKit room event stream into the transport-neutral
 /// [`ConnectionEvent`] vocabulary. Runs until the room closes its channel;
 /// the outbound channel closing (engine gone) stops it early.
+///
+/// `session` is the room the events come from, read for the speaker list.
 async fn translate_room_events(
     mut events: UnboundedReceiver<RoomEvent>,
     tx: UnboundedSender<ConnectionEvent>,
+    owner: LiveKitTransportConnection,
+    session: std::sync::Weak<LiveKitSession>,
 ) {
     while let Some(event) = events.recv().await {
         let translated = match event {
@@ -708,11 +1026,29 @@ async fn translate_room_events(
                 participant,
             } => {
                 let kind = stream_kind(publication.source(), publication.kind());
-                Some(ConnectionEvent::TrackAdded {
-                    identity: participant.identity().to_string(),
-                    kind,
-                    track: Arc::new(LiveKitRemoteTrack { kind, track }),
-                })
+                // Our rooms are always encrypted, and livekit attaches no frame
+                // cryptor to a track declared unencrypted: its frames would be
+                // played as they come. The SFU relays that declaration, so it
+                // could also inject frames of its own under this name.
+                if publication.encryption_type() == EncryptionType::None {
+                    publication.set_subscribed(false);
+                    Some(ConnectionEvent::TrackNotEncrypted {
+                        identity: participant.identity().to_string(),
+                        kind,
+                    })
+                } else {
+                    Some(ConnectionEvent::TrackAdded {
+                        identity: participant.identity().to_string(),
+                        kind,
+                        track: Arc::new(LiveKitRemoteTrack { kind, track }),
+                    })
+                }
+            }
+            // A track refused as unencrypted was never added.
+            RoomEvent::TrackUnsubscribed { publication, .. }
+                if publication.encryption_type() == EncryptionType::None =>
+            {
+                None
             }
             RoomEvent::TrackUnsubscribed {
                 publication,
@@ -730,21 +1066,47 @@ async fn translate_room_events(
                 participant,
                 publication,
             } => remote_mute_event(&participant, &publication, false),
-            RoomEvent::ActiveSpeakersChanged { speakers } => {
-                Some(ConnectionEvent::ActiveSpeakers {
-                    // `audio_level` comes with the same event; without it a host
-                    // has to meter the PCM itself to answer "how loud".
-                    speakers: speakers
-                        .iter()
-                        .map(|speaker| SpeakingParticipant {
-                            identity: speaker.identity().to_string(),
-                            level: speaker.audio_level(),
+            RoomEvent::ActiveSpeakersChanged { .. } => {
+                // The SFU sends speaker *changes* (who started, whose level
+                // moved, who stopped) and the room re-emits each as if it were
+                // the whole list, so a speaker holding a steady level is
+                // missing from it. The engine reads the list as a snapshot, so
+                // it is rebuilt from every participant's flag, which the room
+                // keeps per change. `audio_level` rides along: without it a
+                // host has to meter the PCM itself to answer "how loud".
+                session.upgrade().map(|session| {
+                    let room = session.room();
+                    let local = room.local_participant();
+                    let mut speakers: Vec<SpeakingParticipant> = room
+                        .remote_participants()
+                        .values()
+                        .filter(|p| p.is_speaking())
+                        .map(|p| SpeakingParticipant {
+                            identity: p.identity().to_string(),
+                            level: p.audio_level(),
                         })
-                        .collect(),
+                        .collect();
+                    if local.is_speaking() {
+                        speakers.push(SpeakingParticipant {
+                            identity: local.identity().to_string(),
+                            level: local.audio_level(),
+                        });
+                    }
+                    ConnectionEvent::ActiveSpeakers { speakers }
                 })
             }
             RoomEvent::Reconnecting => Some(ConnectionEvent::Reconnecting),
-            RoomEvent::Reconnected => Some(ConnectionEvent::Reconnected),
+            RoomEvent::Reconnected => {
+                // When LiveKit gives up resuming it restarts the room itself and
+                // republishes our tracks on new peer connections, before this
+                // event, each with a new frame cryptor at index 0. Nothing of
+                // ours publishes them, so nothing else moves them onto the
+                // current index: after a rotation, peers that joined since held
+                // no key for index 0 and saw none of our media. After a resume,
+                // which keeps the cryptors, this changes nothing.
+                owner.reassert_local_key_index();
+                Some(ConnectionEvent::Reconnected)
+            }
             RoomEvent::Disconnected { reason } => Some(ConnectionEvent::Closed {
                 message: format!("{reason:?}"),
             }),
@@ -1034,4 +1396,92 @@ fn copy_plane(
         dst[row * dst_stride..][..width].copy_from_slice(&src[row * src_stride..][..width]);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn signal_client_error(status: u16) -> crate::Error {
+        crate::Error::Room(livekit::RoomError::Engine(
+            livekit::rtc_engine::EngineError::Signal(SignalError::Client(
+                reqwest::StatusCode::from_u16(status).unwrap(),
+                "refused".into(),
+            )),
+        ))
+    }
+
+    /// A restarted SFU has forgotten the room our token names (LiveKit keeps
+    /// rooms in memory, and `auto_create` is off where the token service
+    /// creates them): a fresh token brings it back, so it is no refusal.
+    #[test]
+    fn a_forgotten_room_is_the_token_not_a_refusal() {
+        assert!(matches!(
+            classify_room_error(signal_client_error(404)),
+            TransportError::TokenRejected(_)
+        ));
+        assert!(matches!(
+            classify_room_error(signal_client_error(401)),
+            TransportError::TokenRejected(_)
+        ));
+        assert!(matches!(
+            classify_room_error(signal_client_error(403)),
+            TransportError::Refused(_)
+        ));
+    }
+
+    fn cs_api_config() -> LiveKitTransportConfig {
+        LiveKitTransportConfig {
+            target: LiveKitTarget::CsApi {
+                url: "wss://sfu.other.org".into(),
+                server_name: "other.org".into(),
+            },
+            room_id: "!room:example.org".into(),
+            slot_id: "m.call#room".into(),
+            member_id: "member-1".into(),
+            device_id: "DEVICE".into(),
+        }
+    }
+
+    /// A transport naming only an SFU `url` gets its token from the homeserver,
+    /// for that SFU's server, and connects to that very `url`: the answer
+    /// carries no SFU URL of its own.
+    #[tokio::test]
+    async fn a_url_only_target_asks_the_homeserver_for_its_sfu() {
+        let backend = matrix_rtc_core::testing::MockBackend::new();
+        let token = acquire_token(&reqwest::Client::new(), &cs_api_config(), &backend)
+            .await
+            .expect("a token");
+        assert_eq!(token.jwt, "mock-jwt");
+        assert_eq!(token.url, "wss://sfu.other.org");
+        assert_eq!(
+            *backend.livekit_token_requests.lock().unwrap(),
+            [matrix_rtc_core::LiveKitTokenRequest {
+                server_name: Some("other.org".into()),
+                url: "wss://sfu.other.org".into(),
+                room_id: "!room:example.org".into(),
+                slot_id: "m.call#room".into(),
+                member_id: "member-1".into(),
+            }]
+        );
+    }
+
+    /// A homeserver without MSC4195 refuses for good; a rate limit may pass.
+    #[tokio::test]
+    async fn a_homeserver_without_the_endpoint_is_a_refusal() {
+        let backend = matrix_rtc_core::testing::MockBackend::new();
+        for (status, refused) in [(404, true), (403, true), (429, false), (502, false)] {
+            *backend.livekit_token_answer.lock().unwrap() = Err(
+                matrix_rtc_core::BackendError::with_matrix_error(None, Some(status), "no"),
+            );
+            let error = acquire_token(&reqwest::Client::new(), &cs_api_config(), &backend)
+                .await
+                .expect_err("no token");
+            assert_eq!(
+                matches!(classify_token_error(error), TransportError::Refused(_)),
+                refused,
+                "status {status}"
+            );
+        }
+    }
 }

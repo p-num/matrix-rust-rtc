@@ -13,8 +13,13 @@ pub enum FfiJoinTransport {
     /// Publish on the first LiveKit transport the homeserver advertises
     /// (`rtcTransports` on the backend); the join fails if there is none.
     Advertised,
-    /// Publish on this LiveKit focus, whatever the homeserver advertises.
-    Publish { livekit_service_url: String },
+    /// Publish on this LiveKit transport, whatever the homeserver advertises:
+    /// an SFU `url` (tokens from the homeserver), the legacy JWT service's
+    /// `livekit_service_url`, or both (tokens from the service). At least one.
+    Publish {
+        url: Option<String>,
+        livekit_service_url: Option<String>,
+    },
     /// Publish nothing and only receive, as a recorder or other observer does.
     ReceiveOnly,
 }
@@ -33,9 +38,9 @@ pub struct FfiEncryptionConfig {
     pub max_key_lifetime_ms: Option<u64>,
     /// Whether to manage media keys (default: true).
     pub manage_media_keys: Option<bool>,
-    /// Whether to discard keys from devices that are not cross-signed
+    /// Whether to discard keys from senders the client does not confirm
     /// (default: true, per MSC4153).
-    pub require_cross_signed_sender: Option<bool>,
+    pub require_confirmed_sender: Option<bool>,
 }
 
 /// What kind of call a join is. Only a DM call can ring, so a group call
@@ -140,15 +145,16 @@ pub struct FfiJoinSessionParams {
     ///
     /// A different clock from `keep_alive_timeout_ms`: this is how long the
     /// homeserver keeps the membership at all. The SDK re-sends the membership
-    /// at half this interval, so shortening it buys nothing but traffic.
+    /// once a third of it has passed, so shortening it buys nothing but traffic.
     pub sticky_duration_ms: Option<u64>,
     /// Optional membership lifetime to fall back to on a homeserver that
     /// refuses MSC4140 delayed events, in milliseconds (default: 300000).
     ///
     /// Only ever used on such a homeserver, where nothing clears a crashed
     /// client's membership except this lifetime running out. Raising it trades a
-    /// slower cleanup for less signalling; the SDK re-sends the membership at
-    /// half this interval, so 300000 means a membership event every 2½ minutes.
+    /// slower cleanup for less signalling; the SDK re-sends the membership once
+    /// a third of it has passed, so 300000 means a membership event every 100 s,
+    /// and an outage of up to about 3 min 20 s never lapses it.
     /// Do not lower it below 300000 — MSC4354 says a sticky duration "SHOULD NOT
     /// be set to below 5 minutes", because a server whose clock runs behind
     /// expires sticky events early and a shorter duration cannot absorb that.
@@ -204,17 +210,27 @@ pub struct FfiLeaveSessionParams {
     pub leave_reason: Option<crate::FfiLeaveReason>,
 }
 
-impl From<FfiJoinTransport> for matrix_rtc_call::JoinTransport {
-    fn from(value: FfiJoinTransport) -> Self {
-        match value {
+impl TryFrom<FfiJoinTransport> for matrix_rtc_call::JoinTransport {
+    type Error = crate::MatrixRtcFfiError;
+
+    fn try_from(value: FfiJoinTransport) -> Result<Self, Self::Error> {
+        Ok(match value {
             FfiJoinTransport::Advertised => Self::Advertised,
             FfiJoinTransport::Publish {
+                url,
                 livekit_service_url,
-            } => Self::Publish(matrix_rtc_core::LiveKitTransport {
-                livekit_service_url,
-            }),
+            } => Self::Publish(
+                matrix_rtc_core::LiveKitTransport::new(url, livekit_service_url, None).ok_or_else(
+                    || {
+                        crate::MatrixRtcFfiError::InvalidInput(
+                            "a published LiveKit transport needs a url or a livekit_service_url"
+                                .to_owned(),
+                        )
+                    },
+                )?,
+            ),
             FfiJoinTransport::ReceiveOnly => Self::ReceiveOnly,
-        }
+        })
     }
 }
 
@@ -225,7 +241,7 @@ impl From<FfiEncryptionConfig> for matrix_rtc_core::EncryptionConfig {
             key_rotation_grace_period_ms: value.key_rotation_grace_period_ms.unwrap_or(10000),
             max_key_lifetime_ms: value.max_key_lifetime_ms.unwrap_or(90 * 60 * 1000),
             manage_media_keys: value.manage_media_keys.unwrap_or(true),
-            require_cross_signed_sender: value.require_cross_signed_sender.unwrap_or(true),
+            require_confirmed_sender: value.require_confirmed_sender.unwrap_or(true),
         }
     }
 }
@@ -239,8 +255,15 @@ impl FfiJoinSessionParams {
         let transport = match &self.transport {
             FfiJoinTransport::Advertised => "advertised".to_owned(),
             FfiJoinTransport::Publish {
+                url,
                 livekit_service_url,
-            } => format!("publish:{livekit_service_url}"),
+            } => format!(
+                "publish:{}",
+                livekit_service_url
+                    .as_deref()
+                    .or(url.as_deref())
+                    .unwrap_or("?")
+            ),
             FfiJoinTransport::ReceiveOnly => "receive_only".to_owned(),
         };
 
@@ -267,13 +290,15 @@ impl FfiJoinSessionParams {
     /// host-chosen `member.id` reused across joins would keep the MSC4195
     /// participant identity stable while the key index restarts at 0, so peers
     /// decrypt new media with a stale key and never recover.
-    pub(crate) fn into_call(self) -> matrix_rtc_call::CallJoinOptions {
+    pub(crate) fn into_call(
+        self,
+    ) -> Result<matrix_rtc_call::CallJoinOptions, crate::MatrixRtcFfiError> {
         let mut options = matrix_rtc_call::CallJoinOptions::new();
         if let Some(name) = self.application_slot_id {
             options = options.slot(name);
         }
         let join = &mut options.join;
-        join.transport = self.transport.into();
+        join.transport = self.transport.try_into()?;
         join.encryption_config = self.encryption_config.map(Into::into);
         join.keep_alive_timeout_ms = self.keep_alive_timeout_ms;
         join.sticky_duration_ms = self.sticky_duration_ms;
@@ -292,7 +317,7 @@ impl FfiJoinSessionParams {
         }
         options.kind = self.kind.into();
         options.reactions = self.reactions.map(Into::into);
-        options
+        Ok(options)
     }
 }
 

@@ -107,6 +107,8 @@ pub struct LocalVideoTrack {
     source: RtcVideoSource,
     packet_trailer_handler: Arc<Mutex<Option<PacketTrailerHandler>>>,
     publish_timing_tx: Arc<Mutex<Option<broadcast::Sender<PublishTimingEvent>>>>,
+    /// Last qualities requested by dynacast, re-applied after renegotiation.
+    subscribed_qualities: Arc<Mutex<Option<Vec<proto::SubscribedQuality>>>>,
 }
 
 impl Debug for LocalVideoTrack {
@@ -152,6 +154,7 @@ impl LocalVideoTrack {
             source,
             packet_trailer_handler: Arc::new(Mutex::new(None)),
             publish_timing_tx: Arc::new(Mutex::new(None)),
+            subscribed_qualities: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -323,6 +326,10 @@ impl LocalVideoTrack {
     }
 
     pub(crate) fn set_transceiver(&self, transceiver: Option<RtpTransceiver>) {
+        // clear subscribed qualities on unpublish
+        if transceiver.is_none() {
+            *self.subscribed_qualities.lock() = None;
+        }
         self.inner.info.write().transceiver = transceiver;
     }
 
@@ -356,6 +363,19 @@ impl LocalVideoTrack {
         &self,
         qualities: &[proto::SubscribedQuality],
     ) -> RoomResult<()> {
+        merge_qualities(self.subscribed_qualities.lock().get_or_insert_with(Vec::new), qualities);
+        self.apply_publishing_layers(qualities)
+    }
+
+    /// Re-applies the last dynacast qualities, since renegotiation re-enables paused layers.
+    pub(crate) fn refresh_publishing_layers(&self) -> RoomResult<()> {
+        let Some(qualities) = self.subscribed_qualities.lock().clone() else {
+            return Ok(());
+        };
+        self.apply_publishing_layers(&qualities)
+    }
+
+    fn apply_publishing_layers(&self, qualities: &[proto::SubscribedQuality]) -> RoomResult<()> {
         let transceiver = self.transceiver().ok_or_else(|| {
             RoomError::Internal("cannot set publishing layers: no transceiver".into())
         })?;
@@ -370,17 +390,19 @@ impl LocalVideoTrack {
 
         let mut changed = false;
         for encoding in &mut params.encodings {
-            let quality = crate::options::video_quality_for_rid_or_default(&encoding.rid);
+            // The SFU addresses layers by spatial index (0 = Low), so a
+            // single rid-less encoding is addressed as Low, not High.
+            let rid = if encoding.rid.is_empty() { "q" } else { encoding.rid.as_str() };
+            let quality = crate::options::video_quality_for_rid_or_default(rid);
 
-            let should_active = qualities
-                .iter()
-                .find(|q| q.quality == quality as i32)
-                .map(|q| q.enabled)
-                .unwrap_or(false);
+            // A quality missing from the update is left untouched.
+            let Some(subscribed) = qualities.iter().find(|q| q.quality == quality as i32) else {
+                continue;
+            };
 
-            if encoding.active != should_active {
+            if encoding.active != subscribed.enabled {
                 changed = true;
-                encoding.active = should_active;
+                encoding.active = subscribed.enabled;
             }
         }
 
@@ -394,16 +416,66 @@ impl LocalVideoTrack {
             })
             .collect();
 
-        sender
-            .set_parameters(params)
-            .map_err(|e| RoomError::Internal(format!("failed to set sender parameters: {}", e)))?;
-
         if changed {
+            sender.set_parameters(params).map_err(|e| {
+                RoomError::Internal(format!("failed to set sender parameters: {}", e))
+            })?;
             log::debug!("dynacast: layers changed -> [{}]", layers.join(", "));
         } else {
             log::debug!("dynacast: layers unchanged [{}]", layers.join(", "));
         }
 
         Ok(())
+    }
+
+    /// Applies publishing-layer quality state for end-to-end tests.
+    #[doc(hidden)]
+    #[cfg(feature = "__lk-e2e-test")]
+    pub fn set_publishing_layers_for_test(
+        &self,
+        qualities: &[(PublishingLayerQuality, bool)],
+    ) -> RoomResult<()> {
+        let qualities: Vec<proto::SubscribedQuality> = qualities
+            .iter()
+            .map(|(quality, enabled)| proto::SubscribedQuality {
+                quality: proto::VideoQuality::from(*quality) as i32,
+                enabled: *enabled,
+            })
+            .collect();
+        self.set_publishing_layers(&qualities)
+    }
+}
+
+/// Merges `update` into `cached` by quality, leaving qualities missing from an update untouched.
+fn merge_qualities(
+    cached: &mut Vec<proto::SubscribedQuality>,
+    update: &[proto::SubscribedQuality],
+) {
+    for quality in update {
+        match cached.iter_mut().find(|q| q.quality == quality.quality) {
+            Some(existing) => existing.enabled = quality.enabled,
+            None => cached.push(*quality),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn quality(quality: proto::VideoQuality, enabled: bool) -> proto::SubscribedQuality {
+        proto::SubscribedQuality { quality: quality as i32, enabled }
+    }
+
+    #[test]
+    fn merge_qualities_keeps_earlier_layers() {
+        let mut cached = Vec::new();
+        merge_qualities(&mut cached, &[quality(proto::VideoQuality::Medium, false)]);
+        merge_qualities(&mut cached, &[quality(proto::VideoQuality::High, false)]);
+        merge_qualities(&mut cached, &[quality(proto::VideoQuality::Medium, true)]);
+        assert_eq!(
+            cached,
+            [quality(proto::VideoQuality::Medium, true), quality(proto::VideoQuality::High, false)]
+        );
     }
 }

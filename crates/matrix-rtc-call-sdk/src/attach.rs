@@ -11,13 +11,13 @@
 //! media (peers in the roster with nothing to decrypt), so every host — the
 //! FFI and wasm media sessions, the native `LiveKitCall` facade — goes through
 //! [`attach_media`] rather than repeating it. Transport-specific setup (the key
-//! ring, the token endpoint) stays with the caller.
+//! ring) stays with the caller.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use matrix_rtc_call::RtcCall;
-use matrix_rtc_core::compat::MembershipFormat;
-use matrix_rtc_core::{MatrixBackend, RtcIdentityMapper, TransportIntent};
+use matrix_rtc_core::{IdentitySubject, MatrixBackend, RtcIdentityMapper, TransportIntent};
 use matrix_rtc_transport::{
     ConnectionContext, MediaKeyHandler, MediaTransport, OwnFocusTransport, OwnMemberClaims,
     TransportConnection, TransportError,
@@ -33,16 +33,20 @@ pub struct AttachOptions {
     /// The account and device the call was joined as.
     pub own_user_id: String,
     pub own_device_id: String,
-    /// How `(user, device, member_id)` becomes a transport identity. MUST be
+    /// How a member becomes a transport identity. MUST be
     /// the one the transport was built with: the core's encryption manager,
     /// the transport, our own identity and the key ring all derive through
     /// it, and a skew between them is silent.
     pub identity_mapper: RtcIdentityMapper,
-    /// The membership format the call's room was opened in: the token request
-    /// names the slot as that generation spells it.
-    pub format: MembershipFormat,
     /// Damping of the tile order.
     pub stability: StabilityConfig,
+    /// How long our own focus may stay unreachable before the call ends
+    /// (034 R24): [`OWN_RECONNECT_BUDGET`](matrix_rtc_transport::pool::OWN_RECONNECT_BUDGET)
+    /// unless a host configured another.
+    pub own_reconnect_budget: Duration,
+    /// Whether our media may move to a peer's SFU while ours is down
+    /// (034 R25, contract C11): only where that SFU accepts our token.
+    pub sfu_fallback: bool,
 }
 
 /// A call with media attached.
@@ -96,14 +100,16 @@ where
         )));
     }
     let own_key = match call.transport() {
-        TransportIntent::Publish(published) => {
-            Some(transport.connection_key(published).ok_or_else(|| {
-                AttachError::UnsupportedTransport(format!(
-                    "the call publishes on {published:?}, which is not a {} transport",
-                    transport.transport_type(),
-                ))
-            })?)
-        }
+        TransportIntent::Publish(published) => Some(
+            transport
+                .connection_key(published, &options.own_user_id)
+                .ok_or_else(|| {
+                    AttachError::UnsupportedTransport(format!(
+                        "the call publishes on {published:?}, which is not a {} transport",
+                        transport.transport_type(),
+                    ))
+                })?,
+        ),
         TransportIntent::ReceiveOnly { .. } => None,
     };
     log::info!(
@@ -121,6 +127,8 @@ where
     let raised_hands = call.subscribe_raised_hands().await;
     let reactions = call.subscribe_reactions().await;
     let ended = call.subscribe_ended();
+    let signalling = call.subscribe_signalling_health().await;
+    let own_membership_lapsed = call.subscribe_own_membership_lapsed().await;
 
     // Mapper before handler: identities are derived at signal time, and the
     // replay below derives them too, so a handler installed first would import
@@ -139,8 +147,7 @@ where
 
     let ctx = ConnectionContext {
         room_id: room_id.clone(),
-        // The token request names the slot as this generation spells it.
-        slot_id: options.format.token_slot_id(&slot_id).into_owned(),
+        slot_id: call.format().token_slot_id(&slot_id).into_owned(),
         member: OwnMemberClaims {
             member_id: member_id.clone(),
             user_id: options.own_user_id.clone(),
@@ -159,6 +166,10 @@ where
             ended: Some(ended),
             media_status: Some(call.media_status_reporter()),
             stability: options.stability,
+            signalling: Some(signalling),
+            own_membership_lapsed,
+            own_reconnect_budget: options.own_reconnect_budget,
+            sfu_fallback: options.sfu_fallback,
         },
         memberships,
     );
@@ -190,24 +201,35 @@ where
         );
     }
 
-    let own_identity =
-        (options.identity_mapper)(&options.own_user_id, &options.own_device_id, &member_id);
+    // Derived as the core derives it for our own key: from the transport we
+    // publish on, falling back the same way when nothing is published.
+    let own_transports = match call.transport() {
+        TransportIntent::Publish(published) => std::slice::from_ref(published),
+        TransportIntent::ReceiveOnly { .. } => &[],
+    };
+    let own_identity = (options.identity_mapper)(&IdentitySubject {
+        user_id: &options.own_user_id,
+        device_id: Some(&options.own_device_id),
+        member_id: &member_id,
+        transports: own_transports,
+    })
+    .unwrap_or_else(|| format!("{}:{}", options.own_user_id, options.own_device_id));
     let own_connection = match &own_key {
         Some(own_key) => {
-            let (connection, connection_events) = transport
-                .connect_own(own_key, &ctx)
-                .await
-                .inspect_err(|error| {
-                    log::warn!("media: own focus {own_key} refused the connection: {error}");
-                })?;
-            engine.adopt_own_connection(Box::new(connection.clone()), connection_events);
+            // Not awaited: the join already has the user in the call, and our
+            // own focus connects, or is given up, within the reconnect budget
+            // like any loss (034 R24, contract C10). The status stays
+            // connecting until it is up.
+            let connection = transport.prepare_own(own_key, &ctx);
+            engine.connect_own(Box::new(connection.clone()));
 
             // Move our sender onto each key we rotate to. Without this we
             // advertise a rotation to peers and keep encrypting with the
             // previous key, so anyone joining after it decrypts nothing — and
             // the forward secrecy the rotation exists for is not delivered.
-            // After the connect and the replay, so the first key is already in
-            // the ring; the hook only ever *moves* the index.
+            // After the replay, so the first key is already in the ring; the
+            // hook only ever *moves* the index, and the handle re-asserts it
+            // on every connection it makes.
             let for_keys = connection.clone();
             key_handler.set_local_sender(
                 own_identity.clone(),
@@ -220,11 +242,14 @@ where
             }
             Some(connection)
         }
-        None => None,
+        None => {
+            // Nothing of ours to connect: a receive-only call is up once
+            // attached.
+            call.media_status_reporter().connected();
+            None
+        }
     };
 
-    // Our side is up: the own focus connected, or there is none to connect.
-    call.media_status_reporter().connected();
     log::info!("media: attached as member {member_id}, local identity {own_identity}");
     Ok(MediaAttachment {
         engine,

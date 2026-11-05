@@ -18,17 +18,24 @@
 //! Unadopted reconnect sessions are closed when their owning future is cancelled.
 
 use libwebrtc::prelude::*;
-use livekit_api::signal_client::{SignalError, SignalOptions};
 use livekit_datatrack::backend as dt;
 use livekit_protocol as proto;
-use livekit_runtime::{interval, Interval, JoinHandle, MissedTickBehavior};
+use livekit_signaling::{SignalError, SignalOptions};
 use parking_lot::{RwLock, RwLockReadGuard};
-use std::{borrow::Cow, fmt::Debug, sync::Arc, time::Duration};
-use thiserror::Error;
-use tokio::sync::{
-    mpsc, oneshot, Mutex as AsyncMutex, Notify, RwLock as AsyncRwLock,
-    RwLockReadGuard as AsyncRwLockReadGuard,
+use std::{
+    borrow::Cow,
+    collections::HashSet,
+    fmt::Debug,
+    sync::{Arc, Weak},
+    time::Duration,
 };
+use thiserror::Error;
+#[cfg(all(test, feature = "__lk-e2e-test"))]
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{
+    mpsc, oneshot, Notify, RwLock as AsyncRwLock, RwLockReadGuard as AsyncRwLockReadGuard,
+};
+use tokio::task::JoinHandle;
 
 pub use self::rtc_session::{SessionStats, INITIAL_BUFFERED_AMOUNT_LOW_THRESHOLD};
 use crate::prelude::ParticipantIdentity;
@@ -48,8 +55,14 @@ use crate::{ChatMessage, E2eeManager, TranscriptionSegment};
 mod dc_sender;
 pub mod lk_runtime;
 mod peer_transport;
+mod reconnect_strategy;
 mod rtc_events;
 mod rtc_session;
+
+// Re-exported to preserve the public `rtc_engine::RECONNECT_*` paths.
+pub use reconnect_strategy::{
+    RECONNECT_ATTEMPTS, RECONNECT_BACKOFF_MULTIPLIER, RECONNECT_BASE_DELAY, RECONNECT_MAX_DELAY,
+};
 
 #[cfg(all(test, feature = "__lk-e2e-test"))]
 mod reconnect_close_tests;
@@ -64,20 +77,27 @@ pub(crate) type EngineEmitter = mpsc::UnboundedSender<EngineEvent>;
 pub(crate) type EngineEvents = mpsc::UnboundedReceiver<EngineEvent>;
 pub(crate) type EngineResult<T> = Result<T, EngineError>;
 
-pub const RECONNECT_ATTEMPTS: u32 = 10;
-pub const RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Settling delay before checking PeerConnection state on the resume path.
+/// How long a resume waits before accepting "this transport never left `Connected`" as
+/// evidence that it is still good.
 ///
-/// Lets a freshly issued ICE-restart offer/answer round-trip take effect when the
-/// underlying PC was still in `Connected` at the moment we started the reconnect
-/// (e.g. signal-only failure). Without this, the resume can return success
-/// immediately and the next failure detector then trips the engine into a real
-/// disconnect.
+/// Only the ambiguous case waits: a transport that re-entered `Connected` during the resume
+/// has demonstrably reconnected and is accepted immediately. But a transport whose far end
+/// has silently gone away also still reports `Connected`, because ICE holds that state until
+/// its receiving timeout — so this has to outlast that timeout, or a dead transport is
+/// accepted as healthy.
 ///
-/// Only applied to the resume path. Full reconnect builds brand-new PCs which
-/// don't suffer from the "looks-Connected-but-isn't" race.
-pub const PC_RECONNECT_SETTLE_DELAY: Duration = Duration::from_secs(1);
+/// The cost is resume latency for a signal-only failure, where the media plane was fine and
+/// there is no reconnection to short-circuit on. Resume-only; a full reconnect builds new
+/// PeerConnections and has no stale state to misread.
+///
+/// This window cannot be replaced by watching for an ICE restart to take effect. Measured
+/// against a dev server, a same-node resume does perform a real subscriber ICE restart — the
+/// server's offer carries a fresh ice-ufrag and both transports gather a new generation — yet
+/// neither `IceConnectionState` nor `PeerConnectionState` leaves `Connected` at any point,
+/// because libwebrtc keeps the old candidate pair selected until the new one is ready. So
+/// "nothing transitioned" is the *normal* outcome of a healthy resume, and requiring an
+/// observed transition would time out every signal-only resume into a full reconnect.
+pub const PC_RECONNECT_SETTLE_DELAY: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum SimulateScenario {
@@ -89,9 +109,15 @@ pub enum SimulateScenario {
     Migration,
     ForceTcp,
     ForceTls,
-    /// Tells the server to issue a `LeaveRequest{Reconnect}`, forcing a
-    /// full reconnect (new RtcSession, republish required).
+    /// Client-driven full reconnect: forces the next reconnect to be a full
+    /// reconnect (new RtcSession, republish required) and triggers it locally,
+    /// without relying on the server. Mirrors client-sdk-js's `full-reconnect`.
     FullReconnect,
+    /// Asks the server to drop the signalling connection during the next resume,
+    /// then triggers a resume locally. The resume cannot complete, so the engine
+    /// escalates to a full reconnect — exercising the resume→full escalation
+    /// path. Mirrors client-sdk-js's `disconnect-signal-on-resume`.
+    DisconnectSignalOnResume,
 }
 
 #[derive(Error, Debug)]
@@ -119,6 +145,12 @@ pub struct EngineOptions {
 pub enum EngineEvent {
     ParticipantUpdate {
         updates: Vec<proto::ParticipantInfo>,
+    },
+    /// A signal resume fully recovered; any known participant whose identity
+    /// is not in `seen_identities` left the room while the signal link was
+    /// down and its disconnection must be synthesized.
+    ParticipantReconcile {
+        seen_identities: HashSet<ParticipantIdentity>,
     },
     MediaTrack {
         track: MediaStreamTrack,
@@ -209,6 +241,7 @@ pub enum EngineEvent {
     DataStreamTrailer {
         trailer: proto::data_stream::Trailer,
         participant_identity: String,
+        encryption_type: proto::encryption::Type,
     },
     DataChannelBufferedAmountLowThresholdChanged {
         kind: DataPacketKind,
@@ -225,6 +258,8 @@ pub enum EngineEvent {
     SubscribedQualityUpdate {
         update: proto::SubscribedQualityUpdate,
     },
+    /// A publisher answer was applied; dynacast layers must be re-applied.
+    RefreshPublishingLayers,
     LocalDataTrackInput(dt::local::InputEvent),
     RemoteDataTrackInput(dt::remote::InputEvent),
 }
@@ -241,6 +276,17 @@ struct EngineHandle {
     // If full_reconnect is true, the next attempt will not try to resume
     // and will instead do a full reconnect
     full_reconnect: bool,
+
+    // The disconnect reason that started the current reconnection episode.
+    // Carried through so that, if reconnection ultimately fails, the engine
+    // closes with the original cause rather than a generic `UnknownReason`.
+    reconnect_reason: DisconnectReason,
+
+    // The cause reported to the server on each resume attempt of this episode, so
+    // server-side telemetry can attribute why clients reconnect. Set from the
+    // failure that started the episode and not overwritten by later failures,
+    // which are consequences of the first.
+    reported_reconnect_reason: proto::ReconnectReason,
     engine_task: Option<(JoinHandle<()>, oneshot::Sender<()>)>,
 }
 
@@ -275,7 +321,7 @@ impl Drop for SessionCandidate {
             let session = self.session.clone();
             #[cfg(all(test, feature = "__lk-e2e-test"))]
             let disposed = self.disposed.take();
-            livekit_runtime::spawn(async move {
+            tokio::spawn(async move {
                 session.close(DisconnectReason::ClientInitiated).await;
                 #[cfg(all(test, feature = "__lk-e2e-test"))]
                 if let Some(disposed) = disposed {
@@ -301,7 +347,10 @@ struct EngineInner {
     // We can simply wait for reconnection by trying to acquire a read lock.
     // (This also prevents new reconnection to happens if a read guard is still held)
     reconnecting_lock: AsyncRwLock<()>,
-    reconnecting_interval: AsyncMutex<Interval>,
+
+    // Signalled when a server-requested reconnect wants the next attempt to fire
+    // immediately, collapsing the exponential backoff wait between attempts.
+    retry_now_notify: Arc<Notify>,
 
     // A one-shot barrier at the actual connected-candidate ownership boundary.
     // Tests use a real local SFU; no production connection is replaced by a fake.
@@ -389,6 +438,15 @@ impl RtcEngine {
         self.inner.close(reason).await
     }
 
+    /// Test-only: returns a probe that reports whether the engine internals have been
+    /// dropped. `Drop` running is not observable from the outside, and a reference cycle
+    /// would silently prevent it, so lifecycle tests assert on this instead.
+    #[cfg(feature = "__lk-e2e-test")]
+    pub fn drop_probe(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        let inner = Arc::downgrade(&self.inner);
+        move || inner.upgrade().is_none()
+    }
+
     #[cfg(all(test, feature = "__lk-e2e-test"))]
     pub(crate) async fn probe_closed_reconnection_for_test(&self) -> EngineResult<()> {
         let mut owners = self.inner.owned_attempts.subscribe();
@@ -424,8 +482,18 @@ impl RtcEngine {
             // function marks reconnecting synchronously before spawning a job;
             // these assertions concern fresh recovery admission, not OS packet
             // arrival times from an already-started socket constructor.
-            self.inner.reconnection_needed(true, false);
-            self.inner.reconnection_needed(true, true);
+            self.inner.reconnection_needed(
+                true,
+                false,
+                DisconnectReason::UnknownReason,
+                proto::ReconnectReason::RrUnknown,
+            );
+            self.inner.reconnection_needed(
+                true,
+                true,
+                DisconnectReason::UnknownReason,
+                proto::ReconnectReason::RrUnknown,
+            );
             let handle = self.inner.running_handle.read();
             if !handle.closed
                 || handle.can_reconnect
@@ -531,7 +599,7 @@ impl RtcEngine {
 
     pub fn publisher_negotiation_needed(&self) {
         let inner = self.inner.clone();
-        livekit_runtime::spawn(async move {
+        tokio::spawn(async move {
             if let Ok((handle, _)) = inner.wait_reconnection().await {
                 handle.session.publisher_negotiation_needed()
             }
@@ -579,6 +647,13 @@ impl RtcEngine {
             .fail_transport_during_next_resume
             .store(true, std::sync::atomic::Ordering::Release);
     }
+
+    /// Test-only: drop incoming DISCONNECTED participant entries on the current
+    /// session, simulating an SFU that fails to (re)deliver disconnect updates.
+    #[cfg(feature = "__lk-e2e-test")]
+    pub fn drop_disconnected_updates(&self, enabled: bool) {
+        self.session().drop_disconnected_updates(enabled);
+    }
 }
 
 impl EngineInner {
@@ -605,8 +680,6 @@ impl EngineInner {
                     session.session.wait_pc_connection().await?;
 
                     let (engine_tx, engine_rx) = mpsc::unbounded_channel();
-                    let mut interval = interval(RECONNECT_INTERVAL);
-                    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
                     let inner = Arc::new(Self {
                         lk_runtime,
                         engine_tx,
@@ -617,11 +690,13 @@ impl EngineInner {
                             reconnecting: false,
                             can_reconnect: true,
                             full_reconnect: false,
+                            reconnect_reason: DisconnectReason::UnknownReason,
+                            reported_reconnect_reason: proto::ReconnectReason::RrUnknown,
                             engine_task: None,
                         }),
                         options,
                         reconnecting_lock: AsyncRwLock::default(),
-                        reconnecting_interval: AsyncMutex::new(interval),
+                        retry_now_notify: Arc::new(Notify::new()),
                         #[cfg(all(test, feature = "__lk-e2e-test"))]
                         restart_candidate_barrier: AsyncMutex::new(None),
                         #[cfg(all(test, feature = "__lk-e2e-test"))]
@@ -638,8 +713,8 @@ impl EngineInner {
 
                     // Start initial tasks
                     let (close_tx, close_rx) = oneshot::channel();
-                    let session_task = livekit_runtime::spawn(Self::engine_task(
-                        inner.clone(),
+                    let session_task = tokio::spawn(Self::engine_task(
+                        Arc::downgrade(&inner),
                         session_events,
                         close_rx,
                     ));
@@ -655,6 +730,14 @@ impl EngineInner {
             match try_connect().await {
                 Ok(res) => return Ok(res),
                 Err(e) => {
+                    // A validated auth failure (401/403) will not succeed on
+                    // retry with the same token — surface it immediately instead
+                    // of burning the remaining join attempts. Same classification
+                    // as the reconnect loop (see `auth_failure_reason`).
+                    if auth_failure_reason(&e).is_some() {
+                        log::warn!("authentication rejected during connect ({e}); not retrying");
+                        return Err(e);
+                    }
                     let attempt_i = i + 1;
                     if i < max_retries {
                         log::warn!(
@@ -672,18 +755,28 @@ impl EngineInner {
         Err(last_error.unwrap())
     }
 
+    /// Forwards session events to the engine for as long as the engine is alive.
+    ///
+    /// Takes a [`Weak`] reference because the engine owns this task: its `JoinHandle` and
+    /// stop signal live in [`EngineHandle`], inside the very [`EngineInner`] this task would
+    /// otherwise hold. A strong reference makes the two keep each other alive, so nothing
+    /// but an explicit `close()` can release them, and merely dropping the engine leaks the
+    /// session, both peer connections, and the signal client with its open websocket.
+    /// Upgrading per event also lets the task stop on its own once the engine is gone.
     async fn engine_task(
-        self: Arc<Self>,
+        this: Weak<Self>,
         mut session_events: SessionEvents,
         mut close_rx: oneshot::Receiver<()>,
     ) {
         loop {
             tokio::select! {
                 Some(event) = session_events.recv() => {
+                    let Some(inner) = this.upgrade() else {
+                        break;
+                    };
                     let debug = format!("{:?}", event);
-                    let inner = self.clone();
                     let (tx, rx) = oneshot::channel();
-                    let task = livekit_runtime::spawn(async move {
+                    let task = tokio::spawn(async move {
                         if let Err(err) = inner.on_session_event(event).await {
                             log::error!("failed to handle session event: {:?}", err);
                         }
@@ -693,12 +786,12 @@ impl EngineInner {
                     // Monitor sync/async blockings
                     tokio::select! {
                         _ = rx => {},
-                        _ = livekit_runtime::sleep(Duration::from_secs(10)) => {
+                        _ = tokio::time::sleep(Duration::from_secs(10)) => {
                             log::error!("session_event is taking too much time: {}", debug);
                         }
                     }
 
-                    task.await;
+                    task.await.expect("session event handler panicked");
                 },
                  _ = &mut close_rx => {
                     break;
@@ -714,6 +807,7 @@ impl EngineInner {
             SessionEvent::Close {
                 source,
                 reason,
+                reconnect_reason,
                 action,
                 retry_now,
             } => {
@@ -740,6 +834,8 @@ impl EngineInner {
                         self.reconnection_needed(
                             retry_now,
                             action == proto::leave_request::Action::Reconnect,
+                            reason,
+                            reconnect_reason,
                         );
                     }
                     proto::leave_request::Action::Disconnect => {
@@ -749,7 +845,7 @@ impl EngineInner {
 
                         // Spawning a new task because the close function wait for the engine_task to
                         // finish. (So it doesn't make sense to await it here)
-                        livekit_runtime::spawn({
+                        tokio::spawn({
                             let inner = self.clone();
                             async move {
                                 inner.close(reason).await;
@@ -910,10 +1006,12 @@ impl EngineInner {
             SessionEvent::DataStreamTrailer {
                 trailer,
                 participant_identity,
+                encryption_type,
             } => {
                 let _ = self.engine_tx.send(EngineEvent::DataStreamTrailer {
                     trailer,
                     participant_identity,
+                    encryption_type,
                 });
             }
             SessionEvent::DataChannelBufferedAmountLowThresholdChanged { kind, threshold } => {
@@ -934,6 +1032,9 @@ impl EngineInner {
                     .engine_tx
                     .send(EngineEvent::SubscribedQualityUpdate { update });
             }
+            SessionEvent::RefreshPublishingLayers => {
+                let _ = self.engine_tx.send(EngineEvent::RefreshPublishingLayers);
+            }
             SessionEvent::LocalDataTrackInput(event) => {
                 let _ = self.engine_tx.send(EngineEvent::LocalDataTrackInput(event));
             }
@@ -951,6 +1052,9 @@ impl EngineInner {
     async fn close(&self, reason: DisconnectReason) {
         let (session, engine_task) = {
             let mut running_handle = self.running_handle.write();
+            if running_handle.closed {
+                return;
+            }
             running_handle.closed = true;
             running_handle.can_reconnect = false;
 
@@ -959,9 +1063,6 @@ impl EngineInner {
             (session, engine_task)
         };
 
-        // Mark terminal before waking the reconnect owner. Its candidate guard
-        // closes any session that has connected but has not yet been adopted.
-        self.close_notifier.notify_waiters();
         // A full restart may already have taken the task; that does not transfer
         // the current session away from close's ownership.
         session.close(reason).await;
@@ -975,6 +1076,14 @@ impl EngineInner {
         // exhausts all attempts leaves the room stuck in Reconnecting forever because
         // the room's task never sees the event that drives `handle_disconnected`.
         let _ = self.engine_tx.send(EngineEvent::Disconnected { reason });
+
+        // Signal any in-flight reconnect loop to stop. The reconnect task selects
+        // on `close_notifier`, both at the top-level (cancelling the whole task)
+        // and within its backoff wait (breaking the loop early). We notify LAST,
+        // after teardown has completed: the reconnect loop's own bail paths call
+        // `close()` from inside the task, so notifying earlier could let the
+        // top-level select drop the task mid-`close()` and leave teardown partial.
+        self.close_notifier.notify_waiters();
     }
 
     /// When waiting for reconnection, it ensures we're always using the latest session.
@@ -996,7 +1105,14 @@ impl EngineInner {
     /// Start the reconnect task if not already started
     /// Ask to retry directly if `retry_now` is true
     /// Ask for a full reconnect if `full_reconnect` is true
-    fn reconnection_needed(self: &Arc<Self>, retry_now: bool, full_reconnect: bool) {
+    /// `reason` is the disconnect cause that triggered this reconnection
+    fn reconnection_needed(
+        self: &Arc<Self>,
+        retry_now: bool,
+        full_reconnect: bool,
+        reason: DisconnectReason,
+        reported_reconnect_reason: proto::ReconnectReason,
+    ) {
         let mut running_handle = self.running_handle.write();
 
         if running_handle.closed || !running_handle.can_reconnect {
@@ -1018,10 +1134,7 @@ impl EngineInner {
 
             // Retry as soon as possible when asked, rather than waiting out the backoff.
             if retry_now {
-                let inner = self.clone();
-                livekit_runtime::spawn(async move {
-                    inner.reconnecting_interval.lock().await.reset();
-                });
+                self.retry_now_notify.notify_one();
             }
 
             return;
@@ -1032,12 +1145,23 @@ impl EngineInner {
         // reconnect (a failed/false-successful resume), keep it. Cleared on a successful
         // full reconnect in `try_restart_connection`.
         running_handle.full_reconnect |= full_reconnect;
+        // Remember the cause so a failed reconnection closes with it rather than
+        // a generic UnknownReason, and so each attempt can report it to the server.
+        running_handle.reconnect_reason = reason;
+        running_handle.reported_reconnect_reason = reported_reconnect_reason;
 
-        livekit_runtime::spawn({
+        tokio::spawn({
             let inner = self.clone();
             async move {
                 // Hold the reconnection lock for the whole reconnection time
                 let _r_lock = inner.reconnecting_lock.write().await;
+                {
+                    let mut handle = inner.running_handle.write();
+                    if handle.closed {
+                        handle.reconnecting = false;
+                        return;
+                    }
+                }
                 // The close function can send a signal to cancel the reconnection
 
                 let close_notifier = inner.close_notifier.clone();
@@ -1046,15 +1170,33 @@ impl EngineInner {
 
                 tokio::select! {
                     _ = &mut close_receiver => {
+                        // The engine was closed; abandon the reconnect attempt.
+                        // Clear `reconnecting` (the success/failure path below does
+                        // this after the select; this branch returns early so it
+                        // must do so itself) to avoid leaving a closed engine stuck
+                        // with reconnecting = true.
                         log::debug!("reconnection cancelled");
+                        inner.running_handle.write().reconnecting = false;
+                        return;
                     }
                     res = inner.reconnect_task() => {
                         if res.is_err() {
-                            if !inner.running_handle.read().closed {
-                                log::error!("failed to reconnect to the livekit room");
-                                inner.close(DisconnectReason::UnknownReason).await;
+                            log::error!("failed to reconnect to the livekit room");
+                            // The loop may already have closed the engine with an
+                            // accurate reason (e.g. a server Disconnect hit
+                            // mid-attempt). Only close here for the paths that
+                            // didn't — chiefly attempt exhaustion — and do so with
+                            // the cause that started this episode rather than a
+                            // generic UnknownReason, avoiding a duplicate
+                            // Disconnected event with a stale reason.
+                            let (already_closed, reason) = {
+                                let handle = inner.running_handle.read();
+                                (handle.closed, handle.reconnect_reason)
+                            };
+                            if !already_closed {
+                                inner.close(reason).await;
                             }
-                        } else if !inner.running_handle.read().closed {
+                        } else {
                             log::info!("RtcEngine successfully recovered")
                         }
                     }
@@ -1085,6 +1227,15 @@ impl EngineInner {
             )
         };
 
+        // Lifecycle notifications are emitted once per mode: Resuming the first
+        // time the episode resumes, Restarting the first time it (re)enters full
+        // reconnect. Crucially this includes an escalation from a failed resume,
+        // which previously emitted no Restarting at all -- leaving the Room to
+        // observe Resuming followed by Restarted with no Restarting between
+        // (DELTA 2).
+        let mut resuming_emitted = false;
+        let mut restarting_emitted = false;
+
         for i in 1..=RECONNECT_ATTEMPTS {
             let (is_closed, full_reconnect) = {
                 let running_handle = self.running_handle.read();
@@ -1098,7 +1249,8 @@ impl EngineInner {
             }
 
             if full_reconnect {
-                if i == 1 {
+                if !restarting_emitted {
+                    restarting_emitted = true;
                     let (tx, rx) = oneshot::channel();
                     let _ = self.engine_tx.send(EngineEvent::Restarting(tx));
                     let _ = rx.await;
@@ -1129,11 +1281,22 @@ impl EngineInner {
                                 "server requested disconnect during restart".into(),
                             ));
                         }
+                        if let Some(reason) = auth_failure_reason(&err) {
+                            log::warn!(
+                                "authentication rejected during restart ({err}); not retrying"
+                            );
+                            self.running_handle.write().can_reconnect = false;
+                            self.close(reason).await;
+                            return Err(EngineError::Connection(
+                                "authentication failed during reconnect".into(),
+                            ));
+                        }
                         log::error!("restarting connection failed: {}", err);
                     }
                 }
             } else {
-                if i == 1 {
+                if !resuming_emitted {
+                    resuming_emitted = true;
                     let (tx, rx) = oneshot::channel();
                     let _ = self.engine_tx.send(EngineEvent::Resuming(tx));
                     let _ = rx.await;
@@ -1148,7 +1311,7 @@ impl EngineInner {
                 let session = self.running_handle.read().session.clone();
                 #[cfg(all(test, feature = "__lk-e2e-test"))]
                 let test_attempt = OwnedAttemptTestGuard::new(owner.owned_attempts.clone());
-                let resume = livekit_runtime::spawn(async move {
+                let resume = tokio::spawn(async move {
                     #[cfg(all(test, feature = "__lk-e2e-test"))]
                     let _test_attempt = test_attempt;
                     let result = owner.try_resume_connection().await;
@@ -1158,7 +1321,10 @@ impl EngineInner {
                     }
                     result
                 });
-                match resume.await {
+                let resumed = resume.await.map_err(|err| {
+                    EngineError::Internal(format!("resume owner failed: {err}").into())
+                })?;
+                match resumed {
                     Ok(()) => {
                         let (tx, rx) = oneshot::channel();
                         let _ = self.engine_tx.send(EngineEvent::Resumed(tx));
@@ -1174,6 +1340,16 @@ impl EngineInner {
                                 "server requested disconnect during resume".into(),
                             ));
                         }
+                        if let Some(reason) = auth_failure_reason(&err) {
+                            log::warn!(
+                                "authentication rejected during resume ({err}); not retrying"
+                            );
+                            self.running_handle.write().can_reconnect = false;
+                            self.close(reason).await;
+                            return Err(EngineError::Connection(
+                                "authentication failed during reconnect".into(),
+                            ));
+                        }
                         log::error!("resuming connection failed: {}", err);
                         let mut running_handle = self.running_handle.write();
                         running_handle.full_reconnect = true;
@@ -1181,7 +1357,21 @@ impl EngineInner {
                 }
             }
 
-            self.reconnecting_interval.lock().await.tick().await;
+            // Exponential backoff with full jitter between attempts (DELTA 3).
+            // A server-requested reconnect signals retry_now_notify to collapse
+            // this wait so the next attempt fires immediately; a close signals
+            // close_notifier to break out of the loop early (the next iteration's
+            // `is_closed` check then returns) instead of waiting out the backoff.
+            let backoff = reconnect_strategy::delay(i);
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = self.retry_now_notify.notified() => {
+                    log::debug!("retry_now signalled, skipping reconnect backoff");
+                }
+                _ = self.close_notifier.notified() => {
+                    log::debug!("engine closed, cancelling reconnect backoff");
+                }
+            }
         }
 
         Err(EngineError::Connection(
@@ -1221,7 +1411,7 @@ impl EngineInner {
         let owner = self.clone();
         #[cfg(all(test, feature = "__lk-e2e-test"))]
         let test_attempt = OwnedAttemptTestGuard::new(owner.owned_attempts.clone());
-        let (new_session, join_response, session_events) = livekit_runtime::spawn(async move {
+        let (new_session, join_response, session_events) = tokio::spawn(async move {
             #[cfg(all(test, feature = "__lk-e2e-test"))]
             let _test_attempt = test_attempt;
             if owner.running_handle.read().closed {
@@ -1240,7 +1430,8 @@ impl EngineInner {
             let candidate = owner.prepare_test_candidate(candidate).await;
             EngineResult::Ok((candidate, join_response, events))
         })
-        .await?;
+        .await
+        .map_err(|err| EngineError::Internal(format!("restart owner failed: {err}").into()))??;
 
         #[cfg(all(test, feature = "__lk-e2e-test"))]
         self.wait_restart_test_barrier(RestartBarrierPoint::Connected)
@@ -1276,7 +1467,11 @@ impl EngineInner {
         handle.full_reconnect = false;
 
         let (close_tx, close_rx) = oneshot::channel();
-        let task = livekit_runtime::spawn(self.clone().engine_task(session_events, close_rx));
+        let task = tokio::spawn(Self::engine_task(
+            Arc::downgrade(self),
+            session_events,
+            close_rx,
+        ));
         handle.engine_task = Some((task, close_tx));
 
         Ok(())
@@ -1306,7 +1501,17 @@ impl EngineInner {
         candidate
     }
 
-    /// Try to restart the current session
+    /// Resume the current session in place (the lightweight reconnect path).
+    ///
+    /// The steps below run in a fixed order that any change must preserve, and
+    /// each non-trivial seam is its own method so the sequence — and the reason
+    /// for the ordering — is explicit rather than implied by statement order.
+    /// Mirrors the resume chain in `livekit/specs/signalling-reconnection.allium`:
+    ///   0. sample the PC transition counts, before anything can perturb them;
+    ///   1. reopen the signalling link (queue gate stays on until step 4);
+    ///   2. SyncState before the publisher re-offer;
+    ///   3. re-offer the publisher, then await *demonstrated* PC recovery;
+    ///   4. re-check link liveness, then drain the queue.
     async fn try_resume_connection(self: &Arc<Self>) -> EngineResult<()> {
         // Test-only: force the configured number of resume attempts to fail so tests
         // can exercise the resume-failure → full-reconnect escalation deterministically.
@@ -1334,45 +1539,81 @@ impl EngineInner {
                 .swap(false, Ordering::AcqRel)
             {
                 log::warn!("test fault injection: simulating concurrent failure during resume");
-                self.reconnection_needed(false, false);
+                self.reconnection_needed(
+                    false,
+                    false,
+                    DisconnectReason::UnknownReason,
+                    proto::ReconnectReason::RrUnknown,
+                );
             }
         }
 
         let session = self.running_handle.read().session.clone();
-        let reconnect_response = session.restart().await?;
 
+        // 0. Sample the transports' connection-state transition counts BEFORE anything can
+        //    perturb them, so step 3 can tell a transport that reconnected from one still
+        //    reporting a `Connected` that predates the failure.
+        let pc_snapshot = session.pc_generation_snapshot();
+
+        // 1. Reopen the signalling link. The SignalClient stays gated
+        //    (`reconnecting=true`) so queueable mutations buffer until step 4.
+        let reported_reason = self.running_handle.read().reported_reconnect_reason;
+        let reconnect_response = session.restart(reported_reason).await?;
+
+        // 2. Hand the ReconnectResponse to the room and wait until it has sent
+        //    SyncState, which must precede the publisher re-offer.
+        self.resume_sync_state(reconnect_response).await;
+
+        // 3. Re-offer the publisher (strictly AFTER SyncState), then wait for the transports
+        //    to have demonstrably reconnected rather than merely to report `Connected`.
+        session.restart_publisher().await?;
+        session
+            .wait_pc_reconnected(pc_snapshot, PC_RECONNECT_SETTLE_DELAY)
+            .await?;
+
+        // 4. Re-check link liveness and drain the queued mutations.
+        self.resume_finalize(&session).await
+    }
+
+    /// Resume step 2: announce the resume to the room and block until it has
+    /// sent SyncState. SyncState is a pass-through signal, so it reaches the
+    /// server immediately even though the SignalClient is still gated.
+    async fn resume_sync_state(&self, reconnect_response: proto::ReconnectResponse) {
         let (tx, rx) = oneshot::channel();
         let _ = self.engine_tx.send(EngineEvent::SignalResumed {
             reconnect_response,
             tx,
         });
-
-        // With SignalResumed, the room will send a SyncState message to the server.
-        // SyncState is a pass-through signal so it goes out immediately even though
-        // the SignalClient is still in `reconnecting=true` state.
+        // The room replies on `tx` once SyncState has gone out.
         let _ = rx.await;
+    }
 
-        // The publisher offer must be sent AFTER the SyncState message
-        session.restart_publisher().await?;
-        session
-            .wait_pc_reconnected(PC_RECONNECT_SETTLE_DELAY)
-            .await?;
-
-        // Re-check the signal connection BEFORE flushing the queue. If the WS died
-        // while we were waiting for PCs to come back, draining queued mutations
-        // would just push them into the void; better to bail and let the engine
-        // try a fresh resume (or escalate).
+    /// Resume step 4: confirm the signalling link survived the PC-reconnect wait
+    /// before draining the queue. If the WS died while we were waiting for the
+    /// PeerConnections, draining queued mutations would just push them into the
+    /// void; bail instead and let the engine try a fresh resume (or escalate).
+    async fn resume_finalize(&self, session: &RtcSession) -> EngineResult<()> {
         if !session.signal_client().is_connected().await {
             return Err(EngineError::Connection(
                 "signal connection severed during resume".into(),
             ));
         }
 
-        // Flush queued mutations and clear the `reconnecting` flag — at this point
-        // the resume has fully recovered, so deferred subscription updates / mutes
-        // / etc. should now reach the server. Mirrors `client.setReconnected()`.
+        // Flush queued mutations and clear the `reconnecting` gate — the resume
+        // has fully recovered, so deferred subscription updates / mutes / etc.
+        // should now reach the server. Mirrors `client.setReconnected()`.
         session.signal_client().set_reconnected().await;
 
+        // Anyone who left while the signal link was down never got their
+        // DISCONNECTED update delivered to us; the room synthesizes those
+        // disconnects from the identities seen since the resume began. Sent
+        // from this task — the same producer that sends `Resumed` next — so
+        // they reach the application before `Reconnected`.
+        if let Some(seen_identities) = session.finish_resume() {
+            let _ = self
+                .engine_tx
+                .send(EngineEvent::ParticipantReconcile { seen_identities });
+        }
         Ok(())
     }
 }
@@ -1393,6 +1634,28 @@ fn leave_disconnect_reason(err: &EngineError) -> Option<DisconnectReason> {
     if let EngineError::Signal(SignalError::LeaveRequest { reason, action }) = err {
         if *action == proto::leave_request::Action::Disconnect {
             return Some(*reason);
+        }
+    }
+    None
+}
+
+/// Inspect a reconnect-attempt error for a genuine authentication/authorization
+/// failure (HTTP 401/403). Such a failure will not succeed on retry with the
+/// same token, so the reconnect loop should bail out immediately rather than
+/// burning every attempt (and hammering the server) with credentials it already
+/// knows are rejected.
+///
+/// We key on `SignalError::Client(401|403)`, which is produced by the server's
+/// `rtc/validate` probe (see [`super`]'s `SignalInner::validate`) — an
+/// authoritative classification. We deliberately do NOT key on a raw WebSocket
+/// upgrade status (`SignalError::Handshake`), because that can be a fabricated 401
+/// masking a transient server error (e.g. a 503 from a saturated node), which IS
+/// retryable. A resume that hits a raw 401 simply escalates to a full reconnect,
+/// whose connect path runs `validate()` and surfaces the authoritative status.
+fn auth_failure_reason(err: &EngineError) -> Option<DisconnectReason> {
+    if let EngineError::Signal(SignalError::Client(status, _)) = err {
+        if matches!(status.as_u16(), 401 | 403) {
+            return Some(DisconnectReason::JoinFailure);
         }
     }
     None
@@ -1443,6 +1706,49 @@ mod tests {
                 leave_disconnect_reason(err).is_none(),
                 "{:?} must not be treated as a disconnect Leave",
                 err
+            );
+        }
+    }
+
+    #[test]
+    fn auth_failure_reason_flags_validated_401_and_403() {
+        // The server's rtc/validate probe surfaces auth failures as Client(4xx).
+        for status in [401u16, 403] {
+            let err = EngineError::Signal(SignalError::Client(
+                http::StatusCode::from_u16(status).unwrap(),
+                "invalid token".into(),
+            ));
+            assert_eq!(
+                auth_failure_reason(&err),
+                Some(DisconnectReason::JoinFailure),
+                "Client({status}) must be treated as a non-retryable auth failure"
+            );
+        }
+    }
+
+    fn auth_failure_reason_ignores_other_client_and_server_errors() {
+        let not_auth = [
+            // Other client errors are not auth failures.
+            EngineError::Signal(SignalError::Client(http::StatusCode::NOT_FOUND, "".into())),
+            EngineError::Signal(SignalError::Client(
+                http::StatusCode::TOO_MANY_REQUESTS,
+                "".into(),
+            )),
+            // Server errors (e.g. a saturated node) are retryable.
+            EngineError::Signal(SignalError::Server(
+                http::StatusCode::SERVICE_UNAVAILABLE,
+                "".into(),
+            )),
+            // Generic connectivity/internal errors are retryable.
+            EngineError::Connection("network".into()),
+            EngineError::Internal("bug".into()),
+            EngineError::Signal(SignalError::SendError),
+            EngineError::Signal(SignalError::Timeout("waiting".into())),
+        ];
+        for err in &not_auth {
+            assert!(
+                auth_failure_reason(err).is_none(),
+                "{err:?} must NOT be treated as an auth failure"
             );
         }
     }

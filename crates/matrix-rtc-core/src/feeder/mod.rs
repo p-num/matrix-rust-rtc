@@ -152,18 +152,18 @@ pub fn event_origin(encryption: &EventEncryption) -> EventOrigin {
     }
 }
 
-/// The `KeyOrigin` of a to-device message. A cross-signing status the client
-/// did not report counts as not cross-signed.
+/// The `KeyOrigin` of a to-device message. A confirmation the client did not
+/// report counts as unconfirmed.
 pub fn key_origin(encryption: &EventEncryption, sender: &str) -> KeyOrigin {
     match encryption {
         EventEncryption::Cleartext => KeyOrigin::Cleartext,
         EventEncryption::Encrypted {
             sender_device_id,
-            sender_cross_signed,
+            sender_confirmed,
         } => KeyOrigin::Encrypted {
             sender_user_id: sender.to_owned(),
             sender_device_id: sender_device_id.clone(),
-            sender_is_cross_signed: sender_cross_signed.unwrap_or(false),
+            sender_is_confirmed: sender_confirmed.unwrap_or(false),
         },
     }
 }
@@ -402,7 +402,17 @@ where
     pub async fn run(mut self) {
         loop {
             let input = if *self.seeded.borrow() {
-                self.rx.recv().await
+                // A delayed-leave hold ending is an input of its own (034 R21).
+                let hold = self.room.lock().await.rtc().hold_expires_at();
+                let hold_in =
+                    hold.map(|at| at.saturating_duration_since(crate::executor::Instant::now()));
+                tokio::select! {
+                    input = self.rx.recv() => input,
+                    () = crate::executor::sleep(hold_in.unwrap_or_default()), if hold_in.is_some() => {
+                        self.room.lock().await.rtc().expire_holds().await;
+                        continue;
+                    }
+                }
             } else {
                 tokio::select! {
                     input = self.rx.recv() => input,

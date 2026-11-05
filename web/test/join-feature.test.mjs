@@ -116,6 +116,10 @@ describe('WASM bindings with a mock backend host', () => {
       await call.leave({
         leave_reason: { code: 'leave', reason: 'user hung up' },
       });
+      // leave() returns at once; the leave event and the delayed-leave cancel go out after it.
+      for (let i = 0; i < 100 && host._getCancelledEvents().length === 0; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
 
       const stickyEvents = host._getStickyEvents();
       expect(stickyEvents.length).toBe(1);
@@ -166,16 +170,6 @@ describe('WASM bindings with a mock backend host', () => {
       expect(closed._getStickyEvents().length).toBe(0);
     });
 
-    it('a sticky_2025 room mirrors the legacy fields on the membership', async () => {
-      const client = new bindings.WasmRtcClient(host);
-      const room = await client.room(ROOM_ID, { format: 'sticky_2025' });
-      await room.joinCall(joinParams);
-
-      const content = host._getStickyEvents()[0].content;
-      expect(getContentValue(getContentValue(content, 'member'), 'user_id')).toBe(USER_ID);
-      expect(getContentValue(getContentValue(content, 'member'), 'device_id')).toBe(DEVICE_ID);
-      expect(getContentValue(content, 'rtc_transports')).toBeDefined();
-    });
   });
 
   describe('Error handling', () => {

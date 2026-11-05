@@ -62,7 +62,7 @@ const { client, userId, deviceId } =
 const host = new MatrixHost({ sdk, client });  // the MatrixBackendHost
 const rtc = new bindings.WasmRtcClient(host);   // one per Matrix session; no I/O
 // Subscribes through the host and resolves once the room's current state is in.
-const rtcRoom = await rtc.room(roomId, { format: 'current' });
+const rtcRoom = await rtc.room(roomId, { format: 'msc' });
 
 // 1. Publish our membership (starts the keep-alive machinery). The transport
 //    comes from the homeserver's /rtc/transports unless you pin one here.
@@ -118,7 +118,8 @@ Promise. With matrix-js-sdk (v42+):
 | `ownUserId()` / `ownDeviceId()` | `getUserId()` / `getDeviceId()` | strings (sync) |
 | `sendStickyEvent(roomId, type, content, durationMs)` | `_unstable_sendStickyEvent(roomId, durationMs, null, type, content)` — pass `durationMs` through verbatim | `{event_id}` |
 | `sendStateEvent(roomId, type, stateKey, content)` | `sendStateEvent(roomId, type, content, stateKey)` | `{event_id}` |
-| `sendDelayedEvent(roomId, type, stateKey, content, delayMs)` | `_unstable_sendDelayedEvent(...)`, or `_unstable_sendDelayedStateEvent(...)` when `stateKey` is not `null` | the bare `delay_id` string |
+| `sendDelayedStateEvent(roomId, type, stateKey, content, delayMs)` | `_unstable_sendDelayedStateEvent(...)` | the bare `delay_id` string |
+| `sendDelayedStickyEvent(roomId, type, content, stickyDurationMs, delayMs)` | a delayed sticky send, or a rejection with `errcode: 'M_UNRECOGNIZED'` while the SDK has none — **never** a plain delayed event | the bare `delay_id` string |
 | `restartDelayedEvent(roomId, delayId)` | `_unstable_updateDelayedEvent(delayId, Restart)` — a true MSC4140 restart, **never** cancel+resend | anything |
 | `cancelDelayedEvent(roomId, delayId)` | `_unstable_updateDelayedEvent(delayId, Cancel)` | anything |
 | `sendToDeviceMessage(recipients, type, content)` | `encryptAndSendToDevice(type, recipients, content)` — Olm-encrypted, per specific device | `[{userId, deviceId, error?}]`, or nothing = all delivered |
@@ -149,7 +150,7 @@ Each event is an `EventIn`:
 `{ event_id, sender, event_type, state_key?, origin_server_ts, content, encryption }`
 with `content` verbatim (decrypt first) and `encryption` what your client can
 honestly report — `{ kind: 'cleartext' }` or
-`{ kind: 'encrypted', sender_device_id?, sender_cross_signed? }`, the device
+`{ kind: 'encrypted', sender_device_id?, sender_confirmed? }`, the device
 attributed from the decryption metadata (the js-sdk host matches the megolm
 sender key against the device list). Rust derives the MSC4143 origin rules and
 the MSC4153 key acceptance from that; you never say who is joined. To-device
@@ -163,14 +164,16 @@ until it leaves or is freed.
 
 ### Older membership formats (Element Call compatibility)
 
-Pass `format` when opening the room (`rtc.room`) — `"current"` (default, spec-current),
-`"sticky_2025"` (Element Call "Matrix 2.0", 2025), or `"room_state"`
-(what deployed Element Call speaks) — and the library handles the rest:
-which room state it subscribes to, the inbound translation, outbound
-membership/key rewrites, identities, the token endpoint. Your host delivers
-the same raw events in every format; in `room_state` it also honours the
-`stateKey` of `sendDelayedEvent`, because the dead man's switch is a state
-event there.
+Pass `format` when opening the room (`rtc.room`) — `"msc"` (default, spec-current)
+or `"room_state"` (Element Call's pre-sticky generation) — and the library handles
+the rest: which room state it subscribes to, the inbound translation and the outbound
+membership/key rewrites. The token endpoint and the SFU identity follow the
+published transport, not the format: a transport naming `livekit_service_url` gets its
+tokens from that service's `/sfu/get`, one naming only an SFU `url` from the
+homeserver, through your host's `getLivekitToken`. Your host delivers
+the same raw events in every format; in `room_state` the dead man's switch
+comes through `sendDelayedStateEvent`, and in the sticky formats through
+`sendDelayedStickyEvent`.
 
 **Both sides of a call must use the same format.** A mismatch is a silence, not
 an error: identities derive differently, so the peer sits in the roster with

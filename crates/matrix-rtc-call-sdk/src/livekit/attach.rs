@@ -12,25 +12,28 @@ use std::sync::Arc;
 use crate::{AttachError, AttachOptions, MediaAttachment, StabilityConfig, attach_media};
 use matrix_rtc_call::RtcCall;
 use matrix_rtc_core::MatrixBackend;
-use matrix_rtc_core::compat::MembershipFormat;
 
 use matrix_rtc_livekit::{
-    LiveKitMediaTransport, LiveKitTransportConnection, MediaKeyBridge, TokenEndpoint,
-    identity_mapper, msc4195_key_provider, msc4195_media_key_bridge,
+    LiveKitMediaTransport, LiveKitTransportConnection, MediaKeyBridge, Msc4195KeyProviders,
+    identity_mapper, msc4195_media_key_bridge,
 };
 
 /// What [`attach_livekit`] needs besides the call.
 #[derive(Clone, Debug)]
 pub struct LiveKitAttachOptions {
-    /// The mode the room was opened in. Decides the participant identity and
-    /// the token endpoint, so it must be the one the call was joined with.
-    pub format: MembershipFormat,
     /// HTTP client for the token exchange; `None` builds a default one.
     pub http: Option<reqwest::Client>,
     /// `false` never subscribes to peers' media; see
     /// [`LiveKitMediaTransport::with_auto_subscribe`].
     pub auto_subscribe: bool,
     pub stability: StabilityConfig,
+    /// How long our own focus may stay unreachable before the call ends
+    /// (034 R24); `None` takes
+    /// [`OWN_RECONNECT_BUDGET`](matrix_rtc_transport::pool::OWN_RECONNECT_BUDGET).
+    pub own_reconnect_budget: Option<std::time::Duration>,
+    /// Whether our media may move to a peer's SFU while ours is down
+    /// (034 R25); see [`AttachOptions::sfu_fallback`].
+    pub sfu_fallback: bool,
 }
 
 /// A call with native LiveKit media attached.
@@ -52,15 +55,14 @@ pub async fn attach_livekit<B: MatrixBackend + 'static>(
     options: LiveKitAttachOptions,
 ) -> Result<LiveKitAttachment, AttachError> {
     // One mapper for the core, the transport, our own identity and the ring.
-    let mapper = identity_mapper(options.format);
-    let provider = msc4195_key_provider();
-    let key_bridge = Arc::new(msc4195_media_key_bridge(provider.clone()));
+    let mapper = identity_mapper();
+    let providers = Msc4195KeyProviders::new();
+    let key_bridge = Arc::new(msc4195_media_key_bridge(providers.clone()));
     let (own_user_id, own_device_id) = (backend.own_user_id(), backend.own_device_id());
     let transport = Arc::new(
-        LiveKitMediaTransport::new(options.http.unwrap_or_default(), backend, provider)
+        LiveKitMediaTransport::new(options.http.unwrap_or_default(), backend, providers)
             .with_auto_subscribe(options.auto_subscribe)
-            .with_identity_mapper(mapper.clone())
-            .with_token_endpoint(TokenEndpoint::for_format(options.format)),
+            .with_identity_mapper(mapper.clone()),
     );
     let media = attach_media(
         call,
@@ -70,8 +72,11 @@ pub async fn attach_livekit<B: MatrixBackend + 'static>(
             own_user_id,
             own_device_id,
             identity_mapper: mapper,
-            format: options.format,
             stability: options.stability,
+            own_reconnect_budget: options
+                .own_reconnect_budget
+                .unwrap_or(matrix_rtc_transport::pool::OWN_RECONNECT_BUDGET),
+            sfu_fallback: options.sfu_fallback,
         },
     )
     .await?;

@@ -78,9 +78,9 @@ fn mock() -> Arc<MockBackend> {
 
 /// Who joins is the backend's account; the transport is the host's choice.
 fn join_params() -> JoinSessionParams {
-    JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(LiveKitTransport {
-        livekit_service_url: "https://sfu.example.org".to_owned(),
-    }))
+    JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
+        LiveKitTransport::service("https://sfu.example.org".to_owned()),
+    ))
 }
 
 #[tokio::test(start_paused = true)]
@@ -260,30 +260,56 @@ async fn a_room_state_room_reads_its_membership_from_state_and_joins_as_state() 
 }
 
 #[tokio::test]
-async fn a_sticky_2025_join_carries_the_legacy_fields() {
-    let mock = mock();
-    let client = BaseRtcClient::new(mock.clone());
-    let room = open_in(&client, &mock, MembershipFormat::Sticky2025).await;
-    room.join(join_params()).await.expect("join");
-
-    let sticky = mock.sticky_events.lock().unwrap();
-    let (_, _, content, _) = sticky.last().expect("a membership");
-    assert_eq!(content["member"]["user_id"], mock.user_id.as_str());
-    assert_eq!(content["member"]["device_id"], mock.device_id.as_str());
-}
-
-#[tokio::test]
 async fn dropping_the_room_forgets_its_dialect() {
     let mock = mock();
     let client = BaseRtcClient::new(mock.clone());
-    let room = open_in(&client, &mock, MembershipFormat::Sticky2025).await;
+    let room = open_in(&client, &mock, MembershipFormat::RoomState).await;
     room.join(join_params()).await.expect("join");
     assert!(matches!(
         client.backend().dialect(ROOM),
-        OutboundDialect::Sticky(_)
+        OutboundDialect::State(_)
     ));
 
     drop(room);
+    assert!(matches!(
+        client.backend().dialect(ROOM),
+        OutboundDialect::None
+    ));
+}
+
+/// A leave goes out detached (034 R8), and a host may shut the room down the
+/// moment it has asked for it (C10): the leave is still written in the room's
+/// format, and the format is forgotten once it has gone.
+#[tokio::test]
+async fn a_leave_sent_after_the_room_is_dropped_keeps_its_format() {
+    let mock = mock();
+    let client = BaseRtcClient::new(mock.clone());
+    let room = open_in(&client, &mock, MembershipFormat::RoomState).await;
+    room.join(join_params()).await.expect("join");
+    let joins = mock.state_events.lock().unwrap().len();
+
+    let hold = client.backend().hold_dialect(ROOM);
+    let pending = room
+        .state()
+        .lock()
+        .await
+        .begin_leave(SLOT, LeaveSessionParams::new())
+        .await
+        .expect("joined");
+    drop(room);
+    pending.send().await.expect("the leave is sent");
+
+    let state = mock.state_events.lock().unwrap();
+    assert_eq!(state.len(), joins + 1, "the leave went out as room state");
+    let (room_id, event_type, _, _) = state.last().unwrap();
+    assert_eq!(
+        (room_id.as_str(), event_type.as_str()),
+        (ROOM, STATE_MEMBER_EVENT_TYPE)
+    );
+    assert!(mock.sticky_events.lock().unwrap().is_empty());
+    drop(state);
+
+    drop(hold);
     assert!(matches!(
         client.backend().dialect(ROOM),
         OutboundDialect::None

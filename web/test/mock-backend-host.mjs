@@ -42,7 +42,7 @@ export function memberEventIn({ sender, deviceId, memberId, slotId, focus, event
         can_subscribe: ['livekit'],
       },
     },
-    encryption: { kind: 'encrypted', sender_device_id: deviceId, sender_cross_signed: true },
+    encryption: { kind: 'encrypted', sender_device_id: deviceId, sender_confirmed: true },
   };
 }
 
@@ -72,9 +72,14 @@ export function mockBackendHost({
       stickyEventsSent.push({ roomId, eventType, content, eventId });
       return Promise.resolve({ event_id: eventId });
     },
-    sendDelayedEvent: (roomId, eventType, stateKey, content, delayMs) => {
+    sendDelayedStateEvent: (roomId, eventType, stateKey, content, delayMs) => {
       const delayId = `delayed-event-${delayedEventsSent.length}`;
       delayedEventsSent.push({ roomId, eventType, stateKey, content, delayMs, delayId });
+      return Promise.resolve(delayId);
+    },
+    sendDelayedStickyEvent: (roomId, eventType, content, stickyDurationMs, delayMs) => {
+      const delayId = `delayed-event-${delayedEventsSent.length}`;
+      delayedEventsSent.push({ roomId, eventType, stateKey: null, content, stickyDurationMs, delayMs, delayId });
       return Promise.resolve(delayId);
     },
     restartDelayedEvent: () => Promise.resolve(),
@@ -114,6 +119,7 @@ export function mockBackendHost({
         matrix_server_name: 'example.org',
         expires_in: 3600,
       }),
+    getLivekitToken: (request) => Promise.resolve({ jwt: `jwt-for-${request.url}` }),
     rtcTransports: () => Promise.resolve(transports),
     // Test access.
     _sink: (roomId) => rooms.get(roomId)?.sink,

@@ -140,7 +140,10 @@
 //!     async fn send_sticky_event(&self, _room_id: String, _event_type: String, _content: serde_json::Value, _duration_ms: u64) -> Result<String, CommandError> {
 //!         Ok("$event".to_owned())
 //!     }
-//!     async fn send_delayed_event(&self, _room_id: String, _event_type: String, _state_key: Option<String>, _content: serde_json::Value, _delay_ms: u64) -> Result<String, CommandError> {
+//!     async fn send_delayed_state_event(&self, _room_id: String, _event_type: String, _state_key: String, _content: serde_json::Value, _delay_ms: u64) -> Result<String, CommandError> {
+//!         Ok(String::new())
+//!     }
+//!     async fn send_delayed_sticky_event(&self, _room_id: String, _event_type: String, _content: serde_json::Value, _sticky_duration_ms: u64, _delay_ms: u64) -> Result<String, CommandError> {
 //!         Ok(String::new())
 //!     }
 //!     async fn restart_delayed_event(&self, _room_id: String, _event_id: String) -> Result<(), CommandError> {
@@ -195,7 +198,7 @@
 //!     origin: KeyOrigin::Encrypted {
 //!         sender_user_id: "@bob:example.org".to_string(),
 //!         sender_device_id: Some("device456".to_string()),
-//!         sender_is_cross_signed: true,
+//!         sender_is_confirmed: true,
 //!     },
 //!     room_id: "!room:example.org".to_string(),
 //!     member_id: "bob-member-id".to_string(),
@@ -212,7 +215,7 @@
 
 pub mod types;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
 // `std::time::SystemTime::now()` panics on wasm32-unknown-unknown; web-time's
 // is the same API over `Date.now()`.
@@ -251,6 +254,7 @@ use crate::host::backend::{MatrixBackend, ToDeviceRecipient};
 use crate::host::event::EventOrigin;
 use crate::maybe_send::MaybeSend;
 use crate::session::JoinedMembership;
+use crate::transport::RtcTransport;
 
 /// Message type for to-device encryption key distribution (MSC4143).
 ///
@@ -333,15 +337,29 @@ impl DiscardedKey {
     }
 }
 
-/// Maps a `(user_id, device_id, member_id)` triple to the RTC-backend
-/// participant identity that the media layer addresses keys by.
+/// What a member's RTC-backend participant identity is derived from.
+pub struct IdentitySubject<'a> {
+    /// The member's user id (the member event's `sender`).
+    pub user_id: &'a str,
+    /// The device that sent the member event, when it can be attributed.
+    pub device_id: Option<&'a str>,
+    /// The member's `member.id`.
+    pub member_id: &'a str,
+    /// The transports the member publishes on: how a backend issued its token,
+    /// and so which identity it holds, can depend on them.
+    pub transports: &'a [RtcTransport],
+}
+
+/// Maps a member to the RTC-backend participant identity that the media layer
+/// addresses keys by; `None` when the member lacks what the derivation needs.
 ///
 /// `matrix-rtc-core` stays agnostic about how that identity is derived: a
-/// consumer (e.g. the LiveKit transport, which uses the MSC4195 pseudonymous
-/// identity) injects the derivation via [`EncryptionManager::set_identity_mapper`].
-/// When no mapper is set, the manager falls back to its default identity
-/// (`user_id:device_id` for the own key, `member_id` for inbound keys).
-pub type RtcIdentityMapper = Arc<dyn Fn(&str, &str, &str) -> String + Send + Sync>;
+/// consumer (e.g. the LiveKit transport, whose identity follows the token flow
+/// the published transport selects) injects the derivation via
+/// [`EncryptionManager::set_identity_mapper`]. When no mapper is set, the
+/// manager falls back to its default identity (`user_id:device_id` for the own
+/// key, `member_id` for inbound keys).
+pub type RtcIdentityMapper = Arc<dyn Fn(&IdentitySubject<'_>) -> Option<String> + Send + Sync>;
 
 /// The EncryptionManager manages encryption keys for an RTC session.
 ///
@@ -394,6 +412,8 @@ pub struct EncryptionManager<T: MatrixBackend> {
     /// Optional consumer-supplied mapper from `(user_id, device_id, member_id)`
     /// to the RTC-backend participant identity (see [`RtcIdentityMapper`]).
     identity_mapper: Option<RtcIdentityMapper>,
+    /// The transports we publish on, from which our own identity derives.
+    own_transports: Vec<RtcTransport>,
 
     /// Track if key distribution is in progress
     key_distribution_in_progress: Arc<Mutex<bool>>,
@@ -438,6 +458,30 @@ pub struct EncryptionManager<T: MatrixBackend> {
     /// distribute to — so in a solo call every membership update re-signalled the
     /// same index, and each one reached the transport as a fresh key import.
     signalled_key: Arc<Mutex<Option<SignalledKey>>>,
+
+    /// The members a rollout could not reach, by member id, with the key
+    /// index each is owed (034 R32). Retried on backoff by the session's
+    /// upkeep until delivered; a rotation replaces every entry, a departure
+    /// drops its own.
+    undelivered: Arc<watch::Sender<BTreeMap<String, Undelivered>>>,
+}
+
+/// A key a rollout could not hand to one member.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Undelivered {
+    target: ParticipantDeviceInfo,
+    key_index: u8,
+}
+
+/// What one retry of an undelivered key came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeyRetry {
+    /// The member now holds the key.
+    Delivered,
+    /// Nothing is owed any more: the member left, or a rotation addressed them.
+    Moot,
+    /// The host answered but did not deliver to this member.
+    Undelivered,
 }
 
 /// A key that has been replaced but is still what we encrypt with, because its
@@ -503,6 +547,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             config: EncryptionConfig::default(),
             signal_handler: None,
             identity_mapper: None,
+            own_transports: Vec::new(),
             key_distribution_in_progress: Arc::new(Mutex::new(false)),
             need_new_distribution: Arc::new(Mutex::new(false)),
             next_key_index: Arc::new(Mutex::new(0)),
@@ -512,6 +557,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             superseded_key: Arc::new(RwLock::new(None)),
             rotation_due_at: Arc::new(watch::Sender::new(None)),
             signalled_key: Arc::new(Mutex::new(None)),
+            undelivered: Arc::new(watch::Sender::new(BTreeMap::new())),
         }
     }
 
@@ -564,10 +610,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         // Our own outbound key, under the same identity `signal_key_to_app`
         // would use.
         if let Some(outbound) = self.get_outbound_key() {
-            let rtc_backend_identity = match &self.identity_mapper {
-                Some(mapper) => mapper(&self.own_user_id, &self.own_device_id, &self.own_member_id),
-                None => self.get_own_rtc_backend_identity(),
-            };
+            let rtc_backend_identity = self.own_rtc_identity();
             // Replay with whatever is *left* of this key's `delayBeforeUse`,
             // which is almost always nothing:
             //
@@ -614,13 +657,9 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
                 log::debug!("not replaying keys for {member_id}: no known membership");
                 continue;
             };
-            let rtc_backend_identity = match &self.identity_mapper {
-                Some(mapper) => mapper(
-                    &membership.sender,
-                    membership.origin.sender_device_id().unwrap_or(""),
-                    &membership.member_id,
-                ),
-                None => membership.member_id.clone(),
+            let Some(rtc_backend_identity) = self.peer_rtc_identity(membership) else {
+                log::debug!("not replaying keys for {member_id}: no derivable identity");
+                continue;
             };
             for key in keys {
                 signals.push(KeyMaterialSignal {
@@ -646,6 +685,40 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
     /// identity carried in [`KeyMaterialSignal`]s (see [`RtcIdentityMapper`]).
     pub fn set_identity_mapper(&mut self, mapper: RtcIdentityMapper) {
         self.identity_mapper = Some(mapper);
+    }
+
+    /// Sets the transports we publish on, from which the mapper derives our
+    /// own identity. Empty for a receive-only participation.
+    pub fn set_own_transports(&mut self, transports: Vec<RtcTransport>) {
+        self.own_transports = transports;
+    }
+
+    /// Our RTC backend identity: the mapper's, else `user_id:device_id`.
+    fn own_rtc_identity(&self) -> String {
+        self.identity_mapper
+            .as_ref()
+            .and_then(|mapper| {
+                mapper(&IdentitySubject {
+                    user_id: &self.own_user_id,
+                    device_id: Some(&self.own_device_id),
+                    member_id: &self.own_member_id,
+                    transports: &self.own_transports,
+                })
+            })
+            .unwrap_or_else(|| self.get_own_rtc_backend_identity())
+    }
+
+    /// A peer's RTC backend identity: the mapper's, else their `member_id`.
+    fn peer_rtc_identity(&self, membership: &JoinedMembership) -> Option<String> {
+        match &self.identity_mapper {
+            Some(mapper) => mapper(&IdentitySubject {
+                user_id: &membership.sender,
+                device_id: membership.origin.sender_device_id(),
+                member_id: &membership.member_id,
+                transports: &membership.transports,
+            }),
+            None => Some(membership.member_id.clone()),
+        }
     }
 
     /// Gets the current timestamp in milliseconds.
@@ -745,6 +818,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         *self.signalled_key.lock().unwrap() = None;
         *self.superseded_key.write().unwrap() = None;
         self.set_rotation_due_at(None);
+        self.undelivered.send_replace(BTreeMap::new());
 
         let mut buffer = self.key_buffer.lock().unwrap();
         buffer.buffer.clear();
@@ -935,6 +1009,17 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
                 membership_ts: m.membership_ts,
             })
             .collect();
+
+        // A member who left is owed nothing (034 R32).
+        self.undelivered.send_if_modified(|undelivered| {
+            let before = undelivered.len();
+            undelivered.retain(|_, owed| {
+                current_participants
+                    .iter()
+                    .any(|participant| participant.same_join(&owed.target))
+            });
+            undelivered.len() != before
+        });
 
         let current_key = {
             let guard = self.outbound_key.read().unwrap();
@@ -1135,7 +1220,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         // What will be on the wire once this rollout settles, when that is not what
         // the rollout is about to hand out — during a switch window, the key we are
         // still encrypting with rather than the one in `outbound_key`. `None` when
-        // the two coincide and an arrival needs nothing extra.
+        // the two coincide.
         let key_still_in_use = match (rotating, use_after_ms) {
             // Switching at once: what we distribute is what we will use.
             (true, 0) => None,
@@ -1187,6 +1272,33 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             })
             .collect();
 
+        // Whoever this rollout missed is retried on backoff, independently of
+        // the next rollout; a rotation addresses everyone, so what was owed of
+        // the previous key is dropped (034 R32).
+        self.undelivered.send_if_modified(|undelivered| {
+            let before = undelivered.clone();
+            if use_new_key {
+                undelivered.clear();
+            }
+            for participant in &to_distribute_to {
+                if served
+                    .iter()
+                    .any(|recipient| recipient.same_join(participant))
+                {
+                    undelivered.remove(&participant.member_id);
+                } else {
+                    undelivered.insert(
+                        participant.member_id.clone(),
+                        Undelivered {
+                            target: participant.clone(),
+                            key_index: outbound_key_to_use.key_index,
+                        },
+                    );
+                }
+            }
+            *undelivered != before
+        });
+
         // One line per rollout saying how it went as a whole: per-recipient
         // errors are easy to miss in a busy log, and "distributed to 1 of 3" is
         // the shape of the problem.
@@ -1201,7 +1313,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         } else {
             log::warn!(
                 "[{}/{}] distributed key index {} to {} of {} member(s); not delivered to {:?}, \
-                 who cannot decrypt our media until the next rollout retries them",
+                 who cannot decrypt our media until a retry reaches them",
                 self.room_id,
                 self.slot_id,
                 outbound_key_to_use.key_index,
@@ -1211,54 +1323,11 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             );
         }
 
-        // Whoever has just arrived holds only what this rollout sent them, and what
-        // we encrypt with is not necessarily that: a rotation waits out its
-        // `delayBeforeUse` first, and during that wait the key on the wire is the
-        // one it replaced. Unless the arrival is given *that* key too, they decrypt
-        // nothing until the window closes — a media blackout of
-        // `delay_before_use_ms` on every join into an established call, landing on
-        // the member least able to explain it.
-        //
-        // Handing it over widens what an arrival can read by the length of the
-        // window. The grace period already makes the same concession and for
-        // longer, by giving an arrival a key the call has been using for up to
-        // `key_rotation_grace_period_ms`.
-        //
-        // Restricted to the arrivals this rollout actually reached: a member the
-        // send could not be delivered to holds neither key, and a second
-        // undeliverable message buys them nothing. It also keeps a member we can
-        // never reach — who stays in `joined` for good, never being recorded as
-        // holding anything — from adding a send to every rollout for the rest of
-        // the call.
-        if let Some((in_use_index, in_use_key)) = &key_still_in_use
-            && *in_use_index != outbound_key_to_use.key_index
-        {
-            let arrivals_served: Vec<ParticipantDeviceInfo> = joined_participants
-                .iter()
-                .filter(|arrival| {
-                    served
-                        .iter()
-                        .any(|recipient| recipient.member_id == arrival.member_id)
-                })
-                .cloned()
-                .collect();
-            if !arrivals_served.is_empty() {
-                log::debug!(
-                    "[{}/{}] also handing key index {in_use_index} to {} arrival(s): it is what \
-                     we are encrypting with until index {} takes over",
-                    self.room_id,
-                    self.slot_id,
-                    arrivals_served.len(),
-                    outbound_key_to_use.key_index,
-                );
-                self.send_key_to_participants(
-                    &general_purpose::STANDARD.encode(in_use_key),
-                    *in_use_index,
-                    &arrivals_served,
-                )
-                .await;
-            }
-        }
+        // An arrival is never handed the key still in use during a switch
+        // window: it was minted before they joined, possibly long before, and
+        // would let them read back over everything it encrypted, which is what
+        // rotating on their arrival exists to prevent. They decrypt us once the
+        // window closes, at most `delay_before_use_ms` after joining.
 
         // Update or store the outbound key
         if use_new_key {
@@ -1341,6 +1410,82 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         Ok(())
     }
 
+    /// The members a rollout could not reach, by member id (034 R32).
+    pub fn undelivered_members(&self) -> Vec<String> {
+        self.undelivered.borrow().keys().cloned().collect()
+    }
+
+    /// Follows the undelivered members; the upkeep runs one retry per member.
+    pub(crate) fn subscribe_undelivered(&self) -> watch::Receiver<BTreeMap<String, Undelivered>> {
+        self.undelivered.subscribe()
+    }
+
+    /// Stops retrying `member_id`: the host refused the send for good.
+    pub(crate) fn forget_undelivered(&self, member_id: &str) {
+        self.undelivered
+            .send_if_modified(|undelivered| undelivered.remove(member_id).is_some());
+    }
+
+    /// One retry of the key owed to `member_id`, to that member alone. `Err`
+    /// is the host's failure of the whole send, which the outbox classifies.
+    pub(crate) async fn retry_undelivered_key(
+        &self,
+        member_id: &str,
+    ) -> Result<KeyRetry, CommandError> {
+        let Some(owed) = self.undelivered.borrow().get(member_id).cloned() else {
+            return Ok(KeyRetry::Moot);
+        };
+        let key = self
+            .outbound_key
+            .read()
+            .unwrap()
+            .as_ref()
+            .filter(|key| key.key_index == owed.key_index)
+            .map(|key| key.key.clone());
+        let Some(key) = key else {
+            // Rotated since: the rotation's rollout addressed them.
+            self.drop_owed(&owed);
+            return Ok(KeyRetry::Moot);
+        };
+
+        let served = self
+            .deliver_key(
+                &general_purpose::STANDARD.encode(&key),
+                owed.key_index,
+                std::slice::from_ref(&owed.target),
+            )
+            .await?;
+        if served.is_empty() {
+            return Ok(KeyRetry::Undelivered);
+        }
+        log::info!(
+            "[{}/{}] key index {} delivered to member {} on retry",
+            self.room_id,
+            self.slot_id,
+            owed.key_index,
+            member_id,
+        );
+        if let Some(key) = self.outbound_key.write().unwrap().as_mut()
+            && key.key_index == owed.key_index
+            && !key.shared_with.iter().any(|x| x.same_join(&owed.target))
+        {
+            key.shared_with.push(owed.target.clone());
+        }
+        self.drop_owed(&owed);
+        Ok(KeyRetry::Delivered)
+    }
+
+    /// Removes `owed`, unless a newer rollout has replaced it meanwhile.
+    fn drop_owed(&self, owed: &Undelivered) {
+        self.undelivered.send_if_modified(|undelivered| {
+            let current = undelivered.get(&owed.target.member_id) == Some(owed);
+            if current {
+                undelivered.remove(&owed.target.member_id);
+            }
+            current
+        });
+    }
+
     /// The key we are encrypting with at `now`, and its index.
     ///
     /// Not always the one in `outbound_key`: a rotation is stored there as soon as
@@ -1364,6 +1509,16 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
     ///
     /// The session's scheduler drives [`Self::flush_due_rotation`] at the
     /// instant it comes up; see [`Self::subscribe_rotation_due`].
+    /// [`Self::retry_undelivered_key`], for tests standing in for the upkeep
+    /// that drives it: `true` when the member now holds the key.
+    #[cfg(feature = "testing")]
+    pub async fn retry_undelivered_key_now(&self, member_id: &str) -> Result<bool, CommandError> {
+        Ok(matches!(
+            self.retry_undelivered_key(member_id).await?,
+            KeyRetry::Delivered
+        ))
+    }
+
     pub fn rotation_due_at_ms(&self) -> Option<u64> {
         *self.rotation_due_at.borrow()
     }
@@ -1434,8 +1589,32 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         index: u8,
         targets: &[ParticipantDeviceInfo],
     ) -> Vec<ParticipantDeviceInfo> {
+        self.deliver_key(key_b64, index, targets)
+            .await
+            .unwrap_or_else(|error| {
+                // The batch never left; nobody was served, so nobody is recorded
+                // as holding the key and every one of them is retried.
+                log::error!(
+                    "[{}/{}] could not send key index {index} to any of {} recipient(s): {error}",
+                    self.room_id,
+                    self.slot_id,
+                    targets.len(),
+                );
+                Vec::new()
+            })
+    }
+
+    /// [`Self::send_key_to_participants`], with the host's error when the
+    /// batch itself failed: a retry tells a signalling failure from a member
+    /// the host could not deliver to.
+    async fn deliver_key(
+        &self,
+        key_b64: &str,
+        index: u8,
+        targets: &[ParticipantDeviceInfo],
+    ) -> Result<Vec<ParticipantDeviceInfo>, CommandError> {
         if targets.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         // The same content for every recipient: it names *our* member id and key,
@@ -1500,33 +1679,19 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         }
 
         if recipients.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
-        let deliveries = match self
+        let deliveries = self
             .backend
             .send_to_device_message(recipients, KEY_MESSAGE_TYPE.to_string(), content)
-            .await
-        {
-            Ok(deliveries) => deliveries,
-            Err(error) => {
-                // The batch never left; nobody was served, so nobody is recorded
-                // as holding the key and the next rollout retries all of them.
-                log::error!(
-                    "[{}/{}] could not send key index {index} to any of {} recipient(s): {error}",
-                    self.room_id,
-                    self.slot_id,
-                    addressed.len(),
-                );
-                return Vec::new();
-            }
-        };
+            .await?;
 
         // Match results back by recipient rather than by position: an
         // implementation is free to reorder or to answer for only some of them,
         // and treating an unanswered recipient as served is the failure this
         // whole shape exists to prevent.
-        addressed
+        Ok(addressed
             .into_iter()
             .filter(|target| {
                 let delivered = deliveries.iter().find(|delivery| {
@@ -1561,7 +1726,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
                     }
                 }
             })
-            .collect()
+            .collect())
     }
 
     /// Signals a key to the application layer.
@@ -1579,10 +1744,7 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
     /// eagerly so the transport is listening.
     async fn signal_key_to_app(&self, key: &OutboundEncryptionKey, use_after_ms: u64) {
         if let Some(handler) = &self.signal_handler {
-            let rtc_backend_id = match &self.identity_mapper {
-                Some(mapper) => mapper(&self.own_user_id, &self.own_device_id, &self.own_member_id),
-                None => self.get_own_rtc_backend_identity(),
-            };
+            let rtc_backend_id = self.own_rtc_identity();
             let signal = KeyMaterialSignal {
                 key: key.key.clone(),
                 key_index: key.key_index,
@@ -1679,10 +1841,10 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         match &key.origin {
             KeyOrigin::Cleartext => Err(KeyRejection::Cleartext),
             KeyOrigin::Encrypted {
-                sender_is_cross_signed,
+                sender_is_confirmed,
                 ..
-            } if self.config.require_cross_signed_sender && !sender_is_cross_signed => {
-                Err(KeyRejection::NotCrossSigned)
+            } if self.config.require_confirmed_sender && !sender_is_confirmed => {
+                Err(KeyRejection::SenderNotConfirmed)
             }
             KeyOrigin::Encrypted { .. } => Ok(()),
         }
@@ -1704,10 +1866,10 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             KeyOrigin::Encrypted {
                 sender_user_id,
                 sender_device_id,
-                sender_is_cross_signed,
+                sender_is_confirmed,
             } => log::debug!(
                 "[{}/{}] key index {} for member {} from {sender_user_id}/{} \
-                 cross_signed={sender_is_cross_signed}",
+                 confirmed={sender_is_confirmed}",
                 self.room_id,
                 self.slot_id,
                 received.key_index,
@@ -1744,7 +1906,9 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
 
         let key_bytes = general_purpose::STANDARD
             .decode(&received.key_b64)
-            .map_err(|e| CommandError::SendError(format!("Failed to decode key: {}", e)))?;
+            .map_err(|e| {
+                CommandError::SerializationError(format!("Failed to decode key: {}", e))
+            })?;
 
         if key_bytes.len() != 32 {
             log::warn!(
@@ -1857,18 +2021,10 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         key: InboundEncryptionKey,
         membership: &JoinedMembership,
     ) {
-        // Compute the RTC backend identity for this participant. When a mapper is
-        // installed (e.g. the LiveKit transport's MSC4195 pseudonymous identity),
-        // derive it from the membership's user/device/member triple; otherwise
-        // fall back to the raw member_id (or `sender:device`).
-        let rtc_backend_id = match &self.identity_mapper {
-            Some(mapper) => mapper(
-                &membership.sender,
-                membership.origin.sender_device_id().unwrap_or(""),
-                &membership.member_id,
-            ),
-            None => membership.member_id.clone(),
-        };
+        // The participant's RTC backend identity, as the installed mapper derives
+        // it from the membership; `None` when it cannot be, and then the key is
+        // stored but there is no participant to hand it to.
+        let rtc_backend_id = self.peer_rtc_identity(membership);
 
         // Store the key: at most one entry per index, holding the newest material
         // we have seen for it.
@@ -1920,7 +2076,15 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
         }
 
         // Signal to application
-        self.signal_inbound_key_to_app(key, rtc_backend_id).await;
+        match rtc_backend_id {
+            Some(rtc_backend_id) => self.signal_inbound_key_to_app(key, rtc_backend_id).await,
+            None => log::debug!(
+                "[{}/{}] key from {} has no derivable participant identity; stored only",
+                self.room_id,
+                self.slot_id,
+                membership.member_id
+            ),
+        }
     }
 
     /// Signals an inbound key to the application layer.
@@ -1977,6 +2141,7 @@ impl<T: MatrixBackend + 'static> Clone for EncryptionManager<T> {
             config: self.config.clone(),
             signal_handler: self.signal_handler.clone(),
             identity_mapper: self.identity_mapper.clone(),
+            own_transports: self.own_transports.clone(),
             key_distribution_in_progress: self.key_distribution_in_progress.clone(),
             need_new_distribution: self.need_new_distribution.clone(),
             next_key_index: self.next_key_index.clone(),
@@ -1986,6 +2151,7 @@ impl<T: MatrixBackend + 'static> Clone for EncryptionManager<T> {
             superseded_key: self.superseded_key.clone(),
             rotation_due_at: self.rotation_due_at.clone(),
             signalled_key: self.signalled_key.clone(),
+            undelivered: self.undelivered.clone(),
         }
     }
 }
@@ -2057,7 +2223,7 @@ mod tests {
             origin: KeyOrigin::Encrypted {
                 sender_user_id: "@bob:example.org".to_string(),
                 sender_device_id: Some("device456".to_string()),
-                sender_is_cross_signed: true,
+                sender_is_confirmed: true,
             },
             room_id: ROOM_ID.to_string(),
             member_id: "bob-device456-uuid".to_string(),
@@ -2709,14 +2875,15 @@ mod tests {
         );
     }
 
-    /// An arrival that rotates must still leave the newcomer able to decrypt.
+    /// An arrival that rotates hands the newcomer the new key only.
     ///
     /// The rotation is delayed to keep the members already present decrypting, so
-    /// for the length of the delay we go on encrypting with a key the newcomer was
-    /// never sent — which is a media blackout on every join into an established
-    /// call unless they are handed that key too.
+    /// for the length of the delay we go on encrypting with a key minted before
+    /// the newcomer joined. Handing it over would let them read back over
+    /// everything it encrypted, which is what rotating on their arrival prevents;
+    /// they decrypt us once the new key comes into use.
     #[tokio::test]
-    async fn an_arrival_is_handed_the_key_we_keep_encrypting_with() {
+    async fn an_arrival_is_not_handed_the_key_it_arrived_after() {
         let sender = Arc::new(MockBackend::new());
         let memberships = Arc::new(Mutex::new(vec![bob_membership()]));
         let mut manager = manager_over(sender.clone(), memberships.clone());
@@ -2780,9 +2947,9 @@ mod tests {
             "carol needs the key we are rotating to, got {sent_to_carol:?}"
         );
         assert!(
-            sent_to_carol.contains(&(index_in_use as u64)),
-            "carol also needs the key we go on encrypting with for the next {}ms, or she \
-             decrypts nothing until it elapses; got {sent_to_carol:?}",
+            !sent_to_carol.contains(&(index_in_use as u64)),
+            "carol must not get the key minted before she joined, which we go on \
+             encrypting with for {}ms; got {sent_to_carol:?}",
             signal.use_after_ms,
         );
     }
@@ -2880,11 +3047,14 @@ mod tests {
 
         let handler = Arc::new(RecordingHandler::default());
         manager.set_signal_handler(handler.clone());
-        manager.set_identity_mapper(Arc::new(
-            |user_id: &str, device_id: &str, member_id: &str| {
-                format!("mapped:{user_id}/{device_id}/{member_id}")
-            },
-        ));
+        manager.set_identity_mapper(Arc::new(|subject: &IdentitySubject<'_>| {
+            Some(format!(
+                "mapped:{}/{}/{}",
+                subject.user_id,
+                subject.device_id.unwrap_or_default(),
+                subject.member_id
+            ))
+        }));
 
         manager.replay_keys_to_handler().await;
 
@@ -3118,7 +3288,7 @@ mod tests {
         key.origin = KeyOrigin::Encrypted {
             sender_user_id: "@bob:example.org".to_string(),
             sender_device_id: Some("device456".to_string()),
-            sender_is_cross_signed: false,
+            sender_is_confirmed: false,
         };
         manager
             .receive_key(key)
@@ -3133,7 +3303,7 @@ mod tests {
                 key_index: Some(3),
                 sender_user_id: Some("@bob:example.org".to_string()),
                 sender_device_id: Some("device456".to_string()),
-                reason: KeyRejection::NotCrossSigned,
+                reason: KeyRejection::SenderNotConfirmed,
             }],
         );
         assert!(
@@ -3163,7 +3333,7 @@ mod tests {
         key.origin = KeyOrigin::Encrypted {
             sender_user_id: "@bob:example.org".to_string(),
             sender_device_id: Some("SOMEOTHERDEV".to_string()),
-            sender_is_cross_signed: true,
+            sender_is_confirmed: true,
         };
         manager
             .receive_key(key)
@@ -3207,7 +3377,7 @@ mod tests {
         key.origin = KeyOrigin::Encrypted {
             sender_user_id: "@mallory:example.org".to_string(),
             sender_device_id: Some("device456".to_string()),
-            sender_is_cross_signed: true,
+            sender_is_confirmed: true,
         };
         assert_discarded(&manager, key).await;
     }
@@ -3221,7 +3391,7 @@ mod tests {
         key.origin = KeyOrigin::Encrypted {
             sender_user_id: "@bob:example.org".to_string(),
             sender_device_id: Some("someOtherDevice".to_string()),
-            sender_is_cross_signed: true,
+            sender_is_confirmed: true,
         };
         assert_discarded(&manager, key).await;
     }
@@ -3332,23 +3502,23 @@ mod tests {
     /// MSC4153: keys from devices that are not cross-signed are discarded when
     /// the client is configured to exclude insecure devices.
     #[tokio::test]
-    async fn key_from_non_cross_signed_device_is_discarded_when_required() {
+    async fn key_from_unconfirmed_sender_is_discarded_when_required() {
         let manager = manager_with_bob();
         let mut key = bob_key(vec![1u8; 32], 0);
         key.origin = KeyOrigin::Encrypted {
             sender_user_id: "@bob:example.org".to_string(),
             sender_device_id: Some("device456".to_string()),
-            sender_is_cross_signed: false,
+            sender_is_confirmed: false,
         };
         assert_discarded(&manager, key).await;
     }
 
     /// ...and accepted when the deployment has opted out of that requirement.
     #[tokio::test]
-    async fn key_from_non_cross_signed_device_is_accepted_when_not_required() {
+    async fn key_from_unconfirmed_sender_is_accepted_when_not_required() {
         let mut manager = manager_with_bob();
         manager.set_config(EncryptionConfig {
-            require_cross_signed_sender: false,
+            require_confirmed_sender: false,
             ..EncryptionConfig::default()
         });
 
@@ -3356,7 +3526,7 @@ mod tests {
         key.origin = KeyOrigin::Encrypted {
             sender_user_id: "@bob:example.org".to_string(),
             sender_device_id: Some("device456".to_string()),
-            sender_is_cross_signed: false,
+            sender_is_confirmed: false,
         };
         manager.receive_key(key).await.expect("should succeed");
 
@@ -3397,7 +3567,7 @@ mod tests {
         impostor.origin = KeyOrigin::Encrypted {
             sender_user_id: "@mallory:example.org".to_string(),
             sender_device_id: Some("device456".to_string()),
-            sender_is_cross_signed: true,
+            sender_is_confirmed: true,
         };
         manager.receive_key(impostor).await.unwrap();
         manager
@@ -3425,7 +3595,7 @@ mod tests {
         impostor.origin = KeyOrigin::Encrypted {
             sender_user_id: "@mallory:example.org".to_string(),
             sender_device_id: Some("device456".to_string()),
-            sender_is_cross_signed: true,
+            sender_is_confirmed: true,
         };
         manager.receive_key(impostor).await.unwrap();
 
@@ -3635,12 +3805,24 @@ mod tests {
             ) -> Result<String, CommandError> {
                 Ok("$sticky".to_string())
             }
-            async fn send_delayed_event(
+            async fn send_delayed_state_event(
+                &self,
+                room_id: String,
+                event_type: String,
+                _state_key: String,
+                content: serde_json::Value,
+                delay_ms: u64,
+            ) -> Result<String, CommandError> {
+                self.send_delayed_sticky_event(room_id, event_type, content, 0, delay_ms)
+                    .await
+            }
+
+            async fn send_delayed_sticky_event(
                 &self,
                 _room_id: String,
                 _event_type: String,
-                _state_key: Option<String>,
                 _content: serde_json::Value,
+                _sticky_duration_ms: u64,
                 _delay_ms: u64,
             ) -> Result<String, CommandError> {
                 Ok("$delay".to_string())

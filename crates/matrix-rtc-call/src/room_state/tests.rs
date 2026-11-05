@@ -83,9 +83,9 @@ fn member_event(
 }
 
 fn join_params() -> JoinSessionParams {
-    JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(LiveKitTransport {
-        livekit_service_url: "https://sfu.example.org".to_owned(),
-    }))
+    JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
+        LiveKitTransport::service("https://sfu.example.org".to_owned()),
+    ))
 }
 
 type Call = CallRoomState<DialectBackend<MockBackend>>;
@@ -217,6 +217,34 @@ async fn a_peers_reaction_is_surfaced_with_its_sound() {
     assert_eq!(received.emoji, "👏");
     assert_eq!(received.name, "clapping");
     assert_eq!(received.sound, ReactionSound::Named("clap".to_owned()));
+}
+
+#[tokio::test]
+async fn a_catalogue_reaction_shows_the_catalogues_emoji() {
+    let (mut call, _, _) = joined_call(join_params().into()).await;
+    let mut reactions = call.subscribe_reactions(SLOT).unwrap();
+
+    ingest(
+        &mut call,
+        bob_reacts("$r1", "$bob-member-1", "🙂", "clapping"),
+    );
+
+    assert_eq!(reactions.try_recv().expect("one reaction").emoji, "👏");
+}
+
+#[tokio::test]
+async fn a_reaction_outside_the_catalogue_keeps_the_senders_emoji_and_plays_generic() {
+    let (mut call, _, _) = joined_call(join_params().into()).await;
+    let mut reactions = call.subscribe_reactions(SLOT).unwrap();
+
+    ingest(
+        &mut call,
+        bob_reacts("$r1", "$bob-member-1", "🦄 ", "unicorn"),
+    );
+
+    let received = reactions.try_recv().expect("one reaction");
+    assert_eq!(received.emoji, "🦄");
+    assert_eq!(received.sound, ReactionSound::Generic);
 }
 
 #[tokio::test]
@@ -584,7 +612,7 @@ async fn the_hand_follows_our_membership_event_across_a_refresh() {
     );
 
     assert!(call.rtc_mut().keep_alive(SLOT).await);
-    assert!(call.reannotate_hand_if_moved(SLOT).await);
+    call.drive_hand(SLOT).await;
 
     assert_eq!(
         call.rtc().own_membership_event_id(SLOT).as_deref(),
@@ -790,6 +818,15 @@ async fn join_and_notify(call: &mut Call, member_id: &str, notify: Option<GroupN
         ..rtc.into()
     };
     call.join(params).await.expect("join should succeed");
+    let_detached_sends_run().await;
+}
+
+/// The join returns before its notification is sent, which goes out on a
+/// task of its own; this lets it.
+async fn let_detached_sends_run() {
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
 }
 
 /// Every sticky send of the notification, under its wire type, as
@@ -1033,6 +1070,7 @@ async fn dm(
         })
         .await
         .expect("join succeeds");
+    let_detached_sends_run().await;
     (call, sender, joined)
 }
 

@@ -31,16 +31,19 @@
 //!   install a media key in livekit-js's key provider (the
 //!   [`FrameKeyRing`](matrix_rtc_transport::keys::FrameKeyRing) seam)
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use js_sys::{Array, Function, Promise, Reflect, Uint8Array};
-use matrix_rtc_core::{JoinedMembership, MatrixBackend, RtcIdentityMapper, RtcTransport};
-use matrix_rtc_transport::keys::FrameKeyRing;
-use matrix_rtc_transport::livekit::token::{
-    get_token_request, legacy_token_request, parse_sfu_token,
+use matrix_rtc_core::{
+    BackendError, IdentitySubject, JoinedMembership, LiveKitTokenRequest, MatrixBackend,
+    RtcIdentityMapper, RtcTransport,
 };
-use matrix_rtc_transport::livekit::{SfuToken, TokenEndpoint};
+use matrix_rtc_transport::keys::FrameKeyRing;
+use matrix_rtc_transport::livekit::token::{legacy_token_request, parse_sfu_token};
+use matrix_rtc_transport::livekit::{LiveKitTarget, SfuToken};
 use matrix_rtc_transport::{
     ConnectionContext, ConnectionEvent, FrameEncryptionState, MediaStreamKind, MediaTransport,
     OwnFocusTransport, RemoteTrackHandle, SpeakingParticipant, TransportConnection, TransportError,
@@ -183,6 +186,18 @@ impl WasmConnectionEventSink {
         });
     }
 
+    /// livekit-js `TrackSubscribed` for a publication declared unencrypted
+    /// (`!publication.isEncrypted`) in an encrypted room: refuse it rather
+    /// than `trackAdded` (unsubscribe, never attach), and report it here. Its
+    /// frames would play as they come, and the SFU relays that declaration.
+    #[wasm_bindgen(js_name = trackNotEncrypted)]
+    pub fn track_not_encrypted(&self, identity: String, kind: String) {
+        let Some(kind) = parse_stream_kind(&kind) else {
+            return;
+        };
+        self.send(ConnectionEvent::TrackNotEncrypted { identity, kind });
+    }
+
     /// livekit-js `TrackUnsubscribed` / `LocalTrackUnpublished`.
     #[wasm_bindgen(js_name = trackRemoved)]
     pub fn track_removed(&self, identity: String, kind: String) {
@@ -286,11 +301,17 @@ struct ConnectRequest<'a> {
 
 /// `matrix-rtc-media`'s transport over the JS delegate.
 pub(crate) struct JsMediaTransport {
-    delegate: JsValue,
-    /// The page's Matrix backend, which answers the OpenID token requests.
-    backend: Arc<dyn MatrixBackend>,
+    connector: Rc<JsConnector>,
     identity_mapper: RtcIdentityMapper,
-    token_endpoint: TokenEndpoint,
+}
+
+/// What a connect needs: the delegate that fetches and connects, and the
+/// backend that answers the OpenID and homeserver token requests.
+struct JsConnector {
+    delegate: JsValue,
+    /// The page's Matrix backend, which answers the OpenID token requests and
+    /// the homeserver's MSC4195 `get_token`.
+    backend: Arc<dyn MatrixBackend>,
 }
 
 impl JsMediaTransport {
@@ -298,52 +319,73 @@ impl JsMediaTransport {
         delegate: JsValue,
         backend: Arc<dyn MatrixBackend>,
         identity_mapper: RtcIdentityMapper,
-        token_endpoint: TokenEndpoint,
     ) -> Self {
         Self {
-            delegate,
-            backend,
+            connector: Rc::new(JsConnector { delegate, backend }),
             identity_mapper,
-            token_endpoint,
         }
     }
+}
 
-    /// Obtain a fresh OpenID token from the backend and exchange it for an
-    /// SFU JWT: Rust builds the request and decodes the response
-    /// (`matrix_rtc_transport::livekit`), the delegate performs the fetch.
+impl JsConnector {
+    /// Obtain an SFU token through the flow the connection key's target
+    /// selects: the homeserver's MSC4195 `get_token` through the backend, or an
+    /// OpenID token exchanged at the legacy JWT service's `/sfu/get`, where
+    /// Rust builds the request and decodes the response
+    /// (`matrix_rtc_transport::livekit`) and the delegate performs the fetch.
+    /// No fallback between the two: each mints a different identity.
     async fn acquire_token(
         &self,
-        livekit_service_url: &str,
+        connection_key: &str,
         ctx: &ConnectionContext,
     ) -> Result<SfuToken, TransportError> {
+        // A bare URL, as a page connecting outside a call may pass, names a
+        // legacy JWT service.
+        let target = LiveKitTarget::from_connection_key(connection_key).unwrap_or_else(|| {
+            LiveKitTarget::SfuGet {
+                service_url: connection_key.to_owned(),
+            }
+        });
+        let backend_error = |what: &str, error: BackendError| {
+            let message = format!("{what}: {error}");
+            let refused = error.is_permanent()
+                || error
+                    .status
+                    .is_some_and(|status| (400..500).contains(&status) && status != 429);
+            if refused {
+                TransportError::Refused(message)
+            } else {
+                TransportError::Connect(message)
+            }
+        };
+        let service_url = match target {
+            LiveKitTarget::CsApi { url, server_name } => {
+                let jwt = self
+                    .backend
+                    .livekit_token(&LiveKitTokenRequest {
+                        server_name: Some(server_name),
+                        url: url.clone(),
+                        room_id: ctx.room_id.clone(),
+                        slot_id: ctx.slot_id.clone(),
+                        member_id: ctx.member.member_id.clone(),
+                    })
+                    .await
+                    .map_err(|error| backend_error("homeserver livekit token", error))?;
+                return Ok(SfuToken { jwt, url });
+            }
+            LiveKitTarget::SfuGet { service_url } => service_url,
+        };
+
         let openid = self
             .backend
             .openid_token()
             .await
-            .map_err(|error| TransportError::Connect(format!("openid token: {error}")))?;
-
-        let (url, body) = match self.token_endpoint {
-            TokenEndpoint::Msc4195 => get_token_request(
-                livekit_service_url,
-                &ctx.room_id,
-                &ctx.slot_id,
-                &matrix_rtc_transport::livekit::MemberClaims {
-                    id: ctx.member.member_id.clone(),
-                    claimed_user_id: ctx.member.user_id.clone(),
-                    claimed_device_id: ctx.member.device_id.clone(),
-                },
-                &openid,
-            ),
-            // `room` is the room id, because that is the `livekit_alias` this
-            // generation announces on a focus; the two must agree or the
-            // clients land in different LiveKit rooms.
-            TokenEndpoint::LegacyElementCall => legacy_token_request(
-                livekit_service_url,
-                &ctx.room_id,
-                &ctx.member.device_id,
-                &openid,
-            ),
-        };
+            .map_err(|error| backend_error("openid token", error))?;
+        // `room` is the room id, because that is the `livekit_alias` the
+        // legacy generation announces on a focus; the two must agree or the
+        // clients land in different LiveKit rooms.
+        let (url, body) =
+            legacy_token_request(&service_url, &ctx.room_id, &ctx.member.device_id, &openid);
 
         // The JSON-compatible serializer, so the body reaches the delegate as
         // a plain object — the default turns serde maps into ES `Map`s, which
@@ -370,8 +412,40 @@ impl JsMediaTransport {
                 TransportError::Connect(format!("fetchJson resolved to a non-response: {error}"))
             })?;
 
-        parse_sfu_token(response.status, &response.body)
-            .map_err(|error| TransportError::Connect(error.to_string()))
+        // A 4xx from the token service is a refusal (034 R24).
+        parse_sfu_token(response.status, &response.body).map_err(|error| {
+            if (400..500).contains(&response.status) {
+                TransportError::Refused(error.to_string())
+            } else {
+                TransportError::Connect(error.to_string())
+            }
+        })
+    }
+
+    /// Connects a livekit-js room through the delegate's `connect`, and
+    /// resolves with its handle and events.
+    async fn connect(
+        &self,
+        connection_key: &str,
+        sfu_token: &SfuToken,
+    ) -> Result<(JsValue, mpsc::UnboundedReceiver<ConnectionEvent>), TransportError> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let sink = WasmConnectionEventSink { tx };
+        let request = serde_wasm_bindgen::to_value(&ConnectRequest {
+            connection_key,
+            sfu_url: &sfu_token.url,
+            jwt: &sfu_token.jwt,
+        })
+        .map_err(|error| {
+            TransportError::Connect(format!("connect request did not serialize: {error}"))
+        })?;
+        let handle =
+            call_delegate(&self.delegate, "connect", &[&request, &JsValue::from(sink)]).await?;
+        log::info!(
+            "transport: connected to focus {connection_key} at {}",
+            sfu_token.url
+        );
+        Ok((handle, rx))
     }
 }
 
@@ -392,34 +466,19 @@ impl OwnFocusTransport for JsMediaTransport {
         ),
         TransportError,
     > {
-        let sfu_token = self.acquire_token(connection_key, ctx).await?;
+        let connection = self.prepare_own(connection_key, ctx);
+        let events = connection.reconnect(false).await?;
+        Ok((connection, events))
+    }
 
-        let (tx, rx) = mpsc::unbounded_channel();
-        let sink = WasmConnectionEventSink { tx };
-        let request = serde_wasm_bindgen::to_value(&ConnectRequest {
-            connection_key,
-            sfu_url: &sfu_token.url,
-            jwt: &sfu_token.jwt,
-        })
-        .map_err(|error| {
-            TransportError::Connect(format!("connect request did not serialize: {error}"))
-        })?;
-
-        let handle =
-            call_delegate(&self.delegate, "connect", &[&request, &JsValue::from(sink)]).await?;
-
-        log::info!(
-            "transport: connected to focus {connection_key} at {}",
-            sfu_token.url
-        );
-        Ok((
-            JsTransportConnection {
-                connection_key: connection_key.to_owned(),
-                handle,
-                delegate: self.delegate.clone(),
-            },
-            rx,
-        ))
+    fn prepare_own(&self, connection_key: &str, ctx: &ConnectionContext) -> JsTransportConnection {
+        JsTransportConnection {
+            connection_key: connection_key.to_owned(),
+            handle: Rc::new(RefCell::new(None)),
+            token: Rc::new(RefCell::new(None)),
+            ctx: ctx.clone(),
+            connector: self.connector.clone(),
+        }
     }
 }
 
@@ -429,24 +488,29 @@ impl MediaTransport for JsMediaTransport {
         "livekit"
     }
 
-    fn connection_key(&self, transport: &RtcTransport) -> Option<String> {
-        match transport {
-            RtcTransport::LiveKit(livekit) => Some(livekit.livekit_service_url.clone()),
-            RtcTransport::Unsupported(_) => None,
+    fn connection_key(&self, transport: &RtcTransport, publisher_user_id: &str) -> Option<String> {
+        matrix_rtc_transport::livekit::connection_key(transport, publisher_user_id)
+    }
+
+    fn shares_identity(&self, a: &str, b: &str) -> bool {
+        match (
+            LiveKitTarget::from_connection_key(a),
+            LiveKitTarget::from_connection_key(b),
+        ) {
+            (Some(a), Some(b)) => a.same_flow(&b),
+            _ => false,
         }
     }
 
     fn remote_identity(&self, member: &JoinedMembership) -> Option<String> {
-        // Same rule as the native transport: without an attributable sending
-        // device there is no identity to expect on the SFU. Through the mapper
-        // rather than `pseudonymous_identity` directly, so a legacy call
-        // derives peer identities exactly as it derives its own.
-        let device_id = member.origin.sender_device_id()?;
-        Some((self.identity_mapper)(
-            &member.sender,
-            device_id,
-            &member.member_id,
-        ))
+        // Same rule as the native transport, through the mapper so peers'
+        // identities are derived exactly as the core addresses their keys.
+        (self.identity_mapper)(&IdentitySubject {
+            user_id: &member.sender,
+            device_id: member.origin.sender_device_id(),
+            member_id: &member.member_id,
+            transports: &member.transports,
+        })
     }
 
     async fn connect(
@@ -465,15 +529,20 @@ impl MediaTransport for JsMediaTransport {
     }
 }
 
-/// A live connection: the handle the delegate's `connect` resolved with.
-/// Clones share the same underlying JS object.
+/// A connection to one focus, behind a handle that outlives each connect
+/// (034 R24): the livekit-js room the delegate's `connect` resolved with is
+/// replaced on every reconnect. On the web the page publishes through
+/// livekit-js, so it republishes on the room each `connect` hands it.
+/// Clones share the same state.
 #[derive(Clone)]
 pub(crate) struct JsTransportConnection {
     connection_key: String,
-    handle: JsValue,
-    /// Owns the frame cryptor our own frames go through, so the key index
-    /// switch goes through it.
-    delegate: JsValue,
+    /// The room handle of the last connect; `None` before the first.
+    handle: Rc<RefCell<Option<JsValue>>>,
+    /// The token the last connect used, reused until it is refused.
+    token: Rc<RefCell<Option<SfuToken>>>,
+    ctx: ConnectionContext,
+    connector: Rc<JsConnector>,
 }
 
 #[async_trait(?Send)]
@@ -487,7 +556,8 @@ impl TransportConnection for JsTransportConnection {
 
     /// Through the delegate's `setLocalKeyIndex(index)`.
     fn set_local_key_index(&self, index: u8) {
-        let method = Reflect::get(&self.delegate, &JsValue::from_str("setLocalKeyIndex"))
+        let delegate = &self.connector.delegate;
+        let method = Reflect::get(delegate, &JsValue::from_str("setLocalKeyIndex"))
             .ok()
             .filter(|method| !method.is_undefined());
         let Some(method) = method.and_then(|method| method.dyn_into::<Function>().ok()) else {
@@ -497,13 +567,47 @@ impl TransportConnection for JsTransportConnection {
             );
             return;
         };
-        if let Err(error) = method.call1(&self.delegate, &JsValue::from(index)) {
+        if let Err(error) = method.call1(delegate, &JsValue::from(index)) {
             log::warn!("media: setLocalKeyIndex({index}) threw: {error:?}");
         }
     }
 
+    /// A new livekit-js room through the delegate, with the token of the
+    /// last connect or a fresh one; the previous room is closed.
+    async fn reconnect(
+        &self,
+        fresh_token: bool,
+    ) -> Result<mpsc::UnboundedReceiver<ConnectionEvent>, TransportError> {
+        let cached = self.token.borrow().clone();
+        let token = match cached {
+            Some(token) if !fresh_token => token,
+            _ => {
+                let token = self
+                    .connector
+                    .acquire_token(&self.connection_key, &self.ctx)
+                    .await?;
+                *self.token.borrow_mut() = Some(token.clone());
+                token
+            }
+        };
+        let (handle, events) = self.connector.connect(&self.connection_key, &token).await?;
+        let previous = self.handle.borrow_mut().replace(handle);
+        if let Some(previous) = previous {
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Err(error) = call_delegate(&previous, "close", &[]).await {
+                    log::debug!("closing the previous room: {error}");
+                }
+            });
+        }
+        Ok(events)
+    }
+
     async fn close(&self) -> Result<(), TransportError> {
-        call_delegate(&self.handle, "close", &[]).await.map(|_| ())
+        let handle = self.handle.borrow().clone();
+        match handle {
+            Some(handle) => call_delegate(&handle, "close", &[]).await.map(|_| ()),
+            None => Ok(()),
+        }
     }
 }
 

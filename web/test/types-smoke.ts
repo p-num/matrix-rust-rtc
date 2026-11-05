@@ -43,7 +43,8 @@ export function host(client: {
     ownDeviceId: () => client.deviceId,
     sendStickyEvent: () => client.send(),
     sendStateEvent: () => client.send(),
-    sendDelayedEvent: (_room, _type, stateKey: string | null) => Promise.resolve(stateKey ?? 'delay'),
+    sendDelayedStateEvent: (_room, _type, stateKey: string) => Promise.resolve(stateKey),
+    sendDelayedStickyEvent: () => Promise.resolve('delay'),
     restartDelayedEvent: () => Promise.resolve(),
     cancelDelayedEvent: () => Promise.resolve(),
     sendToDeviceMessage: () => Promise.resolve(),
@@ -69,13 +70,14 @@ export function host(client: {
         sender: '@a:hs',
         event_type: 'm.rtc.encryption_key',
         content: {},
-        encryption: { kind: 'encrypted', sender_device_id: 'DEV', sender_cross_signed: true },
+        encryption: { kind: 'encrypted', sender_device_id: 'DEV', sender_confirmed: true },
       });
       return { cancel: () => {} };
     },
     relations: () => Promise.resolve([]),
     getOpenIdToken: () =>
       Promise.resolve({ access_token: 't', token_type: 'Bearer', matrix_server_name: 'hs', expires_in: 1 }),
+    getLivekitToken: () => Promise.resolve({ jwt: 'jwt' }),
     rtcTransports: () => Promise.resolve([{ type: 'livekit', livekit_service_url: 'https://sfu' }]),
   };
 }
@@ -84,7 +86,7 @@ export async function smoke(
   client: WasmRtcClient,
   delegate: MediaDelegate,
 ): Promise<void> {
-  const options: RoomOptionsIn = { format: 'sticky_2025' };
+  const options: RoomOptionsIn = { format: 'room_state' };
   const room: WasmRtcRoom = await client.room('!r:hs', options);
 
   const params: JoinParamsIn = {

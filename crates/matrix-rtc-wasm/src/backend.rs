@@ -14,8 +14,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use js_sys::{Array, Function, Reflect};
 use matrix_rtc_core::{
-    BackendError, CommandError, EventIn, MatrixBackend, OpenIdToken, RoomSink, RoomSubjects,
-    Subscription, ToDeviceDelivery, ToDeviceMessageIn, ToDeviceRecipient, ToDeviceSink,
+    BackendError, CommandError, EventIn, LiveKitTokenRequest, MatrixBackend, OpenIdToken, RoomSink,
+    RoomSubjects, Subscription, ToDeviceDelivery, ToDeviceMessageIn, ToDeviceRecipient,
+    ToDeviceSink,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -43,38 +44,53 @@ fn js_error_message(error: &JsValue) -> String {
     }
 }
 
-/// A matrix-js-sdk `MatrixError` carries `errcode` and `httpStatus`; read
-/// them when present so the library can classify the failure.
-fn js_error_parts(error: &JsValue) -> (Option<String>, Option<u16>, String) {
-    let field = |name: &str| Reflect::get(error, &JsValue::from_str(name)).ok();
-    let errcode = field("errcode").and_then(|v| v.as_string());
-    let status = field("httpStatus")
+/// A matrix-js-sdk `MatrixError` carries `errcode`, `httpStatus` and, on a
+/// rate limit, `data.retry_after_ms`; read them when present so the library
+/// can classify the failure (034 R3, R7). A host marks a failure its client
+/// knows is final, with no Matrix code, by setting `permanent: true` on it.
+fn js_backend_error(error: &JsValue) -> BackendError {
+    let field = |target: &JsValue, name: &str| Reflect::get(target, &JsValue::from_str(name)).ok();
+    let errcode = field(error, "errcode").and_then(|v| v.as_string());
+    let status = field(error, "httpStatus")
         .and_then(|v| v.as_f64())
         .map(|status| status as u16);
-    (errcode, status, js_error_message(error))
+    let retry_after_ms = field(error, "data")
+        .filter(|data| data.is_object())
+        .and_then(|data| field(&data, "retry_after_ms"))
+        .and_then(|v| v.as_f64())
+        .map(|ms| ms as u64);
+    let permanent = field(error, "permanent").is_some_and(|v| v.as_bool() == Some(true));
+    let error = BackendError::with_matrix_error(errcode, status, js_error_message(error))
+        .with_retry_after_ms(retry_after_ms);
+    if permanent { error.permanent() } else { error }
 }
 
 fn send_error(error: JsValue) -> CommandError {
-    let converted = CommandError::SendError(js_error_message(&error));
+    let converted = CommandError::Backend(js_backend_error(&error));
     log::warn!("command failed: {converted}");
     converted
 }
 
 fn delayed_error(error: JsValue) -> CommandError {
-    let (errcode, status, message) = js_error_parts(&error);
-    let converted = CommandError::delayed_event_failure(errcode.as_deref(), status, message);
+    let converted = CommandError::delayed_event_failure(js_backend_error(&error));
     log::warn!("command failed: {converted}");
     converted
 }
 
 fn backend_error(error: JsValue) -> BackendError {
-    let (errcode, status, message) = js_error_parts(&error);
-    BackendError::with_matrix_error(errcode, status, message)
+    js_backend_error(&error)
 }
 
 /// Reads the event id out of whatever a send method resolved to: matrix-js-sdk's
 /// `{ event_id }`, a wrapper's `{ eventId }`, or a bare string. Anything else
 /// is a failed send, not a silent success.
+/// A delayed send resolves with the bare MSC4140 delay id.
+fn js_delay_id(resolved: &JsValue, method: &str) -> Result<String, CommandError> {
+    resolved.as_string().ok_or_else(|| {
+        CommandError::ClientRejected(format!("{method} did not return a string delay id"))
+    })
+}
+
 fn js_event_id(resolved: &JsValue, method: &str) -> Result<String, CommandError> {
     if let Some(event_id) = resolved.as_string() {
         return Ok(event_id);
@@ -86,7 +102,7 @@ fn js_event_id(resolved: &JsValue, method: &str) -> Result<String, CommandError>
             return Ok(event_id);
         }
     }
-    Err(CommandError::SendError(format!(
+    Err(CommandError::ClientRejected(format!(
         "{method} must resolve to the event id (matrix-js-sdk's `{{event_id}}`); got {resolved:?}"
     )))
 }
@@ -297,37 +313,60 @@ impl MatrixBackend for JsBackend {
         js_event_id(&resolved, "sendStickyEvent")
     }
 
-    async fn send_delayed_event(
+    async fn send_delayed_state_event(
         &self,
         room_id: String,
         event_type: String,
-        state_key: Option<String>,
+        state_key: String,
         content: Value,
         delay_ms: u64,
     ) -> Result<String, CommandError> {
         self.log_command(&format!(
-            "send_delayed_event: room={room_id}, type={event_type}, state_key={state_key:?}, \
-             delay={delay_ms}ms"
+            "send_delayed_state_event: room={room_id}, type={event_type}, \
+             state_key={state_key}, delay={delay_ms}ms"
         ));
         let resolved = self
             .call_async(
-                "sendDelayedEvent",
+                "sendDelayedStateEvent",
                 vec![
                     JsValue::from_str(&room_id),
                     JsValue::from_str(&event_type),
-                    match &state_key {
-                        Some(state_key) => JsValue::from_str(state_key),
-                        None => JsValue::NULL,
-                    },
+                    JsValue::from_str(&state_key),
                     to_plain_js(&content)?,
                     JsValue::from_f64(delay_ms as f64),
                 ],
             )
             .await
             .map_err(delayed_error)?;
-        resolved.as_string().ok_or_else(|| {
-            CommandError::SendError("sendDelayedEvent did not return a string delay id".to_owned())
-        })
+        js_delay_id(&resolved, "sendDelayedStateEvent")
+    }
+
+    async fn send_delayed_sticky_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        content: Value,
+        sticky_duration_ms: u64,
+        delay_ms: u64,
+    ) -> Result<String, CommandError> {
+        self.log_command(&format!(
+            "send_delayed_sticky_event: room={room_id}, type={event_type}, \
+             duration={sticky_duration_ms}ms, delay={delay_ms}ms"
+        ));
+        let resolved = self
+            .call_async(
+                "sendDelayedStickyEvent",
+                vec![
+                    JsValue::from_str(&room_id),
+                    JsValue::from_str(&event_type),
+                    to_plain_js(&content)?,
+                    JsValue::from_f64(sticky_duration_ms as f64),
+                    JsValue::from_f64(delay_ms as f64),
+                ],
+            )
+            .await
+            .map_err(delayed_error)?;
+        js_delay_id(&resolved, "sendDelayedStickyEvent")
     }
 
     async fn restart_delayed_event(
@@ -566,6 +605,27 @@ impl MatrixBackend for JsBackend {
             .map_err(backend_error)?;
         serde_wasm_bindgen::from_value(result)
             .map_err(|e| BackendError::new(format!("getOpenIdToken resolved to a non-token: {e}")))
+    }
+
+    async fn livekit_token(&self, request: &LiveKitTokenRequest) -> Result<String, BackendError> {
+        let request = request
+            .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+            .map_err(|e| BackendError::new(format!("livekit token request: {e}")))?;
+        let result = self
+            .call_async("getLivekitToken", vec![request])
+            .await
+            .map_err(backend_error)?;
+        #[derive(serde::Deserialize)]
+        struct Response {
+            jwt: String,
+        }
+        // `{ jwt }` as the homeserver answers it, or the bare JWT.
+        if let Some(jwt) = result.as_string() {
+            return Ok(jwt);
+        }
+        serde_wasm_bindgen::from_value::<Response>(result)
+            .map(|response| response.jwt)
+            .map_err(|e| BackendError::new(format!("getLivekitToken resolved to a non-token: {e}")))
     }
 
     async fn rtc_transports(&self) -> Result<Value, BackendError> {

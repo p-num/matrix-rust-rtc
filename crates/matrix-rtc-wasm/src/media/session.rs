@@ -18,20 +18,21 @@ use std::time::Duration;
 
 use js_sys::{Function, Reflect};
 use matrix_rtc_call_sdk::{
-    AttachOptions, CallEngine, CallEvent, FrameEncryptionDiagnostic, MediaAttachment, Participant,
-    StabilityConfig, attach_media,
+    AttachOptions, CallEngine, CallEvent, ConnectionState, FrameEncryptionDiagnostic,
+    Interruptions, MediaAttachment, Participant, StabilityConfig, UnableToDecrypt, attach_media,
 };
 use matrix_rtc_core::compat::MembershipFormat;
+use matrix_rtc_core::{IdentitySubject, JoinedMembership, RtcIdentityMapper};
 use matrix_rtc_transport::keys::MediaKeyHandler;
-use matrix_rtc_transport::livekit::{TokenEndpoint, identity_mapper};
+use matrix_rtc_transport::livekit::identity_mapper;
 use matrix_rtc_transport::{FrameEncryptionState, TransportConnection as _};
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use wasm_bindgen::prelude::*;
 
 use super::transport::{JsFrameKeyRing, JsMediaTransport, JsTransportConnection, stream_kind_str};
 use crate::WasmRtcCall;
-use crate::status::WasmCallStatus;
+use crate::status::{WasmCallStatus, WasmSignallingHealth};
 use matrix_rtc_call::CallStatus;
 
 /// livekit-js's `ExternalE2EEKeyProvider` default `keyringSize`.
@@ -47,15 +48,19 @@ struct WasmMediaSessionConfig {
     #[serde(default)]
     key_ring_size: Option<u16>,
     /// Element Call compatibility generation this room was joined for:
-    /// `"current"` (default), `"sticky_2025"`, or `"room_state"`. Decides the
-    /// participant-identity derivation and the token endpoint, so it must
-    /// match the membership the page published.
+    /// `"msc"` (default) or `"room_state"`; must match the mode the room
+    /// was opened in. The participant identity and the token endpoint follow
+    /// the published transport, not this.
     #[serde(default)]
     format: Option<String>,
     /// How much the tile order is damped. Omitted takes the defaults; so does
     /// any field left out of the object.
     #[serde(default)]
     stability: Option<WasmStabilityConfig>,
+    /// How long our own SFU may stay unreachable before the call ends
+    /// (034 R24); omitted takes 60 000.
+    #[serde(default)]
+    own_reconnect_budget_ms: Option<u64>,
 }
 
 /// The tile-order damping a page can set (R10, R11). A product decision
@@ -74,6 +79,9 @@ struct WasmStabilityConfig {
     /// Reorders inside this window are delivered as one.
     #[serde(default = "default_coalesce_ms")]
     coalesce_ms: u64,
+    /// How long frames must fail to decrypt before `unable_to_decrypt` shows.
+    #[serde(default = "default_key_grace_ms")]
+    key_grace_ms: u64,
 }
 
 fn default_promote_ms() -> u64 {
@@ -88,12 +96,17 @@ fn default_coalesce_ms() -> u64 {
     StabilityConfig::default().coalesce.as_millis() as u64
 }
 
+fn default_key_grace_ms() -> u64 {
+    StabilityConfig::default().key_grace.as_millis() as u64
+}
+
 impl From<&WasmStabilityConfig> for StabilityConfig {
     fn from(c: &WasmStabilityConfig) -> Self {
         Self {
             promote: Duration::from_millis(c.promote_ms),
             demote: Duration::from_millis(c.demote_ms),
             coalesce: Duration::from_millis(c.coalesce_ms),
+            key_grace: Duration::from_millis(c.key_grace_ms),
         }
     }
 }
@@ -142,7 +155,7 @@ impl WasmRtcCall {
                 )));
             }
         }
-        if compat != MembershipFormat::Current {
+        if compat != MembershipFormat::Msc {
             log::info!(
                 "media: [{}/{}] connecting in Element Call compatibility mode {compat:?}",
                 self.inner().room_id(),
@@ -151,7 +164,7 @@ impl WasmRtcCall {
         }
         // One mapper for the core, the transport, our own identity and the
         // ring: they must not skew.
-        let mapper = identity_mapper(compat);
+        let mapper = identity_mapper();
         // Frame encryption: livekit-js owns the key provider; the shared
         // handler forwards every signalled key into it through the delegate.
         let ring = JsFrameKeyRing::new(
@@ -174,8 +187,8 @@ impl WasmRtcCall {
             delegate.clone(),
             backend.clone(),
             mapper.clone(),
-            TokenEndpoint::for_format(compat),
         ));
+        let memberships = self.inner().subscribe_memberships().await;
         let MediaAttachment {
             engine,
             own_connection,
@@ -189,12 +202,18 @@ impl WasmRtcCall {
                 own_user_id: backend.own_user_id(),
                 own_device_id: backend.own_device_id(),
                 identity_mapper: mapper.clone(),
-                format: compat,
                 stability: config
                     .stability
                     .as_ref()
                     .map(Into::into)
                     .unwrap_or_default(),
+                own_reconnect_budget: config.own_reconnect_budget_ms.map_or(
+                    matrix_rtc_transport::pool::OWN_RECONNECT_BUDGET,
+                    Duration::from_millis,
+                ),
+                // The page's livekit-js rooms cannot be handed between
+                // connections (034 R25).
+                sfu_fallback: false,
             },
         )
         .await
@@ -206,15 +225,20 @@ impl WasmRtcCall {
         // holds the object borrowed across its awaits, so a parked long-poll
         // would make every other session call throw ("recursive use of an
         // object"). The pumps borrow nothing from the session.
+        let identities = RosterIdentities {
+            mapper,
+            memberships,
+            own_identity: own_identity.clone(),
+        };
         if let Some(on_participants) = delegate_callback(&delegate, "onParticipants") {
             let mut participants_rx = engine.subscribe_participants();
-            let mapper = mapper.clone();
+            let identities = identities.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 while participants_rx.changed().await.is_ok() {
                     let roster: Vec<Participant> = participants_rx.borrow_and_update().clone();
                     let roster: Vec<WasmParticipant> = roster
                         .iter()
-                        .map(|participant| to_wasm_participant(&mapper, participant))
+                        .map(|participant| to_wasm_participant(&identities, participant))
                         .collect();
                     match serde_wasm_bindgen::to_value(&roster) {
                         Ok(roster) => {
@@ -250,6 +274,22 @@ impl WasmRtcCall {
             });
         }
 
+        if let Some(on_interruptions) = delegate_callback(&delegate, "onInterruptions") {
+            let mut interruptions = engine.subscribe_interruptions();
+            interruptions.mark_changed();
+            wasm_bindgen_futures::spawn_local(async move {
+                while interruptions.changed().await.is_ok() {
+                    let record = WasmInterruptions::from(interruptions.borrow_and_update().clone());
+                    match serde_wasm_bindgen::to_value(&record) {
+                        Ok(record) => {
+                            let _ = on_interruptions.call1(&JsValue::NULL, &record);
+                        }
+                        Err(error) => log::warn!("media: interruptions did not serialize: {error}"),
+                    }
+                }
+            });
+        }
+
         if let Some(on_status) = delegate_callback(&delegate, "onStatus") {
             let mut status = self.inner().subscribe_status();
             status.mark_changed();
@@ -274,7 +314,7 @@ impl WasmRtcCall {
             engine,
             own_connection,
             _handler: handler,
-            identity_mapper: mapper,
+            identities,
             own_identity,
         })
     }
@@ -307,8 +347,36 @@ pub struct WasmMediaSession {
     /// Keeps the key handler alive alongside the session for clarity; the
     /// core's encryption manager also holds it.
     _handler: Arc<MediaKeyHandler>,
-    identity_mapper: matrix_rtc_core::RtcIdentityMapper,
+    identities: RosterIdentities,
     own_identity: String,
+}
+
+/// What a roster entry's livekit-js identity derives from: the transport the
+/// member publishes on, which the roster does not carry, so it is looked up in
+/// the call's memberships.
+#[derive(Clone)]
+struct RosterIdentities {
+    mapper: RtcIdentityMapper,
+    memberships: watch::Receiver<Vec<JoinedMembership>>,
+    own_identity: String,
+}
+
+impl RosterIdentities {
+    fn identity(&self, participant: &Participant) -> Option<String> {
+        if participant.is_local {
+            return Some(self.own_identity.clone());
+        }
+        let memberships = self.memberships.borrow();
+        let membership = memberships
+            .iter()
+            .find(|membership| membership.member_id == participant.member_id)?;
+        (self.mapper)(&IdentitySubject {
+            user_id: &membership.sender,
+            device_id: membership.origin.sender_device_id(),
+            member_id: &membership.member_id,
+            transports: &membership.transports,
+        })
+    }
 }
 
 #[wasm_bindgen]
@@ -321,13 +389,21 @@ impl WasmMediaSession {
             .engine
             .participants()
             .iter()
-            .map(|participant| to_wasm_participant(&self.identity_mapper, participant))
+            .map(|participant| to_wasm_participant(&self.identities, participant))
             .collect();
         serde_wasm_bindgen::to_value(&roster).map_err(|err| JsError::new(&err.to_string()))
     }
 
-    /// Our own livekit-js participant identity (the MSC4195 pseudonymous
-    /// identity, or the legacy `{user}:{device}` in that compatibility mode).
+    /// What is interrupting the call now, cause by cause (034 R38).
+    #[wasm_bindgen(unchecked_return_type = "RtcInterruptions")]
+    pub fn interruptions(&self) -> Result<JsValue, JsError> {
+        serde_wasm_bindgen::to_value(&WasmInterruptions::from(self.engine.interruptions()))
+            .map_err(|err| JsError::new(&err.to_string()))
+    }
+
+    /// Our own livekit-js participant identity: the MSC4195 hash when we
+    /// publish on a transport naming only an SFU `url`, else the legacy
+    /// `{user}:{device}` the JWT service's `/sfu/get` mints.
     #[wasm_bindgen(js_name = ownRtcIdentity)]
     pub fn own_rtc_identity(&self) -> String {
         self.own_identity.clone()
@@ -348,21 +424,19 @@ impl WasmMediaSession {
 }
 
 fn to_wasm_participant(
-    mapper: &matrix_rtc_core::RtcIdentityMapper,
+    identities: &RosterIdentities,
     participant: &Participant,
 ) -> WasmParticipant {
-    // No attributable device, no identity — such a member also cannot be
-    // reached on the media plane (same rule as `remote_identity`).
-    let rtc_identity = participant
-        .device_id
-        .as_deref()
-        .map(|device_id| mapper(&participant.user_id, device_id, &participant.member_id));
+    // Derived as `remote_identity` derives it: `None` when the member cannot
+    // be reached on the media plane either.
+    let rtc_identity = identities.identity(participant);
     WasmParticipant {
         member_id: participant.member_id.clone(),
         user_id: participant.user_id.clone(),
         device_id: participant.device_id.clone(),
         is_local: participant.is_local,
-        reachable: participant.reachable,
+        connection: connection_str(participant.connection),
+        unable_to_decrypt: participant.unable_to_decrypt.map(unable_to_decrypt_str),
         rtc_identity,
         hand_raised_at_ms: participant.hand_raised_at_ms,
         hand_raised_position: participant.hand_raised_position,
@@ -374,6 +448,51 @@ fn to_wasm_participant(
                 muted: stream.muted,
             })
             .collect(),
+    }
+}
+
+/// `RtcConnectionState` in `ts_types`.
+fn connection_str(state: ConnectionState) -> &'static str {
+    match state {
+        ConnectionState::Connected => "connected",
+        ConnectionState::Connecting => "connecting",
+        ConnectionState::Reconnecting => "reconnecting",
+        ConnectionState::Unreachable => "unreachable",
+    }
+}
+
+/// `RtcUnableToDecrypt` in `ts_types`.
+fn unable_to_decrypt_str(reason: UnableToDecrypt) -> &'static str {
+    match reason {
+        UnableToDecrypt::MissingKey => "missing_key",
+        UnableToDecrypt::BadKey => "bad_key",
+        UnableToDecrypt::NotEncrypted => "not_encrypted",
+    }
+}
+
+/// `RtcInterruptions` in `ts_types`.
+#[derive(Serialize)]
+struct WasmInterruptions {
+    signalling: WasmSignallingHealth,
+    own_membership_lapsed: bool,
+    own_media: &'static str,
+    members_reconnecting: Vec<String>,
+    members_unreachable: Vec<String>,
+    unable_to_decrypt: Vec<String>,
+    unmappable: Vec<String>,
+}
+
+impl From<Interruptions> for WasmInterruptions {
+    fn from(record: Interruptions) -> Self {
+        Self {
+            signalling: record.signalling.into(),
+            own_membership_lapsed: record.own_membership_lapsed,
+            own_media: connection_str(record.own_media),
+            members_reconnecting: record.members_reconnecting,
+            members_unreachable: record.members_unreachable,
+            unable_to_decrypt: record.unable_to_decrypt,
+            unmappable: record.unmappable,
+        }
     }
 }
 
@@ -391,7 +510,8 @@ struct WasmParticipant {
     user_id: String,
     device_id: Option<String>,
     is_local: bool,
-    reachable: bool,
+    connection: &'static str,
+    unable_to_decrypt: Option<&'static str>,
     /// The livekit-js participant identity, when derivable — the join key for
     /// `room.getParticipantByIdentity()`.
     rtc_identity: Option<String>,
@@ -447,12 +567,12 @@ enum WasmCallEvent {
     HandLowered {
         member_id: String,
     },
-    /// Transient; `sound` is the asset base name to play, `None` for silence.
+    /// Transient; `sound` is the asset base name to play (`generic` when it has none of its own).
     Reaction {
         member_id: String,
         emoji: String,
         name: String,
-        sound: Option<String>,
+        sound: String,
     },
     /// `identity` is the transport identity the key installed under: keys
     /// held before media connects surface while `connectMedia` is still
@@ -474,7 +594,7 @@ enum WasmCallEvent {
         key_index: Option<u8>,
         sender_user_id: Option<String>,
         sender_device_id: Option<String>,
-        /// Machine-readable rejection: `cleartext | not_cross_signed |
+        /// Machine-readable rejection: `cleartext | sender_not_confirmed |
         /// room_mismatch | sender_mismatch | unverifiable_device |
         /// device_mismatch`.
         reason_code: &'static str,
@@ -510,7 +630,7 @@ fn rejection_code(rejection: &matrix_rtc_core::KeyRejection) -> &'static str {
     use matrix_rtc_core::KeyRejection;
     match rejection {
         KeyRejection::Cleartext => "cleartext",
-        KeyRejection::NotCrossSigned => "not_cross_signed",
+        KeyRejection::SenderNotConfirmed => "sender_not_confirmed",
         KeyRejection::RoomMismatch { .. } => "room_mismatch",
         KeyRejection::SenderMismatch { .. } => "sender_mismatch",
         KeyRejection::UnverifiableDevice => "unverifiable_device",
