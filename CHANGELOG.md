@@ -8,6 +8,13 @@ log only.
 
 ## Unreleased
 
+## v0.5.0-rc.5-letro.1 - 2026-11-05
+
+### Changed
+
+- Integrate the upstream RTC 0.5.0-rc.5 call lifecycle, including separate Direct and group entry behavior.
+- Preserve Letro's call intent, transport recovery and shutdown fixes with the updated native core.
+
 ## v0.5.0-rc.4-letro.3 - 2026-10-29
 
 ### Fixed
