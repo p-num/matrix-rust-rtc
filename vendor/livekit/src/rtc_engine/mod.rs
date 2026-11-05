@@ -30,6 +30,8 @@ use std::{
     time::Duration,
 };
 use thiserror::Error;
+#[cfg(all(test, feature = "__lk-e2e-test"))]
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::{
     mpsc, oneshot, Notify, RwLock as AsyncRwLock, RwLockReadGuard as AsyncRwLockReadGuard,
 };

@@ -11,10 +11,7 @@ use crate::{
     rtc_engine::{rtc_session::RtcSession, EngineError, EngineOptions},
 };
 use anyhow::{ensure, Context, Result};
-use libwebrtc::{
-    peer_connection_factory::{IceServer, RtcConfiguration},
-    RtcErrorType,
-};
+use libwebrtc::{peer_connection_factory::IceServer, RtcErrorType};
 use livekit_api::{
     access_token::{AccessToken, VideoGrants},
     services::room::{CreateRoomOptions, RoomClient},
@@ -79,14 +76,11 @@ async fn post_join_pc_constructor_error_closes_its_unowned_signal_client() -> Re
             // Dual-PC creation is strictly after successful SignalClient Join.
             // A nonempty list survives make_rtc_config_join's server merge.
             options.signal_options.single_peer_connection = false;
-            options.rtc_config = RtcConfiguration {
-                ice_servers: vec![IceServer {
-                    urls: vec!["invalid-ice-scheme:post-join-probe".to_owned()],
-                    username: String::new(),
-                    password: String::new(),
-                }],
-                ..Default::default()
-            };
+            options.rtc_config.ice_servers = vec![IceServer {
+                urls: vec!["invalid-ice-scheme:post-join-probe".to_owned()],
+                username: String::new(),
+                password: String::new(),
+            }];
             RtcSession::connect(&url, &attempt_token, options, None).await
         }));
         let pending = attempt.as_mut().context("PC-error probe was not started")?;
