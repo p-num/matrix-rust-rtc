@@ -245,6 +245,25 @@ Membership is always applied as a complete set: a member whose event is absent f
 - `BaseRtcClient` opens rooms (one live handle per room; a second is refused)
   and runs their feeds; `BaseRtcRoomHandle::seeded` resolves once the room's
   current state has been applied.
+- `outbox`: the one retry layer for every send the library makes on its own
+  initiative (034 R1). A send names its slot (scope + kind); a newer send of
+  the same slot supersedes it, never two attempts of one slot are in flight,
+  failures are classified on the host's error (`BackendError::is_permanent`:
+  a refusal is never retried), the rest retried on capped backoff (1 s to
+  30 s, or the server's retry-after), each attempt bounded at 30 s. One per
+  client, and with it the client's **health cell**: `SignallingHealth`
+  (reachable, or unreachable since a time), fed by those sends and the host's
+  `report_connectivity` (R9–R11). Its clock is every deadline's, so
+  `Outbox::with_clock` (through `RtcClient::with_outbox`) runs a call on
+  paused time.
+- Our membership through an outage (`own_membership`, `upkeep`): the lapse
+  predicted from our own deadlines while sends fail (R17), and on signalling's
+  return a probe of the delayed leave, a re-arm and one republish when it
+  fired, or the next complete membership set deciding when it did not (R19).
+  Receiving side: a member's `delayed_leave` is held 10 s before it counts
+  (R21), so a homeserver firing every delay at startup is not a mass
+  departure; a media key a member's device did not get is retried to that
+  member until it lands (R32).
 
 - A join names its slot, application and transport; who joins is the
   backend's account. Choosing the transport is the application's.
@@ -259,11 +278,9 @@ Membership is always applied as a complete set: a member whose event is absent f
   implementation available to test against — still speaks. They carry any
   application. Pure JSON translation: its unit tests need no homeserver.
   Scaffolding with a delete-by date, selected per room by `MembershipFormat`:
-  - **`Sticky2025`**, the 2025 format: already MSC4354 sticky-based, differing
-    only in the fields inside the member content. *Reading* it is permissive and
-    always on, `Current` included (it only fills in modern fields that are
-    absent, so spec-shaped events pass through untouched); *writing* it is
-    opt-in, being the half that changes what other clients see.
+  - The 2025 sticky format is only *read*: permissive and always on, `Msc`
+    included (it only fills in modern fields that are absent, so spec-shaped
+    events pass through untouched). We no longer write it.
   - **`RoomState`**, the format before MSC4354: membership as
     `org.matrix.msc3401.call.member` **room state**, a plain `{user}:{device}` SFU
     participant identity, and the pre-MSC4195 `/sfu/get` token endpoint. Opt-in in
@@ -331,8 +348,15 @@ Membership is always applied as a complete set: a member whose event is absent f
   the frame-encryption diagnostic.
 - The engine's actor drives the pool rather than running beside it, so a
   member's join reaches the roster before their media does. Only the *own*
-  focus — established synchronously by the caller so join can fail fast,
-  then handed over via `adopt_own_connection` — ends the call when it dies.
+  focus ends the call, and only once its reconnect budget is spent or it
+  refuses us (034 R24): `attach_media` hands the pool the own handle
+  unconnected (`connect_own`), so a join never waits for the SFU.
+- `Interruptions` (034 R38): every cause interrupting the call in its own
+  field — signalling, our membership's lapse, our own media, members
+  reconnecting or unreachable, those we cannot decrypt (missing key, bad
+  key, or a track sent in clear and refused) and unmappable identities —
+  published after the roster of the same change. Our publications are muted
+  at the transport while our membership has lapsed (R17).
 - `attach_media` attaches media to a joined `RtcCall`: the one copy of the
   order-sensitive wiring (identity mapper before key handler, key listeners
   before the replay of held keys, replay before the own-focus connect, our
@@ -389,12 +413,25 @@ Membership is always applied as a complete set: a member whose event is absent f
   transport identities to `member_id`s, buffers media and keys that arrive
   before their membership, and debounces per-stream `MediaConstraints`
   (re-applied whenever a stream (re)appears or its connection resumes).
+  Our own focus is reconnected behind the same handle
+  (`TransportConnection::reconnect`) on backoff for 60 s from the loss or
+  the first connect request, the token reused until rejected and refetched
+  once (034 R24); with `PoolConfig::sfu_fallback`, our own focus down 10 s
+  while signalling works and a peer connection is up hands our handle the
+  busiest peer focus's connection (`hand_over`/`take_over`, R25) — a second
+  connect with our identity would evict the pool's own. Tracks remember the
+  connection they came over, so a moved member's late removal is ignored.
+- `testing` (feature): `ScriptedTransport`, a transport whose connections a
+  test interrupts, closes, restores, refuses or makes reject a token — the
+  call SDK's scenario tests and the FFI's debug artifacts use it.
 - `livekit`: the pure half of the MSC4195 control plane, shared by the native
   transport and the web binding — `identity` (the hash derivations), `token`
-  (`/get_token` and legacy `/sfu/get` request builders and the response
-  decoder), `TokenEndpoint`, and `identity_mapper` (the per-generation identity
-  derivation, deliberately a Rust closure because `RtcIdentityMapper` is
-  `Send + Sync`). `matrix-rtc-livekit` re-exports its identity and token
+  (the legacy `/sfu/get` request builder and the response decoder),
+  `LiveKitTarget` (the token flow a transport's fields select, and the
+  connection key it groups by), and `identity_mapper` (the identity that flow
+  mints, deliberately a Rust closure because `RtcIdentityMapper` is
+  `Send + Sync`). The homeserver's MSC4195 `get_token` is the host's call,
+  `MatrixBackend::livekit_token`. `matrix-rtc-livekit` re-exports its identity and token
   endpoint pieces and adds the IO (reqwest, the LiveKit client).
 
 ## `crates/matrix-rtc-wasm`
@@ -461,6 +498,13 @@ Membership is always applied as a complete set: a member whose event is absent f
   runs on a dedicated multithreaded tokio runtime — the core's `?Send`
   futures never touch it. Android gets a `JNI_OnLoad` that initialises
   libwebrtc.
+- Behind the **`testing` feature** (debug artifacts only, 034 contract C16):
+  `ScriptedMatrixBackend` (a host trait implementation over the core's
+  `MockBackend`) and `ScriptedMediaTransport` with
+  `connect_scripted_media_session`, so a host's own tests can take the
+  homeserver or an SFU away, by hand or by fixture key. The behaviour hosts
+  build on is specified in feature-hq's
+  `plans/034.rust_rtc_transient_resilience/contract.md`, not restated here.
 
 ## `crates/matrix-rtc-livekit`
 
@@ -471,13 +515,15 @@ Membership is always applied as a complete set: a member whose event is absent f
   hash derivations (`identity`), drives a LiveKit `Room` (`session`), and bridges
   core media keys into LiveKit per-participant frame encryption (`keys`,
   `MediaKeyBridge` → `KeyProvider`, HKDF mode, GCM frames).
-- Obtains the Matrix OpenID token via the core's `MatrixBackend::openid_token`,
-  so the crate is not hard-wired to a particular Matrix SDK. `MemberClaims`
-  stays here: those are the `/get_token` request body's claims, which no
-  homeserver ever sees.
+- Obtains its tokens through the core's `MatrixBackend` — an OpenID token
+  (`openid_token`) for a JWT service's `/sfu/get`, the homeserver's MSC4195 JWT
+  (`livekit_token`) otherwise — so the crate is not hard-wired to a particular
+  Matrix SDK.
 - Implements `matrix-rtc-transport`'s traits in `transport_impl`
-  (`LiveKitMediaTransport`): connection key = `livekit_service_url`, remote
-  identity = MSC4195 pseudonymous identity, `RoomEvent` → `ConnectionEvent`
+  (`LiveKitMediaTransport`): connection key = the `LiveKitTarget` (token flow
+  and what it authenticates against), remote identity = what that flow mints
+  (`{user}:{device}` from `/sfu/get`, `hash([sender, member.id])` from the
+  homeserver), `RoomEvent` → `ConnectionEvent`
   translation, and `NativeAudioStream` → owned PCM frame streams behind
   `RemoteTrackHandle`.
 - Knows no call: no `matrix-rtc-call`, no call SDK, no Matrix SDK. The token
@@ -537,8 +583,9 @@ stored and signalled once it has been matched against the sender's member event:
   keys), so that half is a backstop rather than an expected path. The exception
   is `EventOrigin::Unknown`, where the host reported nothing at all and the rule
   is skipped like every other unreported fact.
-- Keys from devices that are not cross-signed are discarded unless
-  `EncryptionConfig::require_cross_signed_sender` is turned off (MSC4153).
+- Keys from senders the client does not confirm (under MSC4153, a device that
+  is not cross-signed) are discarded unless
+  `EncryptionConfig::require_confirmed_sender` is turned off.
 - A key that arrives before its member event is buffered *with its origin* and
   checked when the membership shows up — verification is deferred, never
   skipped. Rejected keys never reach the outdated-key filter, so a bogus key
@@ -735,7 +782,7 @@ type makes that unrepresentable. `EventOrigin::Unknown` is distinct from
 `Cleartext`: it means the host did not report, so the rule is skipped rather
 than failed. A host never builds an `EventOrigin`: it reports what its client
 can honestly say — `EventEncryption::{Cleartext, Encrypted { sender_device_id,
-sender_cross_signed }}` on each `EventIn` — and the feeder derives the origin
+sender_confirmed }}` on each `EventIn` — and the feeder derives the origin
 (and, for keys, `KeyOrigin`) from it.
 
 ### Transports and who chooses them

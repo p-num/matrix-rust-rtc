@@ -32,7 +32,7 @@ struct Harness {
 
 impl Harness {
     async fn attach() -> Self {
-        Self::attach_in(Arc::new(MembershipFormat::Current)).await
+        Self::attach_in(Arc::new(MembershipFormat::Msc)).await
     }
 
     async fn attach_in(dialect: Arc<dyn IngestDialect>) -> Self {
@@ -143,7 +143,7 @@ impl IngestDialect for StateDialect {
                 ..event
             })
             .collect();
-        MembershipFormat::Current.current_membership(room_id, sticky, Vec::new())
+        MembershipFormat::Msc.current_membership(room_id, sticky, Vec::new())
     }
 
     fn parse_key(&self, message: &ToDeviceMessageIn) -> Option<ReceivedEncryptionKey> {
@@ -250,6 +250,34 @@ async fn an_empty_sticky_set_clears_the_session() {
     harness
         .wait_until(|| async { harness.member_count().await == Some(0) })
         .await;
+}
+
+/// 034 R21: a held delayed leave ends on the feeder's own timer, with no
+/// further delivery.
+#[tokio::test(start_paused = true)]
+async fn a_delayed_leave_hold_ends_on_the_feeders_timer() {
+    let harness = Harness::attach().await;
+    harness.seed_room_state();
+    harness
+        .sink()
+        .on_sticky_events(vec![member_event(BOB, "bob-1", "$m1")]);
+    harness.attachment.seeded().await;
+    harness
+        .wait_until(|| async { harness.member_count().await == Some(1) })
+        .await;
+
+    let mut fired = member_event(BOB, "bob-1", "$m2");
+    fired.content = json!({
+        "slot_id": SLOT,
+        "msc4354_sticky_key": "bob-1",
+        "member": { "id": "bob-1", "membership": "leave" },
+        "leave_reason": { "code": "delayed_leave" },
+    });
+    harness.sink().on_sticky_events(vec![fired]);
+    tokio::time::sleep(Duration::from_millis(9_900)).await;
+    assert_eq!(harness.member_count().await, Some(1), "held");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(harness.member_count().await, Some(0), "gone at 10 s");
 }
 
 #[tokio::test]
@@ -397,12 +425,12 @@ async fn the_to_device_feeder_subscribes_to_the_spec_and_extra_key_types() {
 }
 
 #[test]
-fn key_origin_treats_an_unreported_cross_signing_as_not_cross_signed() {
+fn key_origin_treats_an_unreported_confirmation_as_unconfirmed() {
     let origin = key_origin(&EventEncryption::encrypted(Some("D".to_owned()), None), BOB);
     assert!(matches!(
         origin,
         KeyOrigin::Encrypted {
-            sender_is_cross_signed: false,
+            sender_is_confirmed: false,
             ..
         }
     ));
@@ -442,7 +470,7 @@ async fn a_stalled_seeding_names_the_deliveries_it_waits_on() {
     let mock = Arc::new(MockBackend::new());
     let manager = Arc::new(Mutex::new(BaseRtcRoom::with_backend(ROOM, mock.clone())));
     let (_attachment, mut run) =
-        RoomFeeder::attach(mock.clone(), manager, Arc::new(MembershipFormat::Current))
+        RoomFeeder::attach(mock.clone(), manager, Arc::new(MembershipFormat::Msc))
             .await
             .expect("attach");
     assert_eq!(run.missing_subjects().len(), 4);
@@ -485,13 +513,10 @@ async fn an_application_gets_its_sticky_types_before_the_set_is_narrowed() {
         rtc: BaseRtcRoom::with_backend(ROOM, mock.clone()),
         received: Vec::new(),
     }));
-    let (attachment, run) = RoomFeeder::attach(
-        mock.clone(),
-        app.clone(),
-        Arc::new(MembershipFormat::Current),
-    )
-    .await
-    .expect("attach");
+    let (attachment, run) =
+        RoomFeeder::attach(mock.clone(), app.clone(), Arc::new(MembershipFormat::Msc))
+            .await
+            .expect("attach");
     tokio::spawn(run.run());
     let sink = mock.room_subscription(ROOM).unwrap().sink.clone();
     sink.on_encryption(false);

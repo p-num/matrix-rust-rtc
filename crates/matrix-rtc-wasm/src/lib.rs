@@ -73,6 +73,49 @@ impl WasmRtcClient {
         }
     }
 
+    /// Whether the homeserver is answering the library's sends (034 R9), as
+    /// `RtcSignallingHealth`.
+    #[wasm_bindgen(getter, js_name = signallingHealth, unchecked_return_type = "RtcSignallingHealth")]
+    pub fn signalling_health(&self) -> Result<JsValue, JsError> {
+        signalling_health_value(self.client.signalling_health())
+    }
+
+    /// Calls `callback` with the signalling health now, then on each change,
+    /// for as long as the client lives. Live before any call or media exists.
+    #[wasm_bindgen(js_name = onSignallingHealth)]
+    pub fn on_signalling_health(
+        &self,
+        #[wasm_bindgen(unchecked_param_type = "(health: RtcSignallingHealth) => void")]
+        callback: js_sys::Function,
+    ) {
+        let mut health = self.client.subscribe_signalling_health();
+        health.mark_changed();
+        matrix_rtc_core::executor::spawn(async move {
+            while health.changed().await.is_ok() {
+                let value = *health.borrow_and_update();
+                match signalling_health_value(value) {
+                    Ok(value) => {
+                        if let Err(error) = callback.call1(&JsValue::NULL, &value) {
+                            log::warn!("client: onSignallingHealth callback threw: {error:?}");
+                        }
+                    }
+                    Err(error) => {
+                        log::warn!("client: signalling health not serialisable: {error:?}")
+                    }
+                }
+            }
+        });
+    }
+
+    /// Reports the page's Matrix client offline, or online once a request to
+    /// the homeserver has succeeded since it was offline — never on sync
+    /// merely starting (034 R11). Online retries every pending send at once.
+    /// Optional: without it the library goes by its own sends.
+    #[wasm_bindgen(js_name = reportConnectivity)]
+    pub fn report_connectivity(&self, online: bool) {
+        self.client.report_connectivity(online);
+    }
+
     /// Opens a room: the library subscribes to what the room needs in the
     /// given mode and applies its current state. Resolves once that state is
     /// applied, so a `joinCall` issued afterwards sees it.
@@ -81,7 +124,7 @@ impl WasmRtcClient {
     /// returned room ends its subscriptions without leaving; `close` leaves
     /// first.
     ///
-    /// `options` is `{ format?: "current" | "sticky_2025" | "room_state" }`.
+    /// `options` is `{ format?: "msc" | "room_state" }`.
     pub async fn room(
         &self,
         room_id: String,
@@ -107,6 +150,10 @@ impl WasmRtcClient {
             room: RwLock::new(Some(room)),
         })
     }
+}
+
+fn signalling_health_value(health: matrix_rtc_call::SignallingHealth) -> Result<JsValue, JsError> {
+    serde_wasm_bindgen::to_value(&status::WasmSignallingHealth::from(health)).map_err(js_error)
 }
 
 #[wasm_bindgen]
@@ -152,8 +199,8 @@ impl WasmRtcRoom {
     ///     omitted is the room-wide call, `room`
     ///   - `transport`: `{ kind: "advertised" }` (the default when omitted)
     ///     publishes on the first LiveKit transport the homeserver advertises
-    ///     (the host's `rtcTransports`); `{ kind: "publish",
-    ///     livekit_service_url }` publishes on that focus; `{ kind:
+    ///     (the host's `rtcTransports`); `{ kind: "publish", url?,
+    ///     livekit_service_url? }` publishes on that transport; `{ kind:
     ///     "receive_only" }` publishes nothing
     ///   - `keep_alive_timeout_ms` (default 30000), `sticky_duration_ms`
     ///     (default 3600000), `degraded_lifetime_ms` (default 300000; not below)
@@ -344,7 +391,8 @@ impl WasmRtcCall {
 
     /// Sends an Element Call emoji reaction. `name` is what peers pick a sound
     /// by (see [`reaction_catalog`]); only the first grapheme of `emoji` is
-    /// sent. Resolves to the event id; rejects inside the send cooldown.
+    /// sent. Resolves to the event id; rejects inside the send cooldown, and
+    /// with "not sent" when it has not landed within 5 s (034 R4).
     #[wasm_bindgen(js_name = sendReaction)]
     pub async fn send_reaction(&self, emoji: String, name: String) -> Result<String, JsError> {
         self.call
@@ -353,13 +401,15 @@ impl WasmRtcCall {
             .map_err(js_error)
     }
 
-    /// Raises our hand. Idempotent while it is up.
+    /// Raises our hand: shown at once, resolving once it has landed, a lower
+    /// superseded it or the call ended; rejects only on a permanent refusal,
+    /// the hand back where it was (034 R5). Idempotent while it is up.
     #[wasm_bindgen(js_name = raiseHand)]
     pub async fn raise_hand(&self) -> Result<(), JsError> {
         self.call.raise_hand().await.map_err(js_error)
     }
 
-    /// Lowers our hand. A no-op when it is down.
+    /// Lowers our hand, as `raiseHand` raises it. A no-op when it is down.
     #[wasm_bindgen(js_name = lowerHand)]
     pub async fn lower_hand(&self) -> Result<(), JsError> {
         self.call.lower_hand().await.map_err(js_error)
@@ -379,8 +429,10 @@ impl WasmRtcCall {
         serde_wasm_bindgen::to_value(&self.call.raised_hands().await).map_err(js_error)
     }
 
-    /// Leaves the slot; the call is over and its media stopped at once, even
-    /// when the send fails — the delayed leave then removes the membership.
+    /// Leaves the slot; the call is over and its media stopped at once, and
+    /// this resolves without waiting for the leave to be sent (034 R8). The
+    /// send is one attempt; if it fails, the delayed leave removes the
+    /// membership. Rejects only when the call was already over.
     ///
     /// `params` is `{ leave_reason?: { code, reason? } }` — e.g.
     /// `{ code: "leave" }` for an intentional hang-up. Defaults to that.
@@ -411,10 +463,10 @@ impl WasmRtcCall {
 /// How a room is opened.
 #[derive(Debug, Default, Deserialize)]
 pub struct WasmRoomOptions {
-    /// `"current"` (the default), `"sticky_2025"` or `"room_state"`. One
-    /// decision for the room: what the library subscribes to, how it renders
-    /// our sends, the `member.id` we join with, how an inbound media key is
-    /// bound, the SFU identity and the token endpoint.
+    /// `"msc"` (the default) or `"room_state"`. One decision for the room:
+    /// what the library subscribes to, how it renders our sends, the
+    /// `member.id` we join with and how an inbound media key is bound. The SFU
+    /// identity and the token endpoint follow the transport instead.
     #[serde(default)]
     pub format: Option<String>,
 }
@@ -435,27 +487,26 @@ pub fn reaction_catalog() -> Result<JsValue, JsError> {
     struct Kind {
         name: &'static str,
         emoji: &'static str,
-        sound: Option<&'static str>,
+        sound: String,
     }
     let catalogue: Vec<Kind> = matrix_rtc_call::KNOWN_REACTIONS
         .iter()
         .map(|kind| Kind {
             name: kind.name,
             emoji: kind.emoji,
-            sound: kind.sound,
+            sound: matrix_rtc_call::sound_for(kind.name)
+                .asset_name()
+                .to_owned(),
         })
         .collect();
     serde_wasm_bindgen::to_value(&catalogue).map_err(|err| JsError::new(&err.to_string()))
 }
 
 /// The sound asset to play for a reaction `name`: a catalogue entry's sound,
-/// `"generic"` for a name outside the catalogue, or `undefined` for a silent
-/// one.
+/// or `"generic"` for any other name.
 #[wasm_bindgen(js_name = reactionSoundFor)]
-pub fn reaction_sound_for(name: String) -> Option<String> {
-    matrix_rtc_call::sound_for(&name)
-        .asset_name()
-        .map(str::to_owned)
+pub fn reaction_sound_for(name: String) -> String {
+    matrix_rtc_call::sound_for(&name).asset_name().to_owned()
 }
 
 /// WASM-friendly join session parameters.
@@ -586,11 +637,11 @@ pub struct WasmEncryptionConfig {
     pub max_key_lifetime_ms: Option<u64>,
     #[serde(default)]
     pub manage_media_keys: Option<bool>,
-    /// Whether to discard keys from devices that are not cross-signed
+    /// Whether to discard keys from senders the client does not confirm
     /// (default: true, per MSC4153). Turn it off only where the client cannot
     /// report cross-signing at all.
     #[serde(default)]
-    pub require_cross_signed_sender: Option<bool>,
+    pub require_confirmed_sender: Option<bool>,
 }
 
 impl From<WasmEncryptionConfig> for EncryptionConfig {
@@ -600,7 +651,7 @@ impl From<WasmEncryptionConfig> for EncryptionConfig {
             key_rotation_grace_period_ms: value.key_rotation_grace_period_ms.unwrap_or(10000),
             max_key_lifetime_ms: value.max_key_lifetime_ms.unwrap_or(90 * 60 * 1000),
             manage_media_keys: value.manage_media_keys.unwrap_or(true),
-            require_cross_signed_sender: value.require_cross_signed_sender.unwrap_or(true),
+            require_confirmed_sender: value.require_confirmed_sender.unwrap_or(true),
         }
     }
 }
@@ -635,8 +686,11 @@ pub enum WasmJoinTransport {
     /// Publish on the first LiveKit transport the homeserver advertises.
     #[default]
     Advertised,
-    /// Publish on this LiveKit focus, whatever the homeserver advertises.
-    Publish { livekit_service_url: String },
+    /// Publish on this LiveKit transport, whatever the homeserver advertises:
+    /// `{ url?, livekit_service_url? }`, at least one. An SFU `url` alone gets
+    /// its tokens from the homeserver; a `livekit_service_url` from that JWT
+    /// service.
+    Publish(matrix_rtc_core::LiveKitTransport),
     /// Publish nothing and only receive, as a recorder or other observer does.
     ReceiveOnly,
 }
@@ -645,11 +699,7 @@ impl From<WasmJoinTransport> for JoinTransport {
     fn from(value: WasmJoinTransport) -> Self {
         match value {
             WasmJoinTransport::Advertised => Self::Advertised,
-            WasmJoinTransport::Publish {
-                livekit_service_url,
-            } => Self::Publish(matrix_rtc_core::LiveKitTransport {
-                livekit_service_url,
-            }),
+            WasmJoinTransport::Publish(transport) => Self::Publish(transport),
             WasmJoinTransport::ReceiveOnly => Self::ReceiveOnly,
         }
     }
@@ -720,8 +770,15 @@ mod tests {
             ),
         );
         set(
-            "sendDelayedEvent",
+            "sendDelayedStateEvent",
             "roomId,eventType,stateKey,content,delayMs",
+            "if (JSON.stringify(content) === '{}') \
+                 return Promise.reject(new Error('content is not a plain object')); \
+             return Promise.resolve('delay-id');",
+        );
+        set(
+            "sendDelayedStickyEvent",
+            "roomId,eventType,content,stickyDurationMs,delayMs",
             "if (JSON.stringify(content) === '{}') \
                  return Promise.reject(new Error('content is not a plain object')); \
              return Promise.resolve('delay-id');",
@@ -868,44 +925,6 @@ mod tests {
                 .await
                 .is_err()
         );
-    }
-
-    /// The sticky dialect's outbound rewrite, through the real send path: a
-    /// join in a `sticky_2025` room must put the EC-2025 mirror fields on
-    /// the wire, or that generation cannot see us.
-    #[wasm_bindgen_test]
-    async fn a_sticky_compat_join_mirrors_the_legacy_fields() {
-        #[derive(Serialize)]
-        struct TestTransport {
-            kind: &'static str,
-            livekit_service_url: &'static str,
-        }
-        #[derive(Serialize)]
-        struct TestJoinParams {
-            application_slot_id: &'static str,
-            transport: TestTransport,
-        }
-
-        let client = WasmRtcClient::new(mock_host(
-            "if (!Array.isArray(content.rtc_transports) \
-                 || !Array.isArray(content.versions) \
-                 || !content.member || content.member.user_id === undefined \
-                 || content.member.device_id === undefined) \
-                 return Promise.reject(new Error('legacy mirror fields missing: ' + JSON.stringify(content)));",
-        ));
-        let room = open(&client, Some("sticky_2025")).await;
-        let params = serde_wasm_bindgen::to_value(&TestJoinParams {
-            application_slot_id: "room",
-            transport: TestTransport {
-                kind: "publish",
-                livekit_service_url: "https://sfu.example.org/livekit/jwt",
-            },
-        })
-        .unwrap();
-
-        room.join_call(params)
-            .await
-            .expect("the rewritten membership should satisfy the strict mock");
     }
 
     #[wasm_bindgen_test]

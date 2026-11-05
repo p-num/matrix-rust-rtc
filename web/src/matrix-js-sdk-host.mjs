@@ -18,7 +18,7 @@ Please see LICENSE in the repository root for full details.
  *   every change, plus timeline events and redactions as they arrive;
  *   `subscribeToDevice` delivers decrypted to-device messages with their Olm
  *   decryption metadata and MSC4153 cross-signing status; `relations`,
- *   `getOpenIdToken` and `rtcTransports` answer on request.
+ *   `getOpenIdToken`, `getLivekitToken` and `rtcTransports` answer on request.
  * The library parses every MatrixRTC content and applies the compatibility
  * dialects itself; this file hands events over verbatim.
  * `matrix-js-sdk` is not imported here: like `MatrixRtcCall`'s livekit-client,
@@ -152,20 +152,26 @@ export class MatrixHost {
     return this.client.sendStateEvent(roomId, eventType, content, stateKey);
   }
 
-  /** A delayed STATE event when `stateKey` is set (the pre-sticky dialect's leave). */
-  async sendDelayedEvent(roomId, eventType, stateKey, content, delayMs) {
-    const response =
-      stateKey === null || stateKey === undefined
-        ? await this.client._unstable_sendDelayedEvent(roomId, { delay: delayMs }, null, eventType, content)
-        : await this.client._unstable_sendDelayedStateEvent(
-            roomId,
-            { delay: delayMs },
-            eventType,
-            content,
-            stateKey,
-          );
+  /** The pre-sticky dialect's leave. */
+  async sendDelayedStateEvent(roomId, eventType, stateKey, content, delayMs) {
+    const response = await this.client._unstable_sendDelayedStateEvent(
+      roomId,
+      { delay: delayMs },
+      eventType,
+      content,
+      stateKey,
+    );
     // The library expects the bare MSC4140 delay id.
     return response.delay_id;
+  }
+
+  /**
+   * Not wired to matrix-js-sdk yet: a plain delayed event would fire without ending the
+   * sticky membership, so this says it cannot, and the library joins without a dead man's
+   * switch, on a shorter membership lifetime.
+   */
+  sendDelayedStickyEvent() {
+    return Promise.reject(Object.assign(new Error('no delayed sticky events'), { errcode: 'M_UNRECOGNIZED' }));
   }
 
   restartDelayedEvent(_roomId, delayId) {
@@ -387,21 +393,46 @@ export class MatrixHost {
     return this.client.getOpenIdToken();
   }
 
-  /** `GET /_matrix/client/v1/rtc/transports`; `[]` where the homeserver lacks it. */
+  /**
+   * The homeserver's MSC4195 LiveKit token, `{ jwt }`, from its `get_token`
+   * under the unstable prefix homeservers serve so far.
+   */
+  getLivekitToken(request) {
+    return this.client.http.authedRequest(
+      this.sdk.Method.Post,
+      '/rtc/livekit/get_token',
+      undefined,
+      request,
+      { prefix: '/_matrix/client/unstable/io.element.msc4195' },
+    );
+  }
+
+  /**
+   * The homeserver's transports, entries as served: `GET
+   * /_matrix/client/v1/rtc/transports` (`transports`), else the unstable
+   * endpoint (`rtc_transports`); `[]` where it serves neither.
+   */
   async rtcTransports() {
-    try {
-      const response = await this.client.http.authedRequest(
-        this.sdk.Method.Get,
-        '/rtc/transports',
-        undefined,
-        undefined,
-        { prefix: '/_matrix/client/v1' },
-      );
-      return response?.rtc_transports ?? [];
-    } catch (error) {
-      if (error?.httpStatus === 404) return [];
-      throw error;
+    const endpoints = [
+      { prefix: '/_matrix/client/v1', field: 'transports' },
+      { prefix: '/_matrix/client/unstable/org.matrix.msc4143', field: 'rtc_transports' },
+    ];
+    for (const { prefix, field } of endpoints) {
+      try {
+        const response = await this.client.http.authedRequest(
+          this.sdk.Method.Get,
+          '/rtc/transports',
+          undefined,
+          undefined,
+          { prefix },
+        );
+        return response?.[field] ?? [];
+      } catch (error) {
+        if (error?.httpStatus === 404 || error?.errcode === 'M_UNRECOGNIZED') continue;
+        throw error;
+      }
     }
+    return [];
   }
 
   // --- shapes ------------------------------------------------------------
@@ -443,17 +474,17 @@ export class MatrixHost {
   /** Olm metadata plus MSC4153: the key is only accepted from a cross-signed device. */
   async toDeviceEncryption(encryptionInfo) {
     if (!encryptionInfo) return { kind: 'cleartext' };
-    let senderCrossSigned;
+    let senderConfirmed;
     if (encryptionInfo.sender && encryptionInfo.senderDevice) {
       const status = await this.client
         .getCrypto()
         .getDeviceVerificationStatus(encryptionInfo.sender, encryptionInfo.senderDevice);
-      senderCrossSigned = status?.signedByOwner ?? false;
+      senderConfirmed = status?.signedByOwner ?? false;
     }
     return {
       kind: 'encrypted',
       sender_device_id: encryptionInfo.senderDevice,
-      sender_cross_signed: senderCrossSigned,
+      sender_confirmed: senderConfirmed,
     };
   }
 

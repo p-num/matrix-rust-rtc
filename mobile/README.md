@@ -86,13 +86,54 @@ room.shutdown()                                    // leaves what is still joine
 ## When the call ends
 
 Every ending takes one path: `call.leave()`, the slot closing mid-call (the
-library sends your leave with `leave_reason.code = "slot_closed"` on its own) or
-`room.close()`. The call is over (`isLive()` is false) as soon as `leave()` is
-called, even if the leave then fails to send, and a `MediaSession`
-ends itself — `Ended(Left)` or `Ended(SlotClosed)`, every SFU connection closed —
-so there is no separate `disconnect()` to call. Stop camera and microphone
-capture on that `Ended`. A host running its own media waits on
+library sends your leave with `leave_reason.code = "slot_closed"` on its own),
+our own SFU given up (below), or `room.close()`. `leave()` returns at once: the
+call is over (`isLive()` is false) and media has stopped when it returns, and
+the leave is then sent in the background, once — it fails only with
+`CallOver`, never on a failed send. A `MediaSession` ends itself — `Ended(Left)`,
+`Ended(SlotClosed)` or `Ended(ConnectionClosed { reason })`, every SFU
+connection closed — so there is no separate `disconnect()` to call. Stop camera
+and microphone capture on that `Ended`. A host running its own media waits on
 `call.waitForEnd()` and tears it down there.
+
+## When the network is not there
+
+Calls survive the homeserver going away and SFUs dropping; what the host does
+is small, and specified in feature-hq's
+`plans/034.rust_rtc_transient_resilience/contract.md` (the source of truth;
+this is the summary).
+
+- **One attempt, an answer within 30 s.** Every `MatrixBackend` send is one
+  attempt whose outcome you report within 30 s; the library retries. With
+  matrix-sdk, configure the request as two attempts of 10 s
+  (`RequestConfig(timeout = 10 s, retryLimit = 2)`): the SDK's own retry reuses
+  the transaction id, so it cannot duplicate an event. Report the Matrix
+  `errcode`, status and `retry_after_ms` on `FfiBackendError`; set `permanent`
+  only for a failure your client knows is final.
+- **`client.reportConnectivity(online)`** is optional and makes recovery
+  immediate: `false` when your client goes offline, `true` only once a request
+  has succeeded after that — never merely because sync started.
+- **What to show.** `client.signallingHealth()` (live before any call exists)
+  is the server indicator; `media.interruptions()` / `nextInterruptions()` is
+  every cause interrupting the call, one field each. Tiles carry `connection`
+  (`Connected`, `Connecting`, `Reconnecting`, `Unreachable`) and
+  `unableToDecrypt` (`MissingKey`, `BadKey`, `NotEncrypted`, or nil).
+- **Our own SFU** is reconnected for 60 s (`ownReconnectBudgetMs`) before the
+  call ends with `ConnectionClosed { Budget | Refused | NeverConnected }`,
+  after its leave; `connectMediaSession` returns without waiting for it. With
+  `sfuFallback` (off by default; only where the other member's SFU accepts
+  your homeserver's accounts) your media moves to another member's SFU after
+  10 s, same member id.
+- **Keep the objects alive** across background, minimise and rotation:
+  dropping the client, room, call or media session is leaving without a leave.
+
+**Testing.** Debug builds of the media artifact (`--profile dev` with
+`MEDIA=1`) carry `ScriptedMatrixBackend`, `ScriptedMediaTransport` and
+`connectScriptedMediaSession`: hand the backend to `RtcClient` and connect
+media through the transport, then take either side away by hand
+(`setOutage`, `script`, `interrupt`, `close`, `restore`, `refuse`,
+`rejectToken`) or by fixture key (`play("outage.homeserver.30s")`,
+`play("outage.own_sfu.fallback")`, …).
 
 ## Turn on logging first
 
@@ -152,7 +193,7 @@ stops it — **there is nothing to call.**
 | Clock | Default | Kept alive by |
 | --- | --- | --- |
 | Delayed leave (dead man's switch) | 30 s | Restarting its timer every 10 s |
-| Sticky-map entry for your membership | 1 h | Re-sending the membership once it is halfway to expiry |
+| Sticky-map entry for your membership | 1 h | Re-sending the membership once a third of it has passed |
 
 Both are configurable per join via `keepAliveTimeoutMs` and `stickyDurationMs`.
 Shortening `stickyDurationMs` buys nothing but extra traffic — the refresh
@@ -239,19 +280,18 @@ when (val event = session.nextEvent()) {
 ## Testing against Element Call
 
 Element Call is the only other MatrixRTC implementation there is to test against,
-and it still speaks a pre-2026 wire format — two of them, in fact, which disagree
-about where a membership lives rather than merely what it says. Pass
-`format` when you open the room to speak one of them:
+and its pre-sticky generation still speaks a pre-2026 wire format. Pass `format`
+when you open the room to speak it:
 
 | Mode | Element Call generation | Membership lives in |
 | --- | --- | --- |
-| `null` / `CURRENT` | none — current MSC4143 + MSC4354 | sticky events |
-| `STICKY2025` | 2025 | sticky events, legacy fields alongside the spec ones |
+| `null` / `MSC` | none — current MSC4143 + MSC4354 | sticky events |
 | `ROOM_STATE` | before MSC4354 | `org.matrix.msc3401.call.member` room state |
 
 It is one decision, not a wire-format flag: it also fixes the `member.id` you
-join with, how an inbound media key is bound to a membership, your SFU
-participant identity, and which token endpoint mints your JWT. Choose it once,
+join with and how an inbound media key is bound to a membership. Your SFU
+participant identity and the token endpoint follow the transport you publish
+on instead (see below). Choose it once,
 when opening the room — the join and the media session read it back from
 there. Getting a mode wrong
 produces no error: the call connects, the roster may even fill in, and nothing
@@ -273,8 +313,11 @@ val room = client.room(roomId, FfiRoomOptions(
   messages through the same to-device subscription. Do set `originServerTs` on
   every event: it is the deadline base for a membership that states no
   `created_ts`, and `0` reads as long expired.
-- **In `ROOM_STATE` only:** honour the `stateKey` of `sendDelayedEvent` — the
-  dead man's switch has to be a state event too.
+- **Delayed leaves:** `sendDelayedStateEvent` is the `ROOM_STATE` dead man's
+  switch, `sendDelayedStickyEvent` the sticky format's. The Rust SDK bindings
+  cannot send a delayed sticky event yet (matrix-rust-sdk#6973): answer
+  `M_UNRECOGNIZED`, never a plain delayed event, and the call joins on a
+  shorter membership lifetime.
 
 Slots need nothing from you. Both generations of Element Call publish no
 `m.rtc.slot`, so the truthful "no slots" your backend reports would resolve the
@@ -283,21 +326,36 @@ absorbs that: it does not subscribe to slot state for the room at all, leaving
 the condition unenforced — that generation predates the concept entirely, so
 "unknowable" is the honest answer rather than "closed".
 
-In `STICKY2025` the condition stays enforced, because those rooms are
-otherwise spec-shaped and a slot in one is meaningful. Someone has to open the
-slot — otherwise the room reads as all-closed, and `join` refuses with
-`SlotClosed`. Element Call will not, so open it yourself (it needs the power
-level for `m.rtc.slot` state; the room creator by default, or set it in the
-room's initial state):
+In `MSC` the condition stays enforced. Someone has to open the slot —
+otherwise the room reads as all-closed, and `join` refuses with `SlotClosed`.
+Open it yourself if nobody else does (it needs the power level for `m.rtc.slot`
+state; the room creator by default, or set it in the room's initial state):
 
 ```kotlin
 room.openSlot("m.call#room", "m.call", FfiSlotEncryption.PerMember)
 ```
 
 `encryption` must be `PerMember` in an encrypted room and `null` elsewhere — the
-mismatch resolves the slot closed for everyone. It needs the power level for
-`m.rtc.slot` state (by default the room creator), and `closeSlot(slotId)`
-ends the call for every member, which is not the same as leaving it.
+mismatch resolves the slot closed for everyone. `closeSlot(slotId)` ends the
+call for every member, which is not the same as leaving it.
+
+### LiveKit tokens follow the transport
+
+A LiveKit transport names the legacy JWT service (`livekit_service_url`), the
+SFU (`url`), or both. With a `livekit_service_url` every token, to publish or to
+subscribe, comes from that service's `/sfu/get` with an OpenID token (your
+`openidToken`), and the SFU identity is `{user}:{device}`. With only a `url`,
+tokens come from the homeserver's MSC4195 `get_token`, which the library asks
+your backend's `livekitToken` for: `POST` the `FfiLiveKitTokenRequest` as the
+JSON body to `/_matrix/client/unstable/io.element.msc4195/rtc/livekit/get_token`
+and return the answer's `jwt`; the identity is then a hash of your user id and
+`member.id`. Until your Matrix SDK can make that request, fail with
+`M_UNRECOGNIZED` / 404: `url`-only transports then cannot be joined or
+subscribed to, while transports with a `livekit_service_url` keep working.
+
+`rtcTransports` must return the transports exactly as the homeserver serves
+them, `url` included. A client SDK whose typed discovery keeps only
+`livekit_service_url` (matrix-rust-sdk's does today) loses it.
 
 Two traps that cost whole debugging sessions on the native path, and are not
 specific to it:

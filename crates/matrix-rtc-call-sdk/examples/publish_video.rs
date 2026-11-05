@@ -63,10 +63,11 @@ async fn run_call(
         &call,
         room.backend().clone(),
         LiveKitAttachOptions {
-            format: Default::default(), // must match RoomOptions::format
             http: None,
             auto_subscribe: true,
             stability: Default::default(),
+            own_reconnect_budget: None,
+            sfu_fallback: false,
         },
     )
     .await?

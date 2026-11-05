@@ -46,7 +46,7 @@
 //! | Variable | Default |
 //! | -------- | ------- |
 //! | `HOMESERVER_URL` | `https://synapse.m.localhost` |
-//! | `ELEMENT_CALL_COMPAT` | `state` (also: `sticky`, `current`) |
+//! | `ELEMENT_CALL_COMPAT` | `state` (also: `msc`) |
 //! | `INVITE_USER` | *required* — the Matrix ID Element Call will log in as |
 //! | `DISPLAY_NAME` | `Rust Peer` — what the browser asserts it can see |
 //! | `ROOM_NAME` | `Interop LiveKitCall` |
@@ -212,8 +212,7 @@ impl Config {
                 .map_err(|_| "INVITE_USER is required (the Matrix ID Element Call logs in as)")?,
             // Defaults to the dialect real Element Call deployments speak today.
             compat: match env::var("ELEMENT_CALL_COMPAT").ok().as_deref() {
-                Some("current") => MembershipFormat::Current,
-                Some("sticky") => MembershipFormat::Sticky2025,
+                Some("msc") => MembershipFormat::Msc,
                 None | Some("state") => MembershipFormat::RoomState,
                 Some(other) => return Err(format!("unknown ELEMENT_CALL_COMPAT {other:?}").into()),
             },
@@ -582,11 +581,10 @@ async fn join_call(
         room,
         LiveKitCallOptions {
             slot_id: cfg.slot_id.clone(),
-            livekit_transport: cfg.livekit_service_url.clone().map(|livekit_service_url| {
-                LiveKitTransport {
-                    livekit_service_url,
-                }
-            }),
+            livekit_transport: cfg
+                .livekit_service_url
+                .clone()
+                .map(LiveKitTransport::service),
             http: Some(http.clone()),
             format: cfg.compat,
             ..LiveKitCallOptions::default()
@@ -598,7 +596,7 @@ async fn join_call(
     // Publish both: Element Call sits on "Waiting for media..." until it has
     // something it can decode, and video is the half that has historically
     // broken silently (see the simulcast note on PATTERN_WIDTH).
-    let tone = media::publish_tone(call.session(), 440.0).await?;
+    let tone = media::publish_tone(&call.session(), 440.0).await?;
     let video = publish_pattern_video(&call).await?;
 
     emit(serde_json::json!({

@@ -384,7 +384,7 @@ async fn disposed(mut witness: watch::Receiver<bool>) -> Result<()> {
 async fn close_connected(fixture: &Fixture) -> Result<()> {
     let witness = fixture.disposal()?;
     let mut gate = fixture.gate(RestartBarrierPoint::Connected).await?;
-    fixture.engine.inner.reconnection_needed(true, true);
+    fixture.engine.inner.reconnection_needed(true, true, DisconnectReason::UnknownReason, proto::ReconnectReason::RrUnknown);
     gate.wait().await?;
     fixture.fresh_candidate().await?;
     let close = fixture.close();
@@ -403,7 +403,7 @@ async fn close_connected(fixture: &Fixture) -> Result<()> {
 async fn cancel_acquisition_receiver(fixture: &Fixture) -> Result<()> {
     let witness = fixture.disposal()?;
     let mut acquiring = fixture.gate(RestartBarrierPoint::Acquiring).await?;
-    fixture.engine.inner.reconnection_needed(true, true);
+    fixture.engine.inner.reconnection_needed(true, true, DisconnectReason::UnknownReason, proto::ReconnectReason::RrUnknown);
     acquiring.wait().await?;
     let close = fixture.close();
     fixture.marked_closed().await?;
@@ -462,7 +462,7 @@ async fn reject_promotion(fixture: &Fixture) -> Result<()> {
 
 async fn close_adopted(fixture: &Fixture) -> Result<()> {
     let mut gate = fixture.gate(RestartBarrierPoint::Promotion).await?;
-    fixture.engine.inner.reconnection_needed(true, true);
+    fixture.engine.inner.reconnection_needed(true, true, DisconnectReason::UnknownReason, proto::ReconnectReason::RrUnknown);
     gate.wait().await?;
     fixture.fresh_candidate().await?;
     gate.release();

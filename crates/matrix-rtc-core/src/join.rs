@@ -35,11 +35,16 @@ pub const DEFAULT_KEEP_ALIVE_INTERVAL_MS: u64 = 10_000;
 /// Distinct from [`DEFAULT_KEEP_ALIVE_TIMEOUT_MS`]: that one arms the delayed
 /// leave (the dead man's switch for a client that dies), while this one is how
 /// long the homeserver keeps our membership in the sticky map at all. Both are
-/// refreshed by [`keep_alive`], the sticky one only once it is halfway to
-/// expiry.
+/// refreshed by [`keep_alive`], the sticky one only once a third of it has
+/// passed.
 ///
 /// [`keep_alive`]: crate::OwnMembershipMachine::keep_alive
 pub const DEFAULT_STICKY_DURATION_MS: u64 = 60 * 60 * 1000;
+
+/// How long a join may take from the moment the library receives it to our
+/// membership being published (034 R6): every step's transient failures are
+/// retried inside it, and a join still not through at its end fails.
+pub const DEFAULT_JOIN_BUDGET_MS: u64 = 30_000;
 
 /// The longest sticky lifetime that is actually honoured (1 hour).
 ///
@@ -374,9 +379,7 @@ mod tests {
     #[test]
     fn test_membership_id_is_unique_per_call() {
         let params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
-            LiveKitTransport {
-                livekit_service_url: "https://example.com".to_string(),
-            },
+            LiveKitTransport::service("https://example.com".to_string()),
         ));
 
         let first = params.membership_id();
@@ -391,9 +394,7 @@ mod tests {
     #[test]
     fn test_explicit_membership_id() {
         let mut params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
-            LiveKitTransport {
-                livekit_service_url: "https://example.com".to_string(),
-            },
+            LiveKitTransport::service("https://example.com".to_string()),
         ));
         params.membership_id = Some("custom-id".to_string());
 
@@ -403,9 +404,7 @@ mod tests {
     #[test]
     fn test_keep_alive_timeout_default() {
         let params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
-            LiveKitTransport {
-                livekit_service_url: "https://example.com".to_string(),
-            },
+            LiveKitTransport::service("https://example.com".to_string()),
         ));
 
         assert_eq!(
@@ -417,9 +416,7 @@ mod tests {
     #[test]
     fn test_keep_alive_timeout_custom() {
         let mut params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
-            LiveKitTransport {
-                livekit_service_url: "https://example.com".to_string(),
-            },
+            LiveKitTransport::service("https://example.com".to_string()),
         ));
         params.keep_alive_timeout_ms = Some(60_000);
 
@@ -429,9 +426,7 @@ mod tests {
     #[test]
     fn test_validate_success() {
         let params = JoinSessionParams::application("m.call").transport(RtcTransport::LiveKit(
-            LiveKitTransport {
-                livekit_service_url: "https://example.com".to_string(),
-            },
+            LiveKitTransport::service("https://example.com".to_string()),
         ));
 
         assert!(params.validate().is_ok());
@@ -468,9 +463,9 @@ mod tests {
         let params = params
             .member_id("mine")
             .keep_alive_interval_ms(5_000)
-            .transport(RtcTransport::LiveKit(LiveKitTransport {
-                livekit_service_url: "https://example.com".to_string(),
-            }));
+            .transport(RtcTransport::LiveKit(LiveKitTransport::service(
+                "https://example.com".to_string(),
+            )));
         assert_eq!(params.membership_id(), "mine");
         assert_eq!(params.effective_keep_alive_interval_ms(), 5_000);
         assert!(matches!(

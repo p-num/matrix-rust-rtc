@@ -15,7 +15,7 @@ members = [
     "crates/matrix-rtc-transport",
     "uniffi-bindgen",
 ]
-exclude = ["vendor/livekit", "vendor/livekit-api"]
+exclude = ["vendor/livekit", "vendor/livekit-signaling"]
 resolver = "2"
 
 # Every member sets `publish = false`: distribution is the mobile artifacts
@@ -23,7 +23,7 @@ resolver = "2"
 # livekit and matrix-sdk crates could not be published anyway — they pin matrix-sdk
 # by git rev, which the registry rejects.
 [workspace.package]
-version = "0.5.0-rc.5-letro.1"
+version = "0.5.0-rc.9-letro.1"
 edition = "2024"
 license = "AGPL-3.0-only OR LicenseRef-Element-Commercial"
 
@@ -59,7 +59,10 @@ async-trait = "0.1"
 # the token exchange's `reqwest::Client`) and `matrix-rtc-call-sdk` uses the
 # same ones, so two version specs would build two copies whose types do not
 # match.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Both root stores, as for livekit below: the native ones honour `SSL_CERT_FILE`,
+# which is how a dev stack's CA (the QA lab's) reaches the token exchange, and
+# the webpki ones keep Android working where the native store is empty.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots"] }
 
 # `livekit`: keep default features (notably `tokio`, which enables the signal client) and
 # select the rustls TLS backend for the SFU WebSocket/HTTP connections.
@@ -78,16 +81,16 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # enterprise CA an admin added there.
 #
 # Not a swap, for two reasons. Desktop would lose user/enterprise-added CAs.
-# And livekit-api gates its WSS-over-HTTP-proxy path on
-# `rustls-tls-native-roots` (signal_client/signal_stream.rs) — without it, any
+# And livekit-net gates its WSS-over-HTTP-proxy path on
+# `rustls-tls-native-roots` (native/proxy.rs) — without it, any
 # wss:// through a proxy becomes a hard "requires rustls-tls-native-roots".
 #
 # This does NOT give Android enterprise/internal CAs: nothing here can read the
 # Java KeyStore. That needs a platform verifier
-# (`rustls-platform-verifier`) plumbed through livekit-api, which calls
+# (`rustls-platform-verifier`) plumbed through livekit-net, which calls
 # `connect_async` without a connector and so cannot accept one today — an
 # upstream change, not a local knob.
-livekit = { version = "=0.7.48", features = [
+livekit = { version = "0.9.7", features = [
     "rustls-tls-native-roots",
     "rustls-tls-webpki-roots",
 ] }
@@ -98,18 +101,18 @@ livekit = { version = "=0.7.48", features = [
 # of matrix-sdk and the `Client` one crate takes is not the one the other accepts.
 # MSC4354 sticky events come from its `unstable-msc4354` feature, which our
 # `matrix-sdk` features enable.
-matrix-sdk = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "c6ad52ecc09eaa36601f55effb0a48a533eb87dd" }
-matrix-sdk-base = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "c6ad52ecc09eaa36601f55effb0a48a533eb87dd" }
-matrix-sdk-ui = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "c6ad52ecc09eaa36601f55effb0a48a533eb87dd" }
+matrix-sdk = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "56bc59112822e7eb25943a95e02502855cdeef2d" }
+matrix-sdk-base = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "56bc59112822e7eb25943a95e02502855cdeef2d" }
+matrix-sdk-ui = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "56bc59112822e7eb25943a95e02502855cdeef2d" }
 
 # matrix-rust-sdk carries these git pins in its own `[patch]` tables. Cargo does
 # NOT propagate a dependency's `[patch]` to the consuming workspace, so they are
 # replicated here verbatim, or the SDK fails to build; a downstream workspace
 # that depends on matrix-rtc-matrix-sdk, or -call-sdk with `matrix-sdk` on, must do the
-# same. Source: matrix-org/matrix-rust-sdk@c6ad52e Cargo.toml — keep in step when
+# same. Source: matrix-org/matrix-rust-sdk@56bc591 (matrix-sdk-ffi/20261020) Cargo.toml — keep in step when
 # bumping the rev above.
 [patch.crates-io]
 livekit = { path = "vendor/livekit" }
-livekit-api = { path = "vendor/livekit-api" }
+livekit-signaling = { path = "vendor/livekit-signaling" }
 async-compat = { git = "https://github.com/element-hq/async-compat", rev = "5a27c8b290f1f1dcfc0c4ec22c464e38528aa591" }
 const_panic = { git = "https://github.com/jplatte/const_panic", rev = "e0b317a9a7bde2d48a7d15b6a60d70e4a41d3b5f" }

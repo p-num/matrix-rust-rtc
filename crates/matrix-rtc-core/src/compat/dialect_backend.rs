@@ -8,12 +8,12 @@
 //! sends what it is given verbatim. One copy of what each binding's command
 //! sender used to do on its own.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    BackendError, CommandError, EventIn, MatrixBackend, OpenIdToken, RoomSink, RoomSubjects,
-    Subscription, ToDeviceDelivery, ToDeviceRecipient, ToDeviceSink, wire_event_type,
+    BackendError, CommandError, EventIn, LiveKitTokenRequest, MatrixBackend, OpenIdToken, RoomSink,
+    RoomSubjects, Subscription, ToDeviceDelivery, ToDeviceRecipient, ToDeviceSink, wire_event_type,
 };
 use async_trait::async_trait;
 use serde_json::Value;
@@ -26,6 +26,51 @@ pub struct DialectBackend<B> {
     /// Keyed by room: a to-device media key names only its room. Never held
     /// across an await.
     dialects: Mutex<HashMap<String, OutboundDialect>>,
+    /// Rooms whose dialect is held for a send still to go out, by count, and
+    /// those of them forgotten meanwhile. See [`Self::hold_dialect`].
+    holds: Mutex<Holds>,
+}
+
+#[derive(Default)]
+struct Holds {
+    counts: HashMap<String, usize>,
+    forgotten: HashSet<String>,
+}
+
+/// Keeps a room's dialect until dropped. See [`DialectBackend::hold_dialect`].
+#[must_use = "the dialect is held only while this lives"]
+pub struct DialectHold<B> {
+    backend: Arc<DialectBackend<B>>,
+    room_id: String,
+}
+
+// Without the backend bound, which a `Drop` may not add.
+impl<B> DialectBackend<B> {
+    fn release_hold(&self, room_id: &str) {
+        let forget = {
+            let Ok(mut holds) = self.holds.lock() else {
+                return;
+            };
+            let Some(count) = holds.counts.get_mut(room_id) else {
+                return;
+            };
+            *count -= 1;
+            if *count > 0 {
+                return;
+            }
+            holds.counts.remove(room_id);
+            holds.forgotten.remove(room_id)
+        };
+        if forget && let Ok(mut dialects) = self.dialects.lock() {
+            dialects.remove(room_id);
+        }
+    }
+}
+
+impl<B> Drop for DialectHold<B> {
+    fn drop(&mut self) {
+        self.backend.release_hold(&self.room_id);
+    }
 }
 
 impl<B: MatrixBackend> DialectBackend<B> {
@@ -33,6 +78,7 @@ impl<B: MatrixBackend> DialectBackend<B> {
         Self {
             inner,
             dialects: Mutex::new(HashMap::new()),
+            holds: Mutex::new(Holds::default()),
         }
     }
 
@@ -43,6 +89,10 @@ impl<B: MatrixBackend> DialectBackend<B> {
     /// Make every later send for `room_id` speak `dialect`, replacing any
     /// previous one.
     pub fn set_dialect(&self, room_id: &str, dialect: OutboundDialect) {
+        // A new join's dialect is not one an earlier detach forgot.
+        if let Ok(mut holds) = self.holds.lock() {
+            holds.forgotten.remove(room_id);
+        }
         if let Ok(mut dialects) = self.dialects.lock() {
             match dialect {
                 OutboundDialect::None => {
@@ -55,10 +105,35 @@ impl<B: MatrixBackend> DialectBackend<B> {
         }
     }
 
-    /// Forget `room_id`'s dialect, after a leave has been rendered in it.
+    /// Forget `room_id`'s dialect once nothing holds it: at once, or when the
+    /// last [`DialectHold`] goes.
     pub fn clear_dialect(&self, room_id: &str) {
+        if let Ok(mut holds) = self.holds.lock()
+            && holds.counts.contains_key(room_id)
+        {
+            holds.forgotten.insert(room_id.to_owned());
+            return;
+        }
         if let Ok(mut dialects) = self.dialects.lock() {
             dialects.remove(room_id);
+        }
+    }
+
+    /// Keeps `room_id`'s dialect for as long as the returned hold lives, even
+    /// across [`Self::clear_dialect`].
+    ///
+    /// For a send that outlives its room: the leave, which goes out detached
+    /// and is not waited for (034 R8, C10), so a host may shut the room down
+    /// the moment it has asked to leave. That forgets the dialect, and a
+    /// pre-sticky join's leave then went out as a current-format sticky event,
+    /// leaving the joined state event in place until it expired.
+    pub fn hold_dialect(self: &Arc<Self>, room_id: &str) -> DialectHold<B> {
+        if let Ok(mut holds) = self.holds.lock() {
+            *holds.counts.entry(room_id.to_owned()).or_default() += 1;
+        }
+        DialectHold {
+            backend: Arc::clone(self),
+            room_id: room_id.to_owned(),
         }
     }
 
@@ -138,20 +213,27 @@ impl<B: MatrixBackend + 'static> MatrixBackend for DialectBackend<B> {
         }
     }
 
-    async fn send_delayed_event(
+    async fn send_delayed_state_event(
         &self,
         room_id: String,
         event_type: String,
-        state_key: Option<String>,
+        state_key: String,
         content: Value,
         delay_ms: u64,
     ) -> Result<String, CommandError> {
-        if state_key.is_some() {
-            return self
-                .inner
-                .send_delayed_event(room_id, event_type, state_key, content, delay_ms)
-                .await;
-        }
+        self.inner
+            .send_delayed_state_event(room_id, event_type, state_key, content, delay_ms)
+            .await
+    }
+
+    async fn send_delayed_sticky_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        content: Value,
+        sticky_duration_ms: u64,
+        delay_ms: u64,
+    ) -> Result<String, CommandError> {
         // The delayed leave follows the same routing as the join it pairs
         // with. No lifetime: its legacy content is `{}`.
         match self
@@ -161,13 +243,15 @@ impl<B: MatrixBackend + 'static> MatrixBackend for DialectBackend<B> {
             MemberEventRoute::Sticky {
                 event_type,
                 content,
-            }
-            | MemberEventRoute::Room {
-                event_type,
-                content,
             } => {
                 self.inner
-                    .send_delayed_event(room_id, wire(event_type), None, content, delay_ms)
+                    .send_delayed_sticky_event(
+                        room_id,
+                        wire(event_type),
+                        content,
+                        sticky_duration_ms,
+                        delay_ms,
+                    )
                     .await
             }
             MemberEventRoute::State {
@@ -176,15 +260,19 @@ impl<B: MatrixBackend + 'static> MatrixBackend for DialectBackend<B> {
                 content,
             } => {
                 self.inner
-                    .send_delayed_event(
+                    .send_delayed_state_event(
                         room_id,
                         event_type.to_owned(),
-                        Some(state_key),
+                        state_key,
                         content,
                         delay_ms,
                     )
                     .await
             }
+            // Only a non-membership event takes this route, and nothing delays one.
+            MemberEventRoute::Room { event_type, .. } => Err(CommandError::from_message(format!(
+                "{event_type} has no delayed form"
+            ))),
         }
     }
 
@@ -285,6 +373,10 @@ impl<B: MatrixBackend + 'static> MatrixBackend for DialectBackend<B> {
 
     async fn openid_token(&self) -> Result<OpenIdToken, BackendError> {
         self.inner.openid_token().await
+    }
+
+    async fn livekit_token(&self, request: &LiveKitTokenRequest) -> Result<String, BackendError> {
+        self.inner.livekit_token(request).await
     }
 
     async fn rtc_transports(&self) -> Result<Value, BackendError> {
@@ -406,7 +498,7 @@ mod tests {
         let (mock, backend) = backend();
         backend.set_dialect(
             "!legacy:example.org",
-            dialect(MembershipFormat::Sticky2025, "!legacy:example.org"),
+            dialect(MembershipFormat::RoomState, "!legacy:example.org"),
         );
         let key = |room_id: &str| {
             json!({
@@ -454,11 +546,11 @@ mod tests {
             dialect(MembershipFormat::RoomState, "!legacy:example.org"),
         );
         backend
-            .send_delayed_event(
+            .send_delayed_sticky_event(
                 "!legacy:example.org".to_owned(),
                 "m.rtc.member".to_owned(),
-                None,
                 json!({ "slot_id": "m.call#room", "msc4354_sticky_key": "k", "member": { "membership": "leave" } }),
+                3_600_000,
                 30_000,
             )
             .await

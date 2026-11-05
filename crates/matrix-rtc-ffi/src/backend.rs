@@ -12,15 +12,18 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use matrix_rtc_core::{
-    BackendError, CommandError, EventEncryption, EventIn, MatrixBackend as CoreBackend,
-    OpenIdToken, RoomSink as CoreRoomSink, RoomSubjects, Subscription as CoreSubscription,
-    ToDeviceDelivery, ToDeviceMessageIn, ToDeviceRecipient, ToDeviceSink as CoreToDeviceSink,
+    BackendError, CommandError, EventEncryption, EventIn, LiveKitTokenRequest,
+    MatrixBackend as CoreBackend, OpenIdToken, RoomSink as CoreRoomSink, RoomSubjects,
+    Subscription as CoreSubscription, ToDeviceDelivery, ToDeviceMessageIn, ToDeviceRecipient,
+    ToDeviceSink as CoreToDeviceSink,
 };
 use serde_json::Value;
 
-/// A failure reported by the host's Matrix client. Carry the Matrix `errcode`
-/// and HTTP status when the client has them: the library classifies them (a
-/// delayed-event refusal, for one); the host does not.
+/// A failure reported by the host's Matrix client. Carry the Matrix `errcode`,
+/// HTTP status and rate-limit `retry_after_ms` when the client has them: the
+/// library classifies them (034 R3, R7); the host does not. Set `permanent`
+/// only for a condition the client knows is final and has no Matrix code for,
+/// such as a room the user is not in: a permanent failure is never retried.
 #[derive(Debug, Clone, thiserror::Error, uniffi::Error)]
 pub enum FfiBackendError {
     // `reason`, not `message`: Kotlin's generated exception already has a
@@ -29,33 +32,35 @@ pub enum FfiBackendError {
     Failed {
         errcode: Option<String>,
         status: Option<u16>,
+        retry_after_ms: Option<u64>,
+        permanent: bool,
         reason: String,
     },
 }
 
 impl FfiBackendError {
-    fn into_parts(self) -> (Option<String>, Option<u16>, String) {
+    fn into_backend_error(self) -> BackendError {
         match self {
             Self::Failed {
                 errcode,
                 status,
+                retry_after_ms,
+                permanent,
                 reason,
-            } => (errcode, status, reason),
+            } => {
+                let error = BackendError::with_matrix_error(errcode, status, reason)
+                    .with_retry_after_ms(retry_after_ms);
+                if permanent { error.permanent() } else { error }
+            }
         }
     }
 
-    fn into_backend_error(self) -> BackendError {
-        let (errcode, status, message) = self.into_parts();
-        BackendError::with_matrix_error(errcode, status, message)
-    }
-
     fn into_send_error(self) -> CommandError {
-        CommandError::SendError(self.into_parts().2)
+        CommandError::Backend(self.into_backend_error())
     }
 
     fn into_delayed_error(self) -> CommandError {
-        let (errcode, status, message) = self.into_parts();
-        CommandError::delayed_event_failure(errcode.as_deref(), status, message)
+        CommandError::delayed_event_failure(self.into_backend_error())
     }
 }
 
@@ -68,6 +73,8 @@ impl From<uniffi::UnexpectedUniFFICallbackError> for FfiBackendError {
         Self::Failed {
             errcode: None,
             status: None,
+            retry_after_ms: None,
+            permanent: false,
             reason: format!("the host threw an unexpected error: {}", error.reason),
         }
     }
@@ -75,14 +82,15 @@ impl From<uniffi::UnexpectedUniFFICallbackError> for FfiBackendError {
 
 /// What the client reports about how an event arrived. `encrypted: false`
 /// means cleartext; the other two fields then mean nothing. Report only what
-/// the client says — a cross-signing status it cannot give stays `null`.
+/// the client says — a confirmation it cannot give stays `null`.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct FfiEventEncryption {
     pub encrypted: bool,
     #[uniffi(default = None)]
     pub sender_device_id: Option<String>,
     #[uniffi(default = None)]
-    pub sender_cross_signed: Option<bool>,
+    /// Whether the client confirms the sender under its own trust settings.
+    pub sender_confirmed: Option<bool>,
 }
 
 impl From<FfiEventEncryption> for EventEncryption {
@@ -90,7 +98,7 @@ impl From<FfiEventEncryption> for EventEncryption {
         if value.encrypted {
             EventEncryption::Encrypted {
                 sender_device_id: value.sender_device_id,
-                sender_cross_signed: value.sender_cross_signed,
+                sender_confirmed: value.sender_confirmed,
             }
         } else {
             EventEncryption::Cleartext
@@ -139,7 +147,7 @@ pub struct FfiToDeviceMessageIn {
     pub encryption: FfiEventEncryption,
 }
 
-fn parse_content(event_type: &str, sender: &str, content_json: &str) -> Option<Value> {
+pub(crate) fn parse_content(event_type: &str, sender: &str, content_json: &str) -> Option<Value> {
     serde_json::from_str(content_json)
         .inspect_err(|error| {
             log::warn!("ignoring a {event_type} from {sender} whose content is not JSON: {error}");
@@ -147,7 +155,7 @@ fn parse_content(event_type: &str, sender: &str, content_json: &str) -> Option<V
         .ok()
 }
 
-fn events_into_core(events: Vec<FfiEventIn>) -> Vec<EventIn> {
+pub(crate) fn events_into_core(events: Vec<FfiEventIn>) -> Vec<EventIn> {
     events
         .into_iter()
         .filter_map(FfiEventIn::into_core)
@@ -199,6 +207,21 @@ pub struct FfiOpenIdToken {
     pub expires_in_secs: u64,
 }
 
+/// An MSC4195 LiveKit token request to the homeserver:
+/// `POST /_matrix/client/v1/rtc/livekit/get_token` (unstable
+/// `/_matrix/client/unstable/io.element.msc4195/rtc/livekit/get_token`), with
+/// this record as the JSON body. A DTO, so no client SDK type crosses the FFI.
+#[derive(Clone, Debug, uniffi::Record)]
+pub struct FfiLiveKitTokenRequest {
+    /// The SFU's homeserver; the homeserver's own when `None` (omit the field).
+    pub server_name: Option<String>,
+    /// The SFU's WebSocket URL.
+    pub url: String,
+    pub room_id: String,
+    pub slot_id: String,
+    pub member_id: String,
+}
+
 /// Where the host delivers a room's subjects. Every call returns at once.
 ///
 /// For sticky events, state events and joined members each call carries the
@@ -206,7 +229,7 @@ pub struct FfiOpenIdToken {
 /// current set at subscription time. An empty set means none.
 #[derive(uniffi::Object)]
 pub struct RoomSink {
-    inner: Arc<dyn CoreRoomSink>,
+    pub(crate) inner: Arc<dyn CoreRoomSink>,
 }
 
 #[uniffi::export]
@@ -240,7 +263,7 @@ impl RoomSink {
 /// Where the host delivers to-device messages of the subscribed types.
 #[derive(uniffi::Object)]
 pub struct ToDeviceSink {
-    inner: Arc<dyn CoreToDeviceSink>,
+    pub(crate) inner: Arc<dyn CoreToDeviceSink>,
 }
 
 #[uniffi::export]
@@ -297,17 +320,30 @@ pub trait MatrixBackend: Send + Sync {
         duration_ms: u64,
     ) -> Result<String, FfiBackendError>;
 
-    /// With `state_key`, a delayed state event; otherwise a delayed
-    /// message-like event. Returns the MSC4140 delay id. A homeserver that
-    /// refuses delayed events (`M_UNRECOGNIZED`, or matrix.org's `M_FORBIDDEN`)
-    /// does not fail the join: report the `errcode` and the library stops
-    /// asking.
-    async fn send_delayed_event(
+    /// A delayed state event, the room-state format's dead man's switch.
+    /// Returns the MSC4140 delay id. A homeserver that refuses delayed events
+    /// (`M_UNRECOGNIZED`, or matrix.org's `M_FORBIDDEN`) does not fail the
+    /// join: report the `errcode` and the library stops asking.
+    async fn send_delayed_state_event(
         &self,
         room_id: String,
         event_type: String,
-        state_key: Option<String>,
+        state_key: String,
         content_json: String,
+        delay_ms: u64,
+    ) -> Result<String, FfiBackendError>;
+
+    /// A delayed sticky event (MSC4140 and MSC4354), the sticky formats' dead
+    /// man's switch, kept `sticky_duration_ms` in the sticky map once it fires.
+    /// Returns the MSC4140 delay id. An SDK that cannot send one answers
+    /// `M_UNRECOGNIZED` and the library joins without it; never send a plain
+    /// delayed event instead, which fires without ending the membership.
+    async fn send_delayed_sticky_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        content_json: String,
+        sticky_duration_ms: u64,
         delay_ms: u64,
     ) -> Result<String, FfiBackendError>;
 
@@ -392,6 +428,16 @@ pub trait MatrixBackend: Send + Sync {
     /// A fresh OpenID token for the account.
     async fn openid_token(&self) -> Result<FfiOpenIdToken, FfiBackendError>;
 
+    /// The homeserver's MSC4195 LiveKit token: `POST` `request` to
+    /// `get_token` (see [`FfiLiveKitTokenRequest`]) and return the `jwt` of
+    /// the answer. Used for transports naming an SFU `url` without a
+    /// `livekit_service_url`. A host that cannot make the request fails with
+    /// `M_UNRECOGNIZED`, status 404, as a homeserver without it would.
+    async fn livekit_token(
+        &self,
+        request: FfiLiveKitTokenRequest,
+    ) -> Result<String, FfiBackendError>;
+
     /// The `rtc_transports` array of `GET /_matrix/client/v1/rtc/transports`,
     /// as JSON; `[]` when the homeserver lacks the endpoint.
     async fn rtc_transports(&self) -> Result<String, FfiBackendError>;
@@ -465,23 +511,52 @@ impl CoreBackend for FfiBackend {
         )
     }
 
-    async fn send_delayed_event(
+    async fn send_delayed_state_event(
         &self,
         room_id: String,
         event_type: String,
-        state_key: Option<String>,
+        state_key: String,
         content: Value,
         delay_ms: u64,
     ) -> Result<String, CommandError> {
         let content_json = to_json(&content)?;
         let what = format!(
-            "delayed [{room_id}] type={event_type} state_key={state_key:?} delay={delay_ms}ms"
+            "delayed state [{room_id}] type={event_type} state_key={state_key} delay={delay_ms}ms"
         );
         trace_command_content(&what, &content_json);
         log_command(
             &what,
             self.host
-                .send_delayed_event(room_id, event_type, state_key, content_json, delay_ms)
+                .send_delayed_state_event(room_id, event_type, state_key, content_json, delay_ms)
+                .await
+                .map_err(FfiBackendError::into_delayed_error),
+        )
+    }
+
+    async fn send_delayed_sticky_event(
+        &self,
+        room_id: String,
+        event_type: String,
+        content: Value,
+        sticky_duration_ms: u64,
+        delay_ms: u64,
+    ) -> Result<String, CommandError> {
+        let content_json = to_json(&content)?;
+        let what = format!(
+            "delayed sticky [{room_id}] type={event_type} duration={sticky_duration_ms}ms \
+             delay={delay_ms}ms"
+        );
+        trace_command_content(&what, &content_json);
+        log_command(
+            &what,
+            self.host
+                .send_delayed_sticky_event(
+                    room_id,
+                    event_type,
+                    content_json,
+                    sticky_duration_ms,
+                    delay_ms,
+                )
                 .await
                 .map_err(FfiBackendError::into_delayed_error),
         )
@@ -664,6 +739,19 @@ impl CoreBackend for FfiBackend {
         })
     }
 
+    async fn livekit_token(&self, request: &LiveKitTokenRequest) -> Result<String, BackendError> {
+        self.host
+            .livekit_token(FfiLiveKitTokenRequest {
+                server_name: request.server_name.clone(),
+                url: request.url.clone(),
+                room_id: request.room_id.clone(),
+                slot_id: request.slot_id.clone(),
+                member_id: request.member_id.clone(),
+            })
+            .await
+            .map_err(FfiBackendError::into_backend_error)
+    }
+
     async fn rtc_transports(&self) -> Result<Value, BackendError> {
         let json = self
             .host
@@ -728,6 +816,8 @@ pub(crate) mod test_support {
         /// Model a homeserver with MSC4140 switched off, the way matrix.org
         /// answers: every delayed send is refused.
         pub refuse_delayed: AtomicBool,
+        /// When set, every sticky send fails with it.
+        pub refuse_sticky: Mutex<Option<FfiBackendError>>,
         pub room_sinks: Mutex<HashMap<String, (FfiRoomSubjects, Arc<RoomSink>)>>,
         pub to_device_sink: Mutex<Option<(Vec<String>, Arc<ToDeviceSink>)>>,
         pub transports_json: Mutex<String>,
@@ -836,6 +926,8 @@ pub(crate) mod test_support {
                 .then(|| FfiBackendError::Failed {
                     errcode: Some("M_FORBIDDEN".to_owned()),
                     status: Some(403),
+                    retry_after_ms: None,
+                    permanent: false,
                     reason: "Sending delayed events has been disallowed".to_owned(),
                 })
         }
@@ -858,17 +950,20 @@ pub(crate) mod test_support {
             content_json: String,
             duration_ms: u64,
         ) -> Result<String, FfiBackendError> {
+            if let Some(error) = self.refuse_sticky.lock().unwrap().clone() {
+                return Err(error);
+            }
             self.record(&event_type);
             *self.sticky_duration_ms.lock().unwrap() = Some(duration_ms);
             self.record_send(Carrier::Sticky, &event_type, None, &content_json);
             Ok(format!("$sticky-{}", self.sends.lock().unwrap().len()))
         }
 
-        async fn send_delayed_event(
+        async fn send_delayed_state_event(
             &self,
             room_id: String,
             event_type: String,
-            state_key: Option<String>,
+            state_key: String,
             content_json: String,
             _delay_ms: u64,
         ) -> Result<String, FfiBackendError> {
@@ -876,12 +971,28 @@ pub(crate) mod test_support {
                 return Err(refusal);
             }
             self.record(&event_type);
-            let carrier = if state_key.is_some() {
-                Carrier::DelayedState
-            } else {
-                Carrier::DelayedSticky
-            };
-            self.record_send(carrier, &event_type, state_key, &content_json);
+            self.record_send(
+                Carrier::DelayedState,
+                &event_type,
+                Some(state_key),
+                &content_json,
+            );
+            Ok(format!("event-{room_id}-{event_type}"))
+        }
+
+        async fn send_delayed_sticky_event(
+            &self,
+            room_id: String,
+            event_type: String,
+            content_json: String,
+            _sticky_duration_ms: u64,
+            _delay_ms: u64,
+        ) -> Result<String, FfiBackendError> {
+            if let Some(refusal) = self.delayed_refusal() {
+                return Err(refusal);
+            }
+            self.record(&event_type);
+            self.record_send(Carrier::DelayedSticky, &event_type, None, &content_json);
             Ok(format!("event-{room_id}-{event_type}"))
         }
 
@@ -1009,6 +1120,13 @@ pub(crate) mod test_support {
             })
         }
 
+        async fn livekit_token(
+            &self,
+            request: FfiLiveKitTokenRequest,
+        ) -> Result<String, FfiBackendError> {
+            Ok(format!("jwt-for-{}", request.url))
+        }
+
         async fn rtc_transports(&self) -> Result<String, FfiBackendError> {
             Ok(self.transports_json.lock().unwrap().clone())
         }
@@ -1031,9 +1149,15 @@ mod tests {
         let FfiBackendError::Failed {
             errcode,
             status,
+            retry_after_ms,
+            permanent,
             reason,
         } = lifted.expect_err("an error");
-        assert_eq!((errcode, status), (None, None));
+        assert_eq!((errcode, status, retry_after_ms), (None, None, None));
+        assert!(
+            !permanent,
+            "an exception the host did not describe is transient"
+        );
         assert!(reason.contains("java.io.IOException: boom"), "{reason}");
     }
 }

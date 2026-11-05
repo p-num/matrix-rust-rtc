@@ -11,7 +11,9 @@ license.workspace = true
 publish = false
 
 [lib]
-crate-type = ["cdylib", "staticlib", "rlib"]
+# No `rlib`: Cargo silently skips the profile's LTO when it is built alongside
+# `cdylib` and `staticlib`, and nothing depends on this crate as a library.
+crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
 matrix-rtc-core = { path = "../matrix-rtc-core" }
@@ -69,6 +71,13 @@ media = [
     "tokio/rt-multi-thread",
     "tokio/time",
 ]
+
+# Scripted fakes for hosts' own tests (034, contract C16):
+# `ScriptedMatrixBackend`, `ScriptedMediaTransport` and
+# `connect_scripted_media_session`. The build scripts turn it on for the
+# debug (dev-profile) AAR and XCFramework only; a release artifact never
+# carries it.
+testing = ["media", "matrix-rtc-core/testing", "matrix-rtc-transport/testing"]
 
 [build-dependencies]
 # Re-emits libwebrtc's `Java_*` JNI link args against our cdylib — see the

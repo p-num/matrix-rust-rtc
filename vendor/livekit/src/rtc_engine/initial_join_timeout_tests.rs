@@ -9,8 +9,8 @@ use anyhow::{ensure, Context, Result};
 use livekit_api::{
     access_token::{AccessToken, VideoGrants},
     services::room::{CreateRoomOptions, RoomClient},
-    signal_client::{SignalClient, SignalError, SignalOptions, JOIN_RESPONSE_TIMEOUT},
 };
+use livekit_signaling::{SignalClient, SignalError, SignalOptions, JOIN_RESPONSE_TIMEOUT};
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
 
@@ -263,7 +263,7 @@ async fn resume_response_timeout_closes_its_unowned_signal_stream_and_allows_ret
             .sid;
         let client = connected.signal_client().clone();
         let owner = client.clone();
-        restart = Some(tokio::spawn(async move { owner.restart().await }));
+        restart = Some(tokio::spawn(async move { owner.restart(livekit_protocol::ReconnectReason::RrUnknown).await }));
         let held_at = proxy.held().await?;
         let people = timeout(LIMIT, admin.list_participants(&room))
             .await
@@ -300,7 +300,7 @@ async fn resume_response_timeout_closes_its_unowned_signal_stream_and_allows_ret
         );
         // The one-shot barrier is consumed. An unheld retry must succeed, retain
         // its private receiver in middleware, and keep the same participant SID.
-        timeout(LIMIT, client.restart())
+        timeout(LIMIT, client.restart(livekit_protocol::ReconnectReason::RrUnknown))
             .await
             .context("normal Resume retry timed out")?
             .map_err(|_| anyhow::anyhow!("normal Resume retry failed"))?;
