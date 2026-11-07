@@ -8,6 +8,10 @@ log only.
 
 ## Unreleased
 
+### Fixed
+
+- Close late SFU connections after call shutdown, including token requests that finish after the media task exits (p-num/element-x-android#156).
+
 ## v0.5.0-rc.9-letro.1 - 2026-11-05
 
 ### Changed

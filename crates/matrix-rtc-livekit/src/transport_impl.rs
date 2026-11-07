@@ -194,7 +194,7 @@ impl OwnFocusTransport for LiveKitMediaTransport {
                     config: Mutex::new(config),
                     token: Mutex::new(None),
                 },
-                installs: Mutex::new(0),
+                installs: Mutex::new(Some(0)),
             }),
         }
     }
@@ -277,9 +277,9 @@ struct ConnectionShared {
     /// room. Weak: an unpublished or dropped one simply goes.
     local_tracks: Mutex<Vec<Weak<LiveKitLocalTrack>>>,
     connector: Connector,
-    /// Bumped by every take-over, under which a connected room is installed:
-    /// a reconnect that started before one is abandoned (034 R25).
-    installs: Mutex<u64>,
+    /// Bumped by every take-over; `None` after close. Earlier reconnects
+    /// cannot install a room, and a closed handle cannot start another.
+    installs: Mutex<Option<u64>>,
 }
 
 /// What [`TransportConnection::hand_over`] gives: the connected room and how
@@ -465,12 +465,35 @@ impl TransportConnection for LiveKitTransportConnection {
         fresh_token: bool,
     ) -> Result<UnboundedReceiver<ConnectionEvent>, TransportError> {
         let connector = &self.shared.connector;
-        let started = *self
+        let (started, mut sessions) = {
+            let installs = self
+                .shared
+                .installs
+                .lock()
+                .expect("installs mutex poisoned");
+            let started = installs
+                .as_ref()
+                .copied()
+                .ok_or_else(|| TransportError::Closed("connection was closed".into()))?;
+            (started, self.shared.session.subscribe())
+        };
+        let token = tokio::select! {
+            result = connector.token(fresh_token) => result?,
+            _ = sessions.changed() => return Err(TransportError::Closed(
+                "abandoned: the handle changed while fetching its token".into(),
+            )),
+        };
+        if *self
             .shared
             .installs
             .lock()
-            .expect("installs mutex poisoned");
-        let token = connector.token(fresh_token).await?;
+            .expect("installs mutex poisoned")
+            != Some(started)
+        {
+            return Err(TransportError::Closed(
+                "abandoned: the handle changed while fetching its token".into(),
+            ));
+        }
         let connection = LiveKitSession::connect_with_options(
             &token,
             e2ee_room_options(
@@ -488,11 +511,11 @@ impl TransportConnection for LiveKitTransportConnection {
                 .installs
                 .lock()
                 .expect("installs mutex poisoned");
-            if *installs != started {
+            if *installs != Some(started) {
                 drop(installs);
                 close_room(session);
                 return Err(TransportError::Closed(
-                    "abandoned: the handle took another connection over".into(),
+                    "abandoned: the handle changed while connecting".into(),
                 ));
             }
             self.shared.session.send_replace(Some(session.clone()))
@@ -554,7 +577,10 @@ impl TransportConnection for LiveKitTransportConnection {
                 .installs
                 .lock()
                 .expect("installs mutex poisoned");
-            *installs += 1;
+            let generation = installs
+                .as_mut()
+                .ok_or_else(|| TransportError::Closed("connection was closed".into()))?;
+            *generation += 1;
             let connector = &self.shared.connector;
             *connector.config.lock().expect("config mutex poisoned") = config;
             *connector.token.lock().expect("token mutex poisoned") = token;
@@ -716,7 +742,16 @@ impl TransportConnection for LiveKitTransportConnection {
     /// the postcondition callers want ("this connection is not open") already
     /// holds, so reporting a failure only makes a clean hangup look broken.
     async fn close(&self) -> Result<(), TransportError> {
-        let Some(session) = self.current_session() else {
+        let session = {
+            let mut installs = self
+                .shared
+                .installs
+                .lock()
+                .expect("installs mutex poisoned");
+            *installs = None;
+            self.shared.session.send_replace(None)
+        };
+        let Some(session) = session else {
             return Ok(());
         };
         match session.room().close().await {
@@ -1401,6 +1436,71 @@ fn copy_plane(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn prepared_connection(url: &str) -> LiveKitTransportConnection {
+        let transport = LiveKitMediaTransport::new(
+            reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            Arc::new(matrix_rtc_core::testing::MockBackend::new()),
+            crate::Msc4195KeyProviders::new(),
+        );
+        transport.prepare_own(
+            url,
+            &ConnectionContext {
+                room_id: "!room:example.org".into(),
+                slot_id: "m.call#room".into(),
+                member: matrix_rtc_transport::OwnMemberClaims {
+                    member_id: "member-1".into(),
+                    user_id: "@alice:example.org".into(),
+                    device_id: "DEVICE".into(),
+                },
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn closing_a_prepared_handle_prevents_its_first_connect() {
+        let prepared = prepared_connection("http://127.0.0.1:9");
+        let worker = prepared.clone();
+        prepared.close().await.unwrap();
+        let error = worker.reconnect(false).await.expect_err("closed handle");
+        assert!(matches!(error, TransportError::Closed(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn closing_a_handle_cancels_its_stalled_token_request() {
+        use tokio::{io::AsyncReadExt, net::TcpListener, sync::oneshot, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let prepared = prepared_connection(&format!("http://{}", listener.local_addr().unwrap()));
+        let (requested, request_received) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            requested.send(()).unwrap();
+            // The JWT service accepted the request but has not answered it.
+            std::future::pending::<()>().await;
+        });
+        let worker = prepared.clone();
+        let connecting = tokio::spawn(async move { worker.reconnect(false).await });
+        timeout(std::time::Duration::from_secs(2), request_received)
+            .await
+            .expect("token request reached the service")
+            .unwrap();
+
+        prepared.close().await.unwrap();
+        let result = timeout(std::time::Duration::from_secs(1), connecting).await;
+        server.abort();
+        let error = result
+            .expect("close cancels the token wait without waiting for the service")
+            .unwrap()
+            .expect_err("closed handle");
+        assert!(matches!(error, TransportError::Closed(_)), "{error:?}");
+    }
 
     fn signal_client_error(status: u16) -> crate::Error {
         crate::Error::Room(livekit::RoomError::Engine(
