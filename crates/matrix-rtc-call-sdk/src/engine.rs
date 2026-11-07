@@ -892,6 +892,7 @@ impl Actor {
 
         self.sync_media_state();
         let mut memberships_open = true;
+        let mut shutdown_ack = None;
         loop {
             tokio::select! {
                 changed = watch_changed(&mut signalling) => match changed {
@@ -942,7 +943,7 @@ impl Actor {
                             status.detached();
                         }
                         self.end();
-                        let _ = ack.send(());
+                        shutdown_ack = Some(ack);
                         break;
                     }
                     Some(message) => self.handle_message(message),
@@ -951,6 +952,16 @@ impl Actor {
                 },
             }
             self.sync_media_state();
+        }
+        // Return queued connections through the closed pool's cleanup path.
+        // Later completions fail their send and close themselves instead.
+        self.pool.close();
+        pool_inbox.close();
+        while let Some(message) = pool_inbox.recv().await {
+            let _ = self.pool.handle(message);
+        }
+        if let Some(ack) = shutdown_ack {
+            let _ = ack.send(());
         }
     }
 
@@ -2070,6 +2081,8 @@ mod tests {
         senders: StdMutex<HashMap<String, UnboundedSender<ConnectionEvent>>>,
         /// Number of connect attempts (per key) that fail before succeeding.
         fail_attempts: AtomicU32,
+        /// Holds a peer's token/connection request across shutdown.
+        connect_gate: StdMutex<Option<Arc<tokio::sync::Notify>>>,
         /// `(connection_key, kind, muted)` of every publish call.
         published: StdMutex<Vec<(String, MediaStreamKind, bool)>>,
         /// `(identity, kind, resolved)` of every apply_constraints call.
@@ -2132,6 +2145,10 @@ mod tests {
             if self.state.fail_attempts.load(Ordering::SeqCst) > 0 {
                 self.state.fail_attempts.fetch_sub(1, Ordering::SeqCst);
                 return Err(TransportError::Connect("fake failure".into()));
+            }
+            let gate = self.state.connect_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.notified().await;
             }
             let (connection, events) = fake_connection(&self.state, connection_key);
             Ok((connection, events))
@@ -4537,6 +4554,75 @@ mod tests {
         // The adopted own connection is left to its owner.
         assert!(!closed(&fx, OWN_FOCUS));
         drop(own);
+    }
+
+    #[derive(Clone, Default)]
+    struct DelayedOwnConnection {
+        started: Arc<tokio::sync::Notify>,
+        authorize: Arc<tokio::sync::Notify>,
+        connected: Arc<tokio::sync::Notify>,
+        active: Arc<AtomicBool>,
+        closes: Arc<AtomicU32>,
+    }
+
+    #[async_trait::async_trait]
+    impl TransportConnection for DelayedOwnConnection {
+        fn connection_key(&self) -> &str {
+            OWN_FOCUS
+        }
+
+        async fn reconnect(
+            &self,
+            _fresh_token: bool,
+        ) -> Result<mpsc::UnboundedReceiver<ConnectionEvent>, TransportError> {
+            self.started.notify_one();
+            self.authorize.notified().await;
+            self.active.store(true, Ordering::SeqCst);
+            self.connected.notify_one();
+            let (_sender, events) = mpsc::unbounded_channel();
+            Ok(events)
+        }
+
+        async fn close(&self) -> Result<(), TransportError> {
+            self.active.store(false, Ordering::SeqCst);
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_closes_own_connection_that_finishes_after_the_actor_stops() {
+        let fx = fixture();
+        let connection = DelayedOwnConnection::default();
+        fx.engine.connect_own(Box::new(connection.clone()));
+        connection.started.notified().await;
+
+        fx.engine.shutdown().await;
+        // As in the FFI, the host closes its prepared own handle too. Its
+        // token request has not answered, so there is no session to close yet.
+        connection.close().await.unwrap();
+        assert_eq!(connection.closes.load(Ordering::SeqCst), 1);
+        connection.authorize.notify_one();
+        connection.connected.notified().await;
+
+        wait_until(|| !connection.active.load(Ordering::SeqCst)).await;
+        assert_eq!(connection.closes.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_closes_peer_connection_that_finishes_after_the_actor_stops() {
+        let fx = fixture();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        *fx.state.connect_gate.lock().unwrap() = Some(gate.clone());
+        fx.memberships
+            .send(vec![member_on("bob", "@bob:example.org", PEER_FOCUS)])
+            .unwrap();
+        wait_until(|| connect_count(&fx, PEER_FOCUS) == 1).await;
+
+        fx.engine.shutdown().await;
+        gate.notify_one();
+        wait_until(|| peer_sender(&fx, PEER_FOCUS).is_some()).await;
+        wait_until(|| closed(&fx, PEER_FOCUS)).await;
     }
 
     #[tokio::test(start_paused = true)]
