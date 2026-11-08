@@ -26,7 +26,8 @@ class AndroidCargoMetadataTests(unittest.TestCase):
         self.env.pop("CARGO_TARGET_DIR", None)
         (self.root / "src").mkdir()
         (self.root / "Cargo.toml").write_text(
-            '[package]\nname="webrtc-sys"\nversion="0.3.51"\nedition="2021"\n')
+            '[package]\nname="webrtc-sys"\nversion="0.3.51"\nedition="2021"\n'
+            '[lib]\ncrate-type=["cdylib"]\n')
         (self.root / "src/lib.rs").write_text("pub fn fixture() {}\n")
         self.jar = self.root / "bundles/active/libwebrtc.jar"
         (self.jar.parent / "lib").mkdir(parents=True)
@@ -41,13 +42,20 @@ class AndroidCargoMetadataTests(unittest.TestCase):
         self.messages = self.root / "messages.jsonl"
 
     def invoke(self, args, check=True):
-        return subprocess.run(args, cwd=self.root, env=self.env,
-                              capture_output=True, text=True, check=check)
+        result = subprocess.run(args, cwd=self.root, env=self.env,
+                                capture_output=True, text=True)
+        if check and result.returncode:
+            # cargo-ndk panic reports include the process environment. Keep
+            # failure output useful without copying credentials into test logs.
+            details = "\n".join(line for line in result.stdout.splitlines()
+                                if line.startswith(("location:", "message:")))
+            self.fail(result.stderr + "\n" + details)
+        return result
 
     def build(self, check=True):
         return self.invoke([
             "python3", str(SCRIPTS / "cargo-android-json.py"),
-            "--messages", str(self.messages), "--targets", TARGET, "--", "check",
+            "--messages", str(self.messages), "--targets", TARGET, "--", "build",
             "--offline", "--jobs", "2", "--target-dir", str(self.root / "target"),
         ], check=check)
 

@@ -10,10 +10,12 @@ which that older JAR does not contain. The Android packager now follows the
 active `webrtc-sys` package's Cargo linker records and requires matching Java
 payloads for every requested ABI. Eleven local selection regressions cover stale
 caches, missing or ambiguous inputs, wrong targets and incompatible ABI payloads.
-Two further integration tests use the actual Android Rust target and NDK,
-including fresh/cached builds and an intentional compiler failure. They verify
-that Cargo records survive the build boundary; `cargo-ndk` normally consumes them,
-so the packager uses its official `ndk-env` interface and runs Cargo directly.
+Two further integration tests perform fresh and cached Android shared-library
+links and an intentional compiler failure. They verify that Cargo records survive
+the build boundary; `cargo-ndk` normally consumes them, so the packager captures
+its inner Cargo stream. The complete NDK environment stays intact: its environment
+export alone omits private linker flags, which a cached build or `cargo check`
+cannot detect.
 
 | Failure | Evidence | Repair |
 | --- | --- | --- |

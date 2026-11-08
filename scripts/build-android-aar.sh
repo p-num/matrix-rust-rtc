@@ -205,8 +205,8 @@ if [ "$DO_BUILD" = "1" ]; then
     # their exact linker paths instead of guessing which cached WebRTC is live.
     BUILD_MESSAGES="$PROJECT_ROOT/target/android-aar-build-messages.jsonl"
     mkdir -p "$PROJECT_ROOT/target"
-    # cargo-ndk consumes these records itself. Use its official environment
-    # command and run Cargo directly so the linker metadata remains available.
+    # cargo-ndk consumes these records itself. Capture its inner Cargo stream
+    # while preserving its complete build environment, including linker flags.
     python3 "$SCRIPT_DIR/cargo-android-json.py" \
       --messages "$BUILD_MESSAGES" --targets "${TARGETS[@]}" -- \
       build -p matrix-rtc-ffi --locked --profile "$PROFILE" "${FEATURE_ARGS[@]}"
