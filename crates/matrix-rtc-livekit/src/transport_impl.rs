@@ -60,6 +60,7 @@ use matrix_rtc_transport::{
     TransportError, VideoDetail, VideoFrame, VideoRotation,
 };
 
+use crate::local_publication::LocalPublicationMute;
 use crate::session::LiveKitSession;
 use crate::{
     LiveKitTarget, LiveKitTransportConfig, SfuToken, acquire_token, e2ee_room_options,
@@ -645,7 +646,7 @@ impl TransportConnection for LiveKitTransportConnection {
             kind,
             source,
             published: Mutex::new(None),
-            muted: AtomicBool::new(options.muted),
+            mute: LocalPublicationMute::new(options.muted, apply_track_mute),
             closed: AtomicBool::new(false),
             retraction_failed: AtomicBool::new(false),
         });
@@ -796,9 +797,9 @@ struct LiveKitLocalTrack {
     /// The track published now and the session it is on, kept so it can be
     /// muted and retracted; `None` before the first connect. The room never
     /// holds this wrapper, so no cycle.
-    published: Mutex<Option<(LocalTrack, Arc<LiveKitSession>)>>,
-    /// The mute the transport was last told: applied to every room.
-    muted: AtomicBool,
+    published: Mutex<Option<(Arc<LocalTrack>, Arc<LiveKitSession>)>>,
+    /// Mute intent shared by pending and live versions of the publication.
+    mute: LocalPublicationMute<LocalTrack>,
     /// Set once `unpublish` succeeds — not before: a failed retraction
     /// leaves the publication live at the SFU, and the handle must stay
     /// usable to feed, mute, and retry it. Captures landing in the source
@@ -822,7 +823,6 @@ impl LiveKitLocalTrack {
     /// same request. Muting once the publish resolved would leave a window
     /// with a live unmuted track at the SFU — a hot mic.
     async fn publish_on(&self, session: &Arc<LiveKitSession>) -> Result<(), TransportError> {
-        let muted = self.muted.load(Ordering::Acquire);
         let source_kind = livekit_track_source(self.kind);
         let (track, options) = match &self.source {
             LocalSource::Audio(source) => {
@@ -830,9 +830,6 @@ impl LiveKitLocalTrack {
                     "audio",
                     RtcAudioSource::Native(source.clone()),
                 );
-                if muted {
-                    track.mute();
-                }
                 (
                     LocalTrack::Audio(track),
                     TrackPublishOptions {
@@ -846,9 +843,6 @@ impl LiveKitLocalTrack {
                     "video",
                     RtcVideoSource::Native(source.clone()),
                 );
-                if muted {
-                    track.mute();
-                }
                 (
                     LocalTrack::Video(track),
                     TrackPublishOptions {
@@ -859,12 +853,29 @@ impl LiveKitLocalTrack {
                 )
             }
         };
-        session
-            .room()
-            .local_participant()
-            .publish_track(track.clone(), options)
-            .await
-            .map_err(|error| TransportError::Connect(error.to_string()))?;
+        let track = self
+            .mute
+            .publish(
+                track,
+                |track| async move {
+                    session
+                        .room()
+                        .local_participant()
+                        .publish_track((*track).clone(), options)
+                        .await
+                        .map_err(|error| TransportError::Connect(error.to_string()))
+                },
+                |publication, muted| {
+                    // Listeners are installed after AddTrackRequest is acknowledged.
+                    // Reassert even when the local track already has the right state.
+                    if muted {
+                        publication.mute();
+                    } else {
+                        publication.unmute();
+                    }
+                },
+            )
+            .await?;
         *self.published.lock().expect("published mutex poisoned") =
             Some((track, Arc::clone(session)));
         Ok(())
@@ -875,7 +886,17 @@ impl LiveKitLocalTrack {
             .lock()
             .expect("published mutex poisoned")
             .as_ref()
-            .map(|(track, _)| track.clone())
+            .map(|(track, _)| track.as_ref().clone())
+    }
+}
+
+fn apply_track_mute(track: &LocalTrack, muted: bool) {
+    if muted {
+        track.mute();
+        track.disable();
+    } else {
+        track.unmute();
+        track.enable();
     }
 }
 
@@ -887,14 +908,7 @@ impl LocalTrackHandle for LiveKitLocalTrack {
 
     /// Held for the rooms it is published on later, too.
     fn set_muted(&self, muted: bool) -> Result<(), TransportError> {
-        self.muted.store(muted, Ordering::Release);
-        match (self.current_track(), muted) {
-            (Some(LocalTrack::Audio(track)), true) => track.mute(),
-            (Some(LocalTrack::Audio(track)), false) => track.unmute(),
-            (Some(LocalTrack::Video(track)), true) => track.mute(),
-            (Some(LocalTrack::Video(track)), false) => track.unmute(),
-            (None, _) => {}
-        }
+        self.mute.set_muted(muted);
         Ok(())
     }
 

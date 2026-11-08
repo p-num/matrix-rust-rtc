@@ -35,6 +35,7 @@ pub use matrix_rtc_transport::livekit::identity;
 pub use matrix_rtc_transport::livekit::{LiveKitTarget, LiveKitTransportConfig, identity_mapper};
 
 pub mod keys;
+mod local_publication;
 // Audio helpers. Recording a subscribed track and writing WAVs is shipped API
 // (the recording-bot use case); the synthetic-tone generator and frequency
 // detector inside are test utilities gated on `cfg(test)`/the `testing` feature.
