@@ -1099,11 +1099,18 @@ impl MediaPool {
         let key = key.to_owned();
         rt::spawn(async move {
             let result = backend.connect(&key, &ctx).await;
-            let _ = messages.send(PoolMessage(Message::ConnectFinished {
+            if let Err(message) = messages.send(PoolMessage(Message::ConnectFinished {
                 connection_key: key,
                 attempt,
                 result,
-            }));
+            })) && let Message::ConnectFinished {
+                result: Ok((connection, _)),
+                ..
+            } = message.0.0
+                && let Err(error) = connection.close().await
+            {
+                log::debug!("closing an abandoned peer connection failed: {error}");
+            }
         });
     }
 
@@ -1503,7 +1510,13 @@ impl MediaPool {
         let messages = self.messages_tx.clone();
         rt::spawn(async move {
             let result = connection.reconnect(fresh_token).await;
-            let _ = messages.send(PoolMessage(Message::OwnConnectFinished { attempt, result }));
+            if messages
+                .send(PoolMessage(Message::OwnConnectFinished { attempt, result }))
+                .is_err()
+                && let Err(error) = connection.close().await
+            {
+                log::debug!("closing an abandoned own connection failed: {error}");
+            }
         });
     }
 

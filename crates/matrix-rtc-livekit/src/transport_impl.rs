@@ -60,6 +60,7 @@ use matrix_rtc_transport::{
     TransportError, VideoDetail, VideoFrame, VideoRotation,
 };
 
+use crate::local_publication::LocalPublicationMute;
 use crate::session::LiveKitSession;
 use crate::{
     LiveKitTarget, LiveKitTransportConfig, SfuToken, acquire_token, e2ee_room_options,
@@ -194,7 +195,7 @@ impl OwnFocusTransport for LiveKitMediaTransport {
                     config: Mutex::new(config),
                     token: Mutex::new(None),
                 },
-                installs: Mutex::new(0),
+                installs: Mutex::new(Some(0)),
             }),
         }
     }
@@ -277,9 +278,9 @@ struct ConnectionShared {
     /// room. Weak: an unpublished or dropped one simply goes.
     local_tracks: Mutex<Vec<Weak<LiveKitLocalTrack>>>,
     connector: Connector,
-    /// Bumped by every take-over, under which a connected room is installed:
-    /// a reconnect that started before one is abandoned (034 R25).
-    installs: Mutex<u64>,
+    /// Bumped by every take-over; `None` after close. Earlier reconnects
+    /// cannot install a room, and a closed handle cannot start another.
+    installs: Mutex<Option<u64>>,
 }
 
 /// What [`TransportConnection::hand_over`] gives: the connected room and how
@@ -465,12 +466,35 @@ impl TransportConnection for LiveKitTransportConnection {
         fresh_token: bool,
     ) -> Result<UnboundedReceiver<ConnectionEvent>, TransportError> {
         let connector = &self.shared.connector;
-        let started = *self
+        let (started, mut sessions) = {
+            let installs = self
+                .shared
+                .installs
+                .lock()
+                .expect("installs mutex poisoned");
+            let started = installs
+                .as_ref()
+                .copied()
+                .ok_or_else(|| TransportError::Closed("connection was closed".into()))?;
+            (started, self.shared.session.subscribe())
+        };
+        let token = tokio::select! {
+            result = connector.token(fresh_token) => result?,
+            _ = sessions.changed() => return Err(TransportError::Closed(
+                "abandoned: the handle changed while fetching its token".into(),
+            )),
+        };
+        if *self
             .shared
             .installs
             .lock()
-            .expect("installs mutex poisoned");
-        let token = connector.token(fresh_token).await?;
+            .expect("installs mutex poisoned")
+            != Some(started)
+        {
+            return Err(TransportError::Closed(
+                "abandoned: the handle changed while fetching its token".into(),
+            ));
+        }
         let connection = LiveKitSession::connect_with_options(
             &token,
             e2ee_room_options(
@@ -488,11 +512,11 @@ impl TransportConnection for LiveKitTransportConnection {
                 .installs
                 .lock()
                 .expect("installs mutex poisoned");
-            if *installs != started {
+            if *installs != Some(started) {
                 drop(installs);
                 close_room(session);
                 return Err(TransportError::Closed(
-                    "abandoned: the handle took another connection over".into(),
+                    "abandoned: the handle changed while connecting".into(),
                 ));
             }
             self.shared.session.send_replace(Some(session.clone()))
@@ -554,7 +578,10 @@ impl TransportConnection for LiveKitTransportConnection {
                 .installs
                 .lock()
                 .expect("installs mutex poisoned");
-            *installs += 1;
+            let generation = installs
+                .as_mut()
+                .ok_or_else(|| TransportError::Closed("connection was closed".into()))?;
+            *generation += 1;
             let connector = &self.shared.connector;
             *connector.config.lock().expect("config mutex poisoned") = config;
             *connector.token.lock().expect("token mutex poisoned") = token;
@@ -619,7 +646,7 @@ impl TransportConnection for LiveKitTransportConnection {
             kind,
             source,
             published: Mutex::new(None),
-            muted: AtomicBool::new(options.muted),
+            mute: LocalPublicationMute::new(options.muted, apply_track_mute),
             closed: AtomicBool::new(false),
             retraction_failed: AtomicBool::new(false),
         });
@@ -716,7 +743,16 @@ impl TransportConnection for LiveKitTransportConnection {
     /// the postcondition callers want ("this connection is not open") already
     /// holds, so reporting a failure only makes a clean hangup look broken.
     async fn close(&self) -> Result<(), TransportError> {
-        let Some(session) = self.current_session() else {
+        let session = {
+            let mut installs = self
+                .shared
+                .installs
+                .lock()
+                .expect("installs mutex poisoned");
+            *installs = None;
+            self.shared.session.send_replace(None)
+        };
+        let Some(session) = session else {
             return Ok(());
         };
         match session.room().close().await {
@@ -761,9 +797,9 @@ struct LiveKitLocalTrack {
     /// The track published now and the session it is on, kept so it can be
     /// muted and retracted; `None` before the first connect. The room never
     /// holds this wrapper, so no cycle.
-    published: Mutex<Option<(LocalTrack, Arc<LiveKitSession>)>>,
-    /// The mute the transport was last told: applied to every room.
-    muted: AtomicBool,
+    published: Mutex<Option<(Arc<LocalTrack>, Arc<LiveKitSession>)>>,
+    /// Mute intent shared by pending and live versions of the publication.
+    mute: LocalPublicationMute<LocalTrack>,
     /// Set once `unpublish` succeeds — not before: a failed retraction
     /// leaves the publication live at the SFU, and the handle must stay
     /// usable to feed, mute, and retry it. Captures landing in the source
@@ -787,7 +823,6 @@ impl LiveKitLocalTrack {
     /// same request. Muting once the publish resolved would leave a window
     /// with a live unmuted track at the SFU — a hot mic.
     async fn publish_on(&self, session: &Arc<LiveKitSession>) -> Result<(), TransportError> {
-        let muted = self.muted.load(Ordering::Acquire);
         let source_kind = livekit_track_source(self.kind);
         let (track, options) = match &self.source {
             LocalSource::Audio(source) => {
@@ -795,9 +830,6 @@ impl LiveKitLocalTrack {
                     "audio",
                     RtcAudioSource::Native(source.clone()),
                 );
-                if muted {
-                    track.mute();
-                }
                 (
                     LocalTrack::Audio(track),
                     TrackPublishOptions {
@@ -811,9 +843,6 @@ impl LiveKitLocalTrack {
                     "video",
                     RtcVideoSource::Native(source.clone()),
                 );
-                if muted {
-                    track.mute();
-                }
                 (
                     LocalTrack::Video(track),
                     TrackPublishOptions {
@@ -824,12 +853,29 @@ impl LiveKitLocalTrack {
                 )
             }
         };
-        session
-            .room()
-            .local_participant()
-            .publish_track(track.clone(), options)
-            .await
-            .map_err(|error| TransportError::Connect(error.to_string()))?;
+        let track = self
+            .mute
+            .publish(
+                track,
+                |track| async move {
+                    session
+                        .room()
+                        .local_participant()
+                        .publish_track((*track).clone(), options)
+                        .await
+                        .map_err(|error| TransportError::Connect(error.to_string()))
+                },
+                |publication, muted| {
+                    // Listeners are installed after AddTrackRequest is acknowledged.
+                    // Reassert even when the local track already has the right state.
+                    if muted {
+                        publication.mute();
+                    } else {
+                        publication.unmute();
+                    }
+                },
+            )
+            .await?;
         *self.published.lock().expect("published mutex poisoned") =
             Some((track, Arc::clone(session)));
         Ok(())
@@ -840,7 +886,17 @@ impl LiveKitLocalTrack {
             .lock()
             .expect("published mutex poisoned")
             .as_ref()
-            .map(|(track, _)| track.clone())
+            .map(|(track, _)| track.as_ref().clone())
+    }
+}
+
+fn apply_track_mute(track: &LocalTrack, muted: bool) {
+    if muted {
+        track.mute();
+        track.disable();
+    } else {
+        track.unmute();
+        track.enable();
     }
 }
 
@@ -852,14 +908,7 @@ impl LocalTrackHandle for LiveKitLocalTrack {
 
     /// Held for the rooms it is published on later, too.
     fn set_muted(&self, muted: bool) -> Result<(), TransportError> {
-        self.muted.store(muted, Ordering::Release);
-        match (self.current_track(), muted) {
-            (Some(LocalTrack::Audio(track)), true) => track.mute(),
-            (Some(LocalTrack::Audio(track)), false) => track.unmute(),
-            (Some(LocalTrack::Video(track)), true) => track.mute(),
-            (Some(LocalTrack::Video(track)), false) => track.unmute(),
-            (None, _) => {}
-        }
+        self.mute.set_muted(muted);
         Ok(())
     }
 
@@ -1401,6 +1450,71 @@ fn copy_plane(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn prepared_connection(url: &str) -> LiveKitTransportConnection {
+        let transport = LiveKitMediaTransport::new(
+            reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            Arc::new(matrix_rtc_core::testing::MockBackend::new()),
+            crate::Msc4195KeyProviders::new(),
+        );
+        transport.prepare_own(
+            url,
+            &ConnectionContext {
+                room_id: "!room:example.org".into(),
+                slot_id: "m.call#room".into(),
+                member: matrix_rtc_transport::OwnMemberClaims {
+                    member_id: "member-1".into(),
+                    user_id: "@alice:example.org".into(),
+                    device_id: "DEVICE".into(),
+                },
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn closing_a_prepared_handle_prevents_its_first_connect() {
+        let prepared = prepared_connection("http://127.0.0.1:9");
+        let worker = prepared.clone();
+        prepared.close().await.unwrap();
+        let error = worker.reconnect(false).await.expect_err("closed handle");
+        assert!(matches!(error, TransportError::Closed(_)), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn closing_a_handle_cancels_its_stalled_token_request() {
+        use tokio::{io::AsyncReadExt, net::TcpListener, sync::oneshot, time::timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let prepared = prepared_connection(&format!("http://{}", listener.local_addr().unwrap()));
+        let (requested, request_received) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            requested.send(()).unwrap();
+            // The JWT service accepted the request but has not answered it.
+            std::future::pending::<()>().await;
+        });
+        let worker = prepared.clone();
+        let connecting = tokio::spawn(async move { worker.reconnect(false).await });
+        timeout(std::time::Duration::from_secs(2), request_received)
+            .await
+            .expect("token request reached the service")
+            .unwrap();
+
+        prepared.close().await.unwrap();
+        let result = timeout(std::time::Duration::from_secs(1), connecting).await;
+        server.abort();
+        let error = result
+            .expect("close cancels the token wait without waiting for the service")
+            .unwrap()
+            .expect_err("closed handle");
+        assert!(matches!(error, TransportError::Closed(_)), "{error:?}");
+    }
 
     fn signal_client_error(status: u16) -> crate::Error {
         crate::Error::Room(livekit::RoomError::Engine(
