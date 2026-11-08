@@ -3,6 +3,18 @@
 This release repairs two independently reproduced transport lifecycle failures.
 The public call protocol and FFI interfaces are unchanged.
 
+The package rehearsal also exposed an Android assembly defect: a broad cache
+search selected Java classes from WebRTC `51ef663` while the native library
+linked `a545de4`. The native binary references `livekit.org.jni_zero.JniZero`,
+which that older JAR does not contain. The Android packager now follows the
+active `webrtc-sys` package's Cargo linker records and requires matching Java
+payloads for every requested ABI. Eleven local selection regressions cover stale
+caches, missing or ambiguous inputs, wrong targets and incompatible ABI payloads.
+Two further integration tests use the actual Android Rust target and NDK,
+including fresh/cached builds and an intentional compiler failure. They verify
+that Cargo records survive the build boundary; `cargo-ndk` normally consumes them,
+so the packager uses its official `ndk-env` interface and runs Cargo directly.
+
 | Failure | Evidence | Repair |
 | --- | --- | --- |
 | Cancelled call joins after delayed authorization resumes | Core `.1` consumer APK `f2cadf0c2ad86c199b08270db982b75a261e140ad9e645184cfaed2bbb66d86d` clears its UI and membership, then creates an orphan SFU session. The cancellation repair keeps zero SFU participants for 90 seconds after authorization resumes; a separate replacement replay keeps only the new session, unchanged for 90 seconds. | Close abandoned connector results, drain completed connections during shutdown and make a closed prepared handle terminal. |
@@ -32,6 +44,8 @@ cargo check --all --jobs 2
 cargo fmt --all -- --check
 CARGO_BUILD_JOBS=2 make clippy
 cargo test --all --jobs 2 -- --test-threads=2
+python3 scripts/test_select_webrtc_jar.py
+python3 scripts/test_android_cargo_metadata.py
 ```
 
 The earlier `.2` binary was a local acceptance candidate, never a published

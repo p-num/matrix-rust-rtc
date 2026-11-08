@@ -200,12 +200,16 @@ if [ "$DO_BUILD" = "1" ]; then
     echo "Ensuring Rust targets are installed..."
     rustup target add "${TARGETS[@]}"
 
-    NDK_TARGET_ARGS=()
-    for t in "${TARGETS[@]}"; do NDK_TARGET_ARGS+=(-t "$t"); done
-
     echo "Building native libraries with cargo-ndk..."
-    cargo ndk "${NDK_TARGET_ARGS[@]}" \
-      build -p matrix-rtc-ffi --profile "$PROFILE" "${FEATURE_ARGS[@]}"
+    # Cargo replays build-script records even for fresh dependencies. Preserve
+    # their exact linker paths instead of guessing which cached WebRTC is live.
+    BUILD_MESSAGES="$PROJECT_ROOT/target/android-aar-build-messages.jsonl"
+    mkdir -p "$PROJECT_ROOT/target"
+    # cargo-ndk consumes these records itself. Use its official environment
+    # command and run Cargo directly so the linker metadata remains available.
+    python3 "$SCRIPT_DIR/cargo-android-json.py" \
+      --messages "$BUILD_MESSAGES" --targets "${TARGETS[@]}" -- \
+      build -p matrix-rtc-ffi --locked --profile "$PROFILE" "${FEATURE_ARGS[@]}"
 
     # Copy only our library into jniLibs (cargo-ndk's -o would copy every .so
     # in the target dir), one ABI directory per target.
@@ -281,36 +285,9 @@ fi
 
 # ---- libwebrtc.jar ----------------------------------------------------------
 # libwebrtc's Java classes: the native library up-calls into them, so the
-# media AAR must ship the jar (it is architecture-independent). Where
-# webrtc-sys leaves it depends on how it was built:
-#   1. our target dir       — only when webrtc-sys is a path dep (livekit's
-#                             own workspace layout; its get_output_path()
-#                             assumes CARGO_MANIFEST_DIR/../target),
-#   2. the cargo registry   — where that broken relative path actually lands
-#                             for a crates.io build,
-#   3. the downloaded libwebrtc bundle (scratch dir) — always present, the
-#                             file the build copied from in the first place.
-find_webrtc_jar() {
-    candidate="$(ls "$PROJECT_ROOT"/target/*-linux-android*/"$PROFILE_DIR"/libwebrtc.jar 2>/dev/null | head -1)"
-    if [ -n "$candidate" ]; then
-        printf '%s\n' "$candidate"
-        return 0
-    fi
-    cargo_home="${CARGO_HOME:-$HOME/.cargo}"
-    candidate="$(find "$cargo_home/registry/src" -maxdepth 6 \
-        -path '*/target/*-linux-android*/*/libwebrtc.jar' 2>/dev/null | head -1)"
-    if [ -n "$candidate" ]; then
-        printf '%s\n' "$candidate"
-        return 0
-    fi
-    candidate="$(find "$PROJECT_ROOT/target" -path '*livekit_webrtc*' \
-        -name 'libwebrtc.jar' 2>/dev/null | head -1)"
-    if [ -n "$candidate" ]; then
-        printf '%s\n' "$candidate"
-        return 0
-    fi
-    return 1
-}
+# media AAR must ship the jar from the same bundle as the linked libwebrtc.a.
+# A global cache search can silently select another WebRTC revision. Resolve
+# Cargo's actual webrtc-sys package and compare Java payloads across all ABIs.
 
 mkdir -p "$MODULE_LIBS_DIR"
 if [ "$DO_BUILD" = "1" ]; then
@@ -318,15 +295,13 @@ if [ "$DO_BUILD" = "1" ]; then
     # doesn't ship a stale jar.
     rm -f "$MODULE_LIBS_DIR/libwebrtc.jar"
     if [ "${MEDIA:-0}" = "1" ]; then
-        if WEBRTC_JAR="$(find_webrtc_jar)"; then
-            echo "Bundling libwebrtc.jar into the module (from $WEBRTC_JAR)..."
-            cp "$WEBRTC_JAR" "$MODULE_LIBS_DIR/libwebrtc.jar"
-        else
-            echo "❌ MEDIA=1 but libwebrtc.jar was not found in the project target"
-            echo "   dir, the cargo registry, or the libwebrtc download directory."
-            echo "   Look for it manually: find ~/.cargo target -name libwebrtc.jar"
-            exit 1
-        fi
+        WEBRTC_PACKAGE_ID="$(cargo pkgid --locked -p webrtc-sys)"
+        WEBRTC_JAR="$(python3 "$SCRIPT_DIR/select-webrtc-jar.py" \
+            --messages "$BUILD_MESSAGES" --package-id "$WEBRTC_PACKAGE_ID" \
+            --target-dir "$PROJECT_ROOT/target" --profile-dir "$PROFILE_DIR" \
+            --targets "${TARGETS[@]}")"
+        echo "Bundling libwebrtc.jar into the module (from $WEBRTC_JAR)..."
+        cp "$WEBRTC_JAR" "$MODULE_LIBS_DIR/libwebrtc.jar"
     fi
 elif [ "${MEDIA:-0}" = "1" ] && [ ! -f "$MODULE_LIBS_DIR/libwebrtc.jar" ]; then
     echo "❌ MEDIA=1 --skip-build but $MODULE_LIBS_DIR/libwebrtc.jar is missing."

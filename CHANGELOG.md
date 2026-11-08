@@ -14,6 +14,7 @@ log only.
 
 - Close late SFU connections after call shutdown, including token requests that finish after the media task exits (p-num/element-x-android#156).
 - Apply mute changes while a local track is being published, so an enabled camera cannot remain muted at the SFU (p-num/element-x-android#155).
+- Bundle the WebRTC Java classes from the native library's actual linker input instead of another cached revision (p-num/element-x-android#155).
 
 ## v0.5.0-rc.9-letro.1 - 2026-11-05
 
