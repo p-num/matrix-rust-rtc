@@ -366,6 +366,47 @@ specific to it:
 - Use an **encrypted** room. The core discards a media key that arrived in the
   clear, as MSC4143 requires.
 
+## Membership identity metadata
+
+`JoinedMembership.membershipTs` is an optional unsigned 64-bit join timestamp
+in milliseconds since the Unix epoch (`UInt64?` in Swift, `ULong?` in Kotlin).
+Both room and call membership subscriptions expose it alongside `identityKind`,
+the closed `FfiMembershipIdentityKind` enum:
+
+| Rust variant | Swift case | Kotlin entry | Identity inputs |
+| --- | --- | --- | --- |
+| `PerJoinMemberId` | `.perJoinMemberId` | `PER_JOIN_MEMBER_ID` | In MSC rooms, `memberId` is fresh per join and stable across membership refreshes. |
+| `LegacyMembershipTimestamp` | `.legacyMembershipTimestamp` | `LEGACY_MEMBERSHIP_TIMESTAMP` | In room-state rooms, use `memberId` and the non-null `membershipTs` together; a device can reuse its member ID on a later join. |
+| `Unavailable` | `.unavailable` | `UNAVAILABLE` | In room-state rooms without a join timestamp, no supported per-join identity is available. |
+
+Scope any host-derived participation identity by room and slot. This metadata
+identifies one participation, not a whole room call. When `identityKind` is
+unavailable, leave correlation unavailable: do not guess from the member ID's
+shape, the latest `membershipEventId`, an event's `origin_server_ts`, or a
+locally observed time. Event IDs and origin timestamps move on refresh; the
+SDK never substitutes either for a missing `membershipTs`.
+
+For pre-sticky state memberships, the core carries the raw legacy `created_ts`,
+or that membership event's origin timestamp when the legacy field is absent.
+Expiry and focus ordering still use a separately clamped time, so a peer with a
+fast clock keeps its generation identity across refreshes without extending its
+membership lifetime. This legacy translation does not authorize a host fallback
+for a roster entry whose `membershipTs` is null.
+
+These fields carry existing protocol metadata and add no logging or telemetry.
+Hosts must apply their privacy policy before deriving or emitting an identity;
+the fields do not authorize logging raw room, user, device, or member IDs.
+Generated Swift/Kotlin and the native FFI binary must be rebuilt and distributed
+together: adding fields to a UniFFI record changes its serialized wire layout.
+The existing published binaries cannot supply these fields.
+
+The narrow contract checks are `cargo test -p matrix-rtc-ffi --jobs 2
+membership_identity`, `./scripts/test-membership-identity-swift.sh` on macOS,
+and `./gradlew :matrixrtc:testReleaseUnitTest --max-workers=2` in
+`mobile/android` after `./scripts/build-android-aar.sh` generates Kotlin.
+They cover MSC refresh/rejoin identity, the legacy timestamp pair, unavailable
+identity, and native codec roundtrips including the full unsigned timestamp range.
+
 ## Full Documentation
 
 See [PACKAGING.md](./PACKAGING.md) for complete documentation including:

@@ -206,6 +206,10 @@ struct Parsed<'a> {
     /// `origin_server_ts`. Taking the minimum is also what stops a peer with a
     /// fast clock from looking alive longer than it is.
     joined_at: u64,
+    /// The raw `created_ts`, or the event timestamp when that legacy field is
+    /// absent. Kept separate from the clamped expiry/focus time: a later event
+    /// must not move an identity supplied by a peer with a fast clock.
+    membership_ts: u64,
     /// `content["m.call.intent"]`, if stated.
     intent: Option<&'a Value>,
     /// `foci_preferred[0]`, verbatim.
@@ -258,16 +262,15 @@ pub fn translate_state_memberships(
             // `created_ts` rides along because this dialect's member id is
             // `{user}:{device}`, reused across joins: the timestamp is the only
             // thing that tells a rejoined session — which holds no keys — apart
-            // from the join we may already have served keys to. `joined_at` is
-            // pinned for the life of one join (a refresh keeps `created_ts` and
-            // the minimum with `origin_server_ts` does not move), so it changes
-            // exactly when the participation does.
+            // from the join we may already have served keys to. Preserve the
+            // raw generation timestamp here: clamping it to each refresh's
+            // origin timestamp would change identity while a fast clock catches up.
             let mut content = json!({
                 "slot_id": member.slot_id,
                 "msc4354_sticky_key": member.member_id,
                 "member": { "id": member.member_id, "membership": "join" },
                 "application": application,
-                "created_ts": member.joined_at,
+                "created_ts": member.membership_ts,
             });
 
             // The focus object goes through **verbatim**: `RawRtcTransport`
@@ -348,10 +351,11 @@ fn parse<'a>(event: &'a StateMemberEvent, now_ms: u64) -> Option<Parsed<'a>> {
     };
 
     // See `Parsed::joined_at` for why this is a minimum rather than a preference.
-    let joined_at = match object.get("created_ts").and_then(Value::as_u64) {
-        Some(created_ts) => created_ts.min(event.origin_server_ts),
-        None => event.origin_server_ts,
-    };
+    let membership_ts = object
+        .get("created_ts")
+        .and_then(Value::as_u64)
+        .unwrap_or(event.origin_server_ts);
+    let joined_at = membership_ts.min(event.origin_server_ts);
     let expires = object
         .get("expires")
         .and_then(Value::as_u64)
@@ -399,6 +403,7 @@ fn parse<'a>(event: &'a StateMemberEvent, now_ms: u64) -> Option<Parsed<'a>> {
         slot_id,
         application_type: application_type.to_owned(),
         joined_at,
+        membership_ts,
         intent: object.get("m.call.intent"),
         own_focus: object
             .get("foci_preferred")
@@ -882,6 +887,45 @@ mod tests {
         // origin_server_ts is old, so despite the future `created_ts` this is
         // judged from the server's stamp and has expired.
         assert!(translate_values(&[("a", 1_000, skewed)], NOW).is_empty());
+    }
+
+    #[test]
+    fn a_fast_clocks_raw_generation_timestamp_survives_refreshes() {
+        let created_ts = NOW + 60_000;
+        let content = join_with(&[("created_ts", json!(created_ts))]);
+        for origin_server_ts in [NOW, NOW + 1_000, created_ts + 1_000] {
+            let membership = translate_values(
+                &[("a", origin_server_ts, content.clone())],
+                origin_server_ts,
+            )
+            .pop()
+            .expect("a live membership at each refresh");
+            assert_eq!(membership.content["created_ts"], json!(created_ts));
+        }
+    }
+
+    #[test]
+    fn a_missing_generation_timestamp_uses_the_membership_events_origin() {
+        let origin_server_ts = NOW - 1_000;
+        let content = join_with(&[("created_ts", Value::Null)]);
+        for observed_at in [NOW, NOW + 500] {
+            let membership =
+                translate_values(&[("a", origin_server_ts, content.clone())], observed_at)
+                    .pop()
+                    .expect("a live membership at either observation time");
+            assert_eq!(membership.content["created_ts"], json!(origin_server_ts));
+        }
+    }
+
+    #[test]
+    fn a_raw_generation_timestamp_does_not_extend_the_clamped_expiry() {
+        let created_ts = NOW + 60_000;
+        let content = join_with(&[("created_ts", json!(created_ts)), ("expires", json!(1_000))]);
+        let live = translate_values(&[("a", NOW, content.clone())], NOW + 999)
+            .pop()
+            .expect("live immediately before server-based expiry");
+        assert_eq!(live.content["created_ts"], json!(created_ts));
+        assert!(translate_values(&[("a", NOW, content)], NOW + 1_000).is_empty());
     }
 
     #[test]

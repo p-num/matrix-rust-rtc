@@ -8,8 +8,13 @@ log only.
 
 ## Unreleased
 
+### Added
+
+- Native membership snapshots expose join timestamps and conservative per-participation identity metadata (p-num/element-x-ios#411).
+
 ### Fixed
 
+- Keep legacy generation timestamps stable across refreshes from peers with fast clocks (p-num/element-x-ios#411).
 - Forward Letro membership intent through explicit join intent resolution (element-hq/matrix-rust-rtc#64).
 
 ## v0.5.0-rc.11 - 2026-11-10

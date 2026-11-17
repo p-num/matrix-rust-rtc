@@ -1,10 +1,14 @@
 # Android Integration Tests
 
-This directory will contain integration tests for Kotlin bindings once they're generated.
+`MembershipIdentityBindingTest` checks the generated membership DTO and buffer
+codec for every identity kind, including zero and maximum unsigned timestamps.
+Run `./scripts/build-android-aar.sh` from the repository root first to generate
+the Kotlin bindings, then run `./gradlew :matrixrtc:testReleaseUnitTest
+--max-workers=2` from `mobile/android`.
 
 ## Test Structure
 
-When the build script generates Kotlin bindings to `src/main/java`, add corresponding tests here:
+Binding tests compile against generated Kotlin under `src/main/java`:
 
 ```kotlin
 import org.junit.Test
