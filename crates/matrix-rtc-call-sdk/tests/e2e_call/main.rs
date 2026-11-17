@@ -28,7 +28,8 @@
 //!
 //! - [`Scenario`] — the media topology: both on one SFU (`single_focus`),
 //!   each on their own (`two_foci`, MSC4195 multi-SFU), or one peer redialling
-//!   while the other stays (`rejoin`).
+//!   while the other stays (`rejoin`), or the camera published as H.264
+//!   (`h264_video`).
 //! - [`MembershipFormat`] — the wire dialect both peers speak: spec-current
 //!   (`msc`) or pre-sticky room state (`room_state`). In `room_state` step 4 is skipped (that
 //!   generation has no slot concept) and membership is
@@ -67,13 +68,15 @@ use matrix_sdk_ui::sync_service::SyncService;
 
 use matrix_rtc_call::{CallEnd, CallStatus};
 use matrix_rtc_call_sdk::{CallEvent, Participant as MediaParticipant};
-use matrix_rtc_call_sdk::{LiveKitCall, LiveKitCallOptions, close_slot, open_slot};
+use matrix_rtc_call_sdk::{
+    LiveKitCall, LiveKitCallOptions, close_slot, open_slot, supported_video_codecs,
+};
 use matrix_rtc_core::compat::MembershipFormat;
 use matrix_rtc_core::{LiveKitTransport, SlotEncryption};
 use matrix_rtc_livekit::media;
 use matrix_rtc_transport::{
-    I420Buffer, MediaConstraints, MediaStreamKind, PublishOptions, VideoFrame, VideoRotation,
-    VideoSourceConfig,
+    I420Buffer, MediaConstraints, MediaStreamKind, PublishOptions, VideoCodecPreference,
+    VideoEncodingLimits, VideoFrame, VideoRotation, VideoSourceConfig,
 };
 
 use provision::Credentials;
@@ -97,6 +100,10 @@ struct Participant {
 
 struct Config {
     homeserver: String,
+    /// The second homeserver, federated with the first. In MSC a publisher's
+    /// tokens come from its own homeserver, which mints them for one SFU only,
+    /// so a publisher on the second SFU lives here.
+    homeserver_2: String,
     slot_id: String,
     livekit_service_url: String,
     /// Second focus (authorisation service of SFU 2), used by the two-foci
@@ -107,6 +114,8 @@ struct Config {
     /// stack's Synapse proxies to the first lk-jwt-service. Must equal that
     /// service's `LIVEKIT_URL`, which the homeserver checks the request against.
     sfu_url: String,
+    /// The second SFU's WebSocket URL, its tokens from the second homeserver.
+    sfu_url_2: String,
     insecure_tls: bool,
 }
 
@@ -117,6 +126,8 @@ impl Config {
         Config {
             homeserver: env::var("HOMESERVER_URL")
                 .unwrap_or_else(|_| "http://localhost:8008".to_owned()),
+            homeserver_2: env::var("HOMESERVER_URL_2")
+                .unwrap_or_else(|_| "http://localhost:8009".to_owned()),
             slot_id: env::var("SLOT_ID").unwrap_or_else(|_| "m.call#room".to_owned()),
             livekit_service_url: env::var("LIVEKIT_SERVICE_URL")
                 .unwrap_or_else(|_| "http://localhost:6080".to_owned()),
@@ -124,22 +135,46 @@ impl Config {
                 .unwrap_or_else(|_| "http://localhost:6081".to_owned()),
             sfu_url: env::var("LIVEKIT_SFU_URL")
                 .unwrap_or_else(|_| "ws://localhost:7880".to_owned()),
+            sfu_url_2: env::var("LIVEKIT_SFU_URL_2")
+                .unwrap_or_else(|_| "ws://localhost:7890".to_owned()),
             insecure_tls: env::var("INSECURE_TLS").is_ok(),
         }
     }
 }
 
-/// Which transports the participants publish on, and so how each gets its
-/// LiveKit tokens and which identity it holds.
+/// Which of the stack's two SFUs a participant publishes on.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Auth {
-    /// Every focus named by its JWT service: `/sfu/get`, `{user}:{device}`.
-    Service,
-    /// Alice's focus named by its SFU `url` alone: the homeserver's MSC4195
-    /// `get_token`, `hash([sender, member.id])`. Bob's too in a single-focus
-    /// run; in a two-foci one he stays on the second focus's JWT service, so
-    /// each side subscribes through the other's flow.
-    Sfu,
+enum Sfu {
+    First,
+    Second,
+}
+
+impl Config {
+    /// The transport a participant publishes on: in MSC the SFU's `url`, its
+    /// tokens from the homeserver's MSC4195 `get_token` under
+    /// `hash([sender, member.id])`; in room-state the SFU's JWT service,
+    /// `/sfu/get` under `{user}:{device}` (spec 038 R17, R19).
+    fn transport(&self, format: MembershipFormat, sfu: Sfu) -> LiveKitTransport {
+        match (format, sfu) {
+            (MembershipFormat::Msc, Sfu::First) => LiveKitTransport::sfu(self.sfu_url.clone()),
+            (MembershipFormat::Msc, Sfu::Second) => LiveKitTransport::sfu(self.sfu_url_2.clone()),
+            (MembershipFormat::RoomState, Sfu::First) => {
+                LiveKitTransport::service(self.livekit_service_url.clone())
+            }
+            (MembershipFormat::RoomState, Sfu::Second) => {
+                LiveKitTransport::service(self.livekit_service_url_2.clone())
+            }
+        }
+    }
+
+    /// The homeserver a publisher on `sfu` lives on: in MSC the one minting
+    /// that SFU's tokens, the first everywhere else.
+    fn homeserver_for(&self, format: MembershipFormat, sfu: Sfu) -> &str {
+        match (format, sfu) {
+            (MembershipFormat::Msc, Sfu::Second) => &self.homeserver_2,
+            _ => &self.homeserver,
+        }
+    }
 }
 
 /// Which media topology a run exercises.
@@ -180,39 +215,52 @@ enum Scenario {
     /// (`CallEnd::SlotClosed`), after which `LiveKitCall::leave` still
     /// succeeds. Not run in `RoomState`, which has no slots.
     SlotClosed,
+    /// Single focus, and alice's camera is published as H.264 with the SIP
+    /// bridge's caps (2.5 Mbit/s, 30 fps, simulcast): bob must decrypt and
+    /// decode it. Proves a non-default codec survives frame E2EE end to end.
+    H264Video,
 }
 
-async fn credentials(cfg: &Config) -> Result<(Credentials, Credentials), Box<dyn Error>> {
-    let [alice, bob] = credentials_for(cfg, ["alice", "bob"]).await?;
+/// Alice on the first homeserver, bob on `bob_homeserver`.
+async fn credentials(
+    cfg: &Config,
+    bob_homeserver: &str,
+) -> Result<(Credentials, Credentials), Box<dyn Error>> {
+    let [alice, bob] =
+        credentials_for(cfg, [("alice", &cfg.homeserver), ("bob", bob_homeserver)]).await?;
     Ok((alice, bob))
 }
 
-/// Use `ALICE`/`BOB`/... (+`_PW`) when every one of them is supplied
-/// (long-lived stacks with closed registration); otherwise register fresh
-/// throwaway users for this run.
+/// Each `(name, homeserver)`'s user: `ALICE`/`BOB`/... (+`_PW`) when every
+/// one of them is supplied (long-lived stacks with closed registration);
+/// otherwise fresh throwaway users registered for this run.
 async fn credentials_for<const N: usize>(
     cfg: &Config,
-    names: [&str; N],
+    names: [(&str, &str); N],
 ) -> Result<[Credentials; N], Box<dyn Error>> {
     let supplied: Vec<_> = names
         .iter()
-        .filter_map(|name| env::var(name.to_uppercase()).ok())
+        .filter_map(|(name, _)| env::var(name.to_uppercase()).ok())
         .collect();
     let mut users = Vec::with_capacity(N);
     if supplied.len() == N {
-        for (name, user) in names.iter().zip(supplied) {
+        for ((name, homeserver), user) in names.iter().zip(supplied) {
             let var = format!("{}_PW", name.to_uppercase());
             let password = env::var(&var)
                 .map_err(|_| format!("{} is set but {var} is not", name.to_uppercase()))?;
-            users.push(Credentials { user, password });
+            users.push(Credentials {
+                user,
+                password,
+                homeserver: (*homeserver).to_owned(),
+            });
         }
     } else {
         let http = reqwest::Client::builder()
             .danger_accept_invalid_certs(cfg.insecure_tls)
             .build()?;
         let suffix = provision::run_suffix();
-        for name in names {
-            users.push(provision::register_user(&http, &cfg.homeserver, name, &suffix).await?);
+        for (name, homeserver) in names {
+            users.push(provision::register_user(&http, homeserver, name, &suffix).await?);
         }
     }
     Ok(users
@@ -231,7 +279,7 @@ async fn credentials_for<const N: usize>(
 /// cross-signed-sender requirement holds at its (default) strictest.
 async fn login_and_sync(cfg: &Config, who: &Credentials) -> Result<SyncedClient, Box<dyn Error>> {
     let mut builder = Client::builder()
-        .homeserver_url(&cfg.homeserver)
+        .homeserver_url(&who.homeserver)
         .with_encryption_settings(EncryptionSettings {
             auto_enable_cross_signing: true,
             ..EncryptionSettings::default()
@@ -460,19 +508,16 @@ async fn wait_for_key(call: &LiveKitCall, peer_identity: &str, label: &str) -> b
 
 /// One `#[test]` per (scenario, compat) pair.
 macro_rules! e2e_tests {
-    ($($name:ident => ($scenario:ident, $compat:ident $(, $auth:ident)?),)*) => {$(
+    ($($name:ident => ($scenario:ident, $compat:ident),)*) => {$(
         #[test]
         #[ignore = "requires the demo/backend docker stack (make backend-up)"]
         fn $name() {
             harness(
                 Scenario::$scenario,
                 MembershipFormat::$compat,
-                e2e_tests!(@auth $($auth)?),
             );
         }
     )*};
-    (@auth) => { Auth::Service };
-    (@auth $auth:ident) => { Auth::$auth };
 }
 
 e2e_tests! {
@@ -483,8 +528,7 @@ e2e_tests! {
     e2e_call_rejoin_msc => (RejoinSameProcess, Msc),
     e2e_call_rejoin_room_state => (RejoinSameProcess, RoomState),
     e2e_call_slot_closed_msc => (SlotClosed, Msc),
-    e2e_call_single_focus_msc_sfu_url => (SingleFocus, Msc, Sfu),
-    e2e_call_two_foci_msc_sfu_url_and_service => (TwoFoci, Msc, Sfu),
+    e2e_call_h264_video_msc => (H264Video, Msc),
 }
 
 /// Process-wide one-time setup, safe to call from every test in this binary.
@@ -502,8 +546,8 @@ fn init_test_process() {
         .try_init();
 }
 
-fn harness(scenario: Scenario, compat: MembershipFormat, auth: Auth) {
-    run_to_completion(OVERALL_DEADLINE, |cfg| run(cfg, scenario, compat, auth));
+fn harness(scenario: Scenario, compat: MembershipFormat) {
+    run_to_completion(OVERALL_DEADLINE, |cfg| run(cfg, scenario, compat));
 }
 
 /// Run one end-to-end flow on a fresh runtime, panicking on failure or when
@@ -532,9 +576,15 @@ async fn run(
     cfg: Config,
     scenario: Scenario,
     compat: MembershipFormat,
-    auth: Auth,
 ) -> Result<(), Box<dyn Error>> {
-    let (alice_creds, bob_creds) = credentials(&cfg).await?;
+    let bob_sfu = match scenario {
+        Scenario::TwoFoci => Sfu::Second,
+        Scenario::SingleFocus
+        | Scenario::RejoinSameProcess
+        | Scenario::SlotClosed
+        | Scenario::H264Video => Sfu::First,
+    };
+    let (alice_creds, bob_creds) = credentials(&cfg, cfg.homeserver_for(compat, bob_sfu)).await?;
 
     // 1. Both clients log in and sync.
     let alice = login_and_sync(&cfg, &alice_creds).await?;
@@ -582,16 +632,8 @@ async fn run(
     //    connect, all through the facade). In two-foci mode each participant
     //    publishes on their own SFU; the engines then cross-connect to the
     //    peer's focus for subscribing (MSC4195 multi-SFU).
-    let alice_transport = match auth {
-        Auth::Service => LiveKitTransport::service(cfg.livekit_service_url.clone()),
-        Auth::Sfu => LiveKitTransport::sfu(cfg.sfu_url.clone()),
-    };
-    let bob_transport = match scenario {
-        Scenario::SingleFocus | Scenario::RejoinSameProcess | Scenario::SlotClosed => {
-            alice_transport.clone()
-        }
-        Scenario::TwoFoci => LiveKitTransport::service(cfg.livekit_service_url_2.clone()),
-    };
+    let alice_transport = cfg.transport(compat, Sfu::First);
+    let bob_transport = cfg.transport(compat, bob_sfu);
     // Kept so bob can redial on the same room handle after hanging up.
     let bob_room_again = bob_room.clone();
     let alice = join_call(
@@ -614,7 +656,7 @@ async fn run(
     };
     let identities_ok = minted(&alice.call, &alice_transport) && minted(&bob.call, &bob_transport);
     println!(
-        "[alice] identity {} ({auth:?}); [bob] identity {}",
+        "[alice] identity {} ({compat:?}); [bob] identity {}",
         alice.call.local_identity(),
         bob.call.local_identity()
     );
@@ -644,6 +686,25 @@ async fn run(
             true,
             true,
         ),
+        Scenario::H264Video => {
+            let tone_ok = record_and_verify_tone(&mut bob.call, "first-call").await?;
+            // Without an H.264 encoder the publish would quietly fall back to
+            // VP8 and the check below would prove nothing.
+            let codecs = supported_video_codecs();
+            if !codecs.contains(&VideoCodecPreference::H264) {
+                return Err(format!("this platform cannot encode H.264 (only {codecs:?})").into());
+            }
+            println!("[alice] publishing pattern video as H.264");
+            let options = PublishOptions::camera(PATTERN)
+                .with_video_codec(VideoCodecPreference::H264)
+                .with_video_encoding(VideoEncodingLimits {
+                    max_bitrate_bps: Some(2_500_000),
+                    max_framerate: Some(30),
+                });
+            _alice_video = Some(publish_pattern(&alice.call, options).await?);
+            let video_ok = verify_video_pattern(&bob.call, "bob").await?;
+            (tone_ok, true, video_ok, true)
+        }
         Scenario::TwoFoci => {
             println!("[bob] publishing 660 Hz tone");
             _bob_tone = Some(media::publish_tone(&bob.call.session(), 660.0).await?);
@@ -767,7 +828,7 @@ async fn run(
 
     println!("\n=== RESULT ===");
     println!("compat mode:                            {compat:?}");
-    println!("transports ({auth:?}) mint the identities:  {identities_ok}");
+    println!("transports ({compat:?}) mint the identities:  {identities_ok}");
     println!("membership discovered by alice:         {alice_sees}");
     println!("membership discovered by bob:           {bob_sees}");
     println!("alice's media key received by bob:      {alice_key_seen_by_bob}");
@@ -777,6 +838,9 @@ async fn run(
         println!("tone bob->alice received + verified:    {reverse_tone_ok}");
         println!("video pattern alice->bob verified:      {video_ok}");
         println!("constraints pause/resume verified:      {constraints_ok}");
+    }
+    if scenario == Scenario::H264Video {
+        println!("H.264 video pattern alice->bob verified: {video_ok}");
     }
     if scenario == Scenario::RejoinSameProcess {
         println!("alice's key received on bob's redial:   {rejoin_key_ok}");

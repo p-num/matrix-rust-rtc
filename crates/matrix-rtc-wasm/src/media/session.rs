@@ -35,18 +35,16 @@ use crate::WasmRtcCall;
 use crate::status::{WasmCallStatus, WasmSignallingHealth};
 use matrix_rtc_call::CallStatus;
 
-/// livekit-js's `ExternalE2EEKeyProvider` default `keyringSize`.
-const LIVEKIT_JS_DEFAULT_KEY_RING_SIZE: u16 = 16;
+/// The `keyringSize` the page's livekit-js key provider is built with
+/// (`web/src/matrix-rtc-call.mjs`): every MSC4143 key index, 0 to 255
+/// (spec 038 R38).
+const KEY_RING_SIZE: u16 = 256;
 
 /// Tuning for a media session. The call says the rest: its room, slot and
 /// `member.id`, the focus its join publishes on, and — through the backend —
 /// who we are.
 #[derive(Debug, Default, Deserialize)]
 struct WasmMediaSessionConfig {
-    /// livekit-js key-provider ring size, when configured away from its
-    /// default of 16 (`keyringSize`). Keys at or past it are rejected.
-    #[serde(default)]
-    key_ring_size: Option<u16>,
     /// Element Call compatibility generation this room was joined for:
     /// `"msc"` (default) or `"room_state"`; must match the mode the room
     /// was opened in. The participant identity and the token endpoint follow
@@ -118,7 +116,7 @@ impl WasmRtcCall {
     /// the own-focus livekit-js room. The `member.id` comes from the join —
     /// the page neither chooses nor passes it.
     ///
-    /// `config` is `{ key_ring_size?, format?, stability? }`, and may be
+    /// `config` is `{ format?, stability?, own_reconnect_budget_ms? }`, and may be
     /// omitted; the focus is the one the join publishes on, none for a
     /// receive-only call;
     /// `delegate` is the object driving livekit-js (see the module docs of
@@ -167,12 +165,7 @@ impl WasmRtcCall {
         let mapper = identity_mapper();
         // Frame encryption: livekit-js owns the key provider; the shared
         // handler forwards every signalled key into it through the delegate.
-        let ring = JsFrameKeyRing::new(
-            delegate.clone(),
-            config
-                .key_ring_size
-                .unwrap_or(LIVEKIT_JS_DEFAULT_KEY_RING_SIZE),
-        );
+        let ring = JsFrameKeyRing::new(delegate.clone(), KEY_RING_SIZE);
         // The ring and handler hold `JsValue`s, so they are `!Send` — shared
         // ownership on one thread. The `Arc`s are what the core's and the
         // engine's APIs take.
@@ -401,12 +394,30 @@ impl WasmMediaSession {
             .map_err(|err| JsError::new(&err.to_string()))
     }
 
+    /// Participants on an SFU whose membership we have not received, by
+    /// livekit-js identity (spec 038 R25): listed once unmapped for 10 s
+    /// while signalling is healthy, apart from `interruptions()`.
+    #[wasm_bindgen(js_name = unverifiedParticipants)]
+    pub fn unverified_participants(&self) -> Vec<String> {
+        self.engine.unverified_participants()
+    }
+
     /// Our own livekit-js participant identity: the MSC4195 hash when we
     /// publish on a transport naming only an SFU `url`, else the legacy
     /// `{user}:{device}` the JWT service's `/sfu/get` mints.
     #[wasm_bindgen(js_name = ownRtcIdentity)]
     pub fn own_rtc_identity(&self) -> String {
         self.own_identity.clone()
+    }
+
+    /// The connection key of the own-focus room, under which the delegate's
+    /// `connect` received it; `undefined` for a receive-only call. Opaque: it
+    /// identifies the token flow and its target, not just a URL.
+    #[wasm_bindgen(js_name = ownConnectionKey)]
+    pub fn own_connection_key(&self) -> Option<String> {
+        self.own_connection
+            .as_ref()
+            .map(|connection| connection.connection_key().to_owned())
     }
 
     /// End the media session while staying joined. After leaving it is not

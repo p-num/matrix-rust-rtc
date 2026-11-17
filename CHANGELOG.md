@@ -8,6 +8,56 @@ log only.
 
 ## Unreleased
 
+### Fixed
+
+- Forward Letro membership intent through explicit join intent resolution (element-hq/matrix-rust-rtc#64).
+
+## v0.5.0-rc.11 - 2026-11-10
+
+### Breaking
+
+- A join's `intent` is the user's explicit choice and wins over the call in progress; a join without one follows the call, so a room's call button passes none (030).
+
+### Added
+
+- A web delegate's room handle may implement `setWanted(identities)` to subscribe only to the participants the core asks for, as the bundled `matrix-rtc-call.mjs` now does with `autoSubscribe: false`.
+- `PublishOptions` takes a video codec and bitrate/framerate caps (`with_video_codec`, `with_video_encoding`), and `supported_video_codecs()` lists what this platform can encode; also on FFI.
+- Web: `MatrixRtcCall.ownRoom` is the own-focus livekit-js room to publish into, since `rooms` is keyed by opaque connection keys rather than focus URLs (`session.ownConnectionKey()`).
+
+### Fixed
+
+- A native subscriber resuming a paused video with a quality request gets that quality, instead of sometimes staying on the size it asked before the pause: each constraint change now reaches the SFU as one settings update.
+- Web: `joinCall({ transport: undefined })` takes the advertised transport like an omitted key, instead of rejecting the params; `mention_user_ids: undefined` likewise reads as none.
+- Each SFU connection subscribes only to the members it serves, so a peer reached through two token flows no longer arrives twice and our own media no longer comes back to us.
+
+## v0.5.0-rc.10 - 2026-11-09
+
+### Breaking
+
+- In the MSC format a member event is read exactly as MSC4143 states it: Element Call's 2025 sticky content and self-claimed devices are only read in the room-state format (038).
+- In an encrypted room a member is joined only if decryption names the device that sent their member event; `EventOrigin::Unknown` is removed (038).
+- A join whose slot id breaks MSC4143's grammar or 255-byte limit fails with `JoinError::InvalidSlotId`, and a member of another application is not joined to a slot (038).
+- MSC media keys go out as `io.element.call.encryption_keys` with exactly `room_id`, `member_id` and an unpadded `media_key`, and each room reads only its own format's key body (038).
+- An MSC room drops a media key shorter than 32 bytes (room-state rooms still take 16), and the web `connect` config no longer takes `keyRingSize` (038).
+- `ConnectionContext` carries `e2ee`, and the web delegate's `connect` request an `e2ee` flag that, not the page's `roomOptions.e2ee`, decides frame encryption (038).
+- In the MSC format a call publishes on the homeserver's first `m.livekit` transport, written `{type: "m.livekit", url}`, and counts a peer's media only on `m.livekit` with a `url`, every token coming from the homeserver; `transports::choose`/`resolve` and `transport_to_json` take the room's format (038).
+- A join on a homeserver advertising no LiveKit transport of the room's format fails with `JoinError::NoLiveKitTransport`, and a homeserver without MSC4195's `get_token` ends the call at once with the new loss reason `token_endpoint_unsupported` instead of retrying (038).
+- A participant on an SFU with no membership is no longer an interruption while signalling is healthy: after 10 s it is listed by the new `unverified_participants` (engine, FFI and web media sessions) (038).
+- In the MSC format, starting or ringing a call sends an MSC4075 `m.rtc.invite` (`slot_id`, `sender_ts`, `lifetime`, `m.mentions`, sticky key) without waiting for our membership, withdrawn when we leave alone or the slot closes; an invite targeting nobody is refused with `RtcError::InviteTargetsNobody`; room-state keeps today's notification (038).
+
+### Added
+
+- `msc_support` (core, `RtcClient`, FFI, web `mscSupport`) names what a homeserver lacks for the MSC format, from its `/versions` features (host helpers `server_features`/`serverFeatures`) and its transports, without choosing the format (038).
+- A join follows the call's voice/video intent from the memberships already in it and publishes it in ours; read it from `RtcCall::call_intent` to start the camera, and pass `intent` only to start a call (030).
+
+### Fixed
+
+- The matrix-js-sdk host sends the delayed leave as a sticky delayed event, so a crashed web client's membership ends when it fires; without SDK or server support it still joins without one (038).
+- A call in a room whose encryption is off sends no media keys and connects without frame encryption, natively and on the web (038).
+- On the web an unencrypted track in an encrypted call is refused whatever the page's options (038).
+- A call joined in the clear leaves with `slot_closed` when the room's encryption turns on, rather than staying unencrypted (038).
+- Every key index, 0 to 255, is usable natively and on the web; native dropped index 255 and the web anything past 15 (038).
+
 ## v0.5.0-rc.9-letro.2 - 2026-11-08
 
 ### Fixed

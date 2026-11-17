@@ -24,6 +24,31 @@ pub enum FfiJoinTransport {
     ReceiveOnly,
 }
 
+/// MSC4196 `m.call.intent`: a voice or a video call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiCallIntent {
+    Audio,
+    Video,
+}
+
+impl From<FfiCallIntent> for matrix_rtc_call::CallIntent {
+    fn from(value: FfiCallIntent) -> Self {
+        match value {
+            FfiCallIntent::Audio => Self::Audio,
+            FfiCallIntent::Video => Self::Video,
+        }
+    }
+}
+
+impl From<matrix_rtc_call::CallIntent> for FfiCallIntent {
+    fn from(value: matrix_rtc_call::CallIntent) -> Self {
+        match value {
+            matrix_rtc_call::CallIntent::Audio => Self::Audio,
+            matrix_rtc_call::CallIntent::Video => Self::Video,
+        }
+    }
+}
+
 /// FFI-friendly encryption configuration.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiEncryptionConfig {
@@ -166,6 +191,13 @@ pub struct FfiJoinSessionParams {
     /// Unset is enabled with Element Call's three-second window.
     #[uniffi(default = None)]
     pub reactions: Option<FfiReactionsConfig>,
+    /// The user's explicit voice or video choice: starting a call, or
+    /// answering a ring that said which. It wins over a call in progress.
+    /// Unset (a room's call button, which cannot know) follows the call, and
+    /// with no call to follow is video. Read the outcome from
+    /// [`crate::RtcCall::call_intent`].
+    #[uniffi(default = None)]
+    pub intent: Option<FfiCallIntent>,
 }
 
 /// FFI-friendly reactions configuration (mirrors
@@ -309,12 +341,13 @@ impl FfiJoinSessionParams {
             }
             FfiCallKind::Direct { ring } => ring.as_ref().and_then(|ring| ring.intent.clone()),
         });
-        if let Some(intent) = intent {
-            join.application.extra.insert(
-                "m.call.intent".to_owned(),
-                serde_json::Value::String(intent),
-            );
-        }
+        // The call layer settles and publishes intent at join; writing the
+        // membership extra directly would be overwritten by its default.
+        options.intent = self.intent.map(Into::into).or_else(|| {
+            intent
+                .as_deref()
+                .and_then(matrix_rtc_call::CallIntent::parse)
+        });
         options.kind = self.kind.into();
         options.reactions = self.reactions.map(Into::into);
         Ok(options)
