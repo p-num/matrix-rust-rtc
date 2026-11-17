@@ -386,12 +386,12 @@ shape, the latest `membershipEventId`, an event's `origin_server_ts`, or a
 locally observed time. Event IDs and origin timestamps move on refresh; the
 SDK never substitutes either for a missing `membershipTs`.
 
-For pre-sticky state memberships, the core carries the raw legacy `created_ts`,
-or that membership event's origin timestamp when the legacy field is absent.
+For pre-sticky state memberships, the core carries only an explicit raw legacy
+`created_ts`; a missing field leaves generation identity unavailable.
 Expiry and focus ordering still use a separately clamped time, so a peer with a
 fast clock keeps its generation identity across refreshes without extending its
-membership lifetime. This legacy translation does not authorize a host fallback
-for a roster entry whose `membershipTs` is null.
+membership lifetime. An event's origin timestamp can be an internal expiry/focus
+fallback, but never substitutes for a missing generation identity.
 
 These fields carry existing protocol metadata and add no logging or telemetry.
 Hosts must apply their privacy policy before deriving or emitting an identity;

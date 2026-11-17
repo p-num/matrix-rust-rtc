@@ -206,10 +206,9 @@ struct Parsed<'a> {
     /// `origin_server_ts`. Taking the minimum is also what stops a peer with a
     /// fast clock from looking alive longer than it is.
     joined_at: u64,
-    /// The raw `created_ts`, or the event timestamp when that legacy field is
-    /// absent. Kept separate from the clamped expiry/focus time: a later event
-    /// must not move an identity supplied by a peer with a fast clock.
-    membership_ts: u64,
+    /// Only the raw `created_ts`, when supplied by the peer. Expiry/focus may
+    /// fall back to the event timestamp; generation identity must not.
+    membership_ts: Option<u64>,
     /// `content["m.call.intent"]`, if stated.
     intent: Option<&'a Value>,
     /// `foci_preferred[0]`, verbatim.
@@ -270,8 +269,10 @@ pub fn translate_state_memberships(
                 "msc4354_sticky_key": member.member_id,
                 "member": { "id": member.member_id, "membership": "join" },
                 "application": application,
-                "created_ts": member.membership_ts,
             });
+            if let Some(membership_ts) = member.membership_ts {
+                content["created_ts"] = json!(membership_ts);
+            }
 
             // The focus object goes through **verbatim**: `RawRtcTransport`
             // flattens what it does not know, so `livekit_alias` rides along
@@ -351,11 +352,10 @@ fn parse<'a>(event: &'a StateMemberEvent, now_ms: u64) -> Option<Parsed<'a>> {
     };
 
     // See `Parsed::joined_at` for why this is a minimum rather than a preference.
-    let membership_ts = object
-        .get("created_ts")
-        .and_then(Value::as_u64)
-        .unwrap_or(event.origin_server_ts);
-    let joined_at = membership_ts.min(event.origin_server_ts);
+    let membership_ts = object.get("created_ts").and_then(Value::as_u64);
+    let joined_at = membership_ts
+        .unwrap_or(event.origin_server_ts)
+        .min(event.origin_server_ts);
     let expires = object
         .get("expires")
         .and_then(Value::as_u64)
@@ -905,7 +905,7 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_generation_timestamp_uses_the_membership_events_origin() {
+    fn a_missing_generation_timestamp_is_not_synthesized_from_the_events_origin() {
         let origin_server_ts = NOW - 1_000;
         let content = join_with(&[("created_ts", Value::Null)]);
         for observed_at in [NOW, NOW + 500] {
@@ -913,7 +913,7 @@ mod tests {
                 translate_values(&[("a", origin_server_ts, content.clone())], observed_at)
                     .pop()
                     .expect("a live membership at either observation time");
-            assert_eq!(membership.content["created_ts"], json!(origin_server_ts));
+            assert!(membership.content.get("created_ts").is_none());
         }
     }
 

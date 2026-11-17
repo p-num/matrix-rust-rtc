@@ -1745,18 +1745,105 @@ mod tests {
             [
                 FfiMembershipIdentityKind::Unavailable,
                 FfiMembershipIdentityKind::Unavailable,
-                FfiMembershipIdentityKind::LegacyMembershipTimestamp,
+                FfiMembershipIdentityKind::Unavailable,
             ],
         );
         assert_eq!(joined[0].membership_ts, None);
         assert_eq!(joined[1].membership_ts, None);
-        assert!(joined[2].membership_ts.is_some());
+        assert_eq!(joined[2].membership_ts, None);
         assert!(
             joined
                 .iter()
                 .all(|member| member.transports.len() == 1 && member.can_subscribe.len() == 1),
             "every generation's SFU must survive the translation: {joined:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn raw_legacy_generation_reaches_both_subscriptions_without_timestamp_synthesis() {
+        fn state_event(
+            created_ts: Option<u64>,
+            origin_server_ts: u64,
+            event_id: &str,
+        ) -> FfiEventIn {
+            let mut content = serde_json::json!({
+                "application": "m.call",
+                "call_id": "",
+                "device_id": "BOBDEV",
+                "membershipID": "@bob:example.org:BOBDEV",
+                "expires": 14_400_000_u64,
+                "foci_preferred": [{ "type": "livekit", "livekit_service_url": SFU }],
+            });
+            if let Some(ts) = created_ts {
+                content["created_ts"] = ts.into();
+            }
+            FfiEventIn {
+                event_id: event_id.to_owned(),
+                sender: "@bob:example.org".to_owned(),
+                event_type: STATE_MEMBER_EVENT_TYPE.to_owned(),
+                state_key: Some("_@bob:example.org_BOBDEV_m.call".to_owned()),
+                origin_server_ts,
+                content_json: content.to_string(),
+                encryption: cleartext(),
+            }
+        }
+
+        let now = matrix_rtc_core::compat::room_state::now_ms();
+        for created_ts in [Some(now + 60_000), None] {
+            let expected_kind = if created_ts.is_some() {
+                FfiMembershipIdentityKind::LegacyMembershipTimestamp
+            } else {
+                FfiMembershipIdentityKind::Unavailable
+            };
+            let mock = MockHost::new();
+            let client = RtcClient::new(mock.clone());
+            let room = open(
+                &client,
+                &mock,
+                Some(FfiMembershipFormat::RoomState),
+                false,
+                Vec::new(),
+                Vec::new(),
+            )
+            .await;
+            // The raw state feed traverses `ingest::to_core_state_memberships`
+            // before projection and either public membership subscription.
+            mock.room_sink(ROOM).on_state_events(
+                STATE_MEMBER_EVENT_TYPE.to_owned(),
+                vec![state_event(created_ts, now, "$first")],
+            );
+            wait_until(async || room.member_count(SLOT.to_owned()).await.unwrap() == 1).await;
+            let room_subscription = room
+                .subscribe_membership_snapshots(SLOT.to_owned())
+                .await
+                .unwrap();
+            let call = room.clone().join_call(join_params()).await.unwrap();
+            let call_subscription = call.subscribe_membership_snapshots().await;
+            for members in [
+                room_subscription.next().await.unwrap(),
+                call_subscription.next().await.unwrap(),
+            ] {
+                assert_eq!(members.len(), 1);
+                assert_eq!(members[0].membership_ts, created_ts);
+                assert_eq!(members[0].identity_kind, expected_kind);
+            }
+
+            mock.room_sink(ROOM).on_state_events(
+                STATE_MEMBER_EVENT_TYPE.to_owned(),
+                vec![state_event(created_ts, now + 1_000, "$refresh")],
+            );
+            for subscription in [room_subscription, call_subscription] {
+                let members = tokio::time::timeout(Duration::from_secs(2), subscription.next())
+                    .await
+                    .expect("refreshed state must reach the roster")
+                    .unwrap();
+                assert_eq!(members.len(), 1);
+                assert_eq!(members[0].membership_event_id.as_deref(), Some("$refresh"));
+                assert_eq!(members[0].membership_ts, created_ts);
+                assert_eq!(members[0].identity_kind, expected_kind);
+            }
+            room.shutdown().await;
+        }
     }
 
     /// The SDK owns the `member.id`, and a rejoin must not reuse the previous

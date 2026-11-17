@@ -1755,16 +1755,16 @@ pub struct JoinedMembership {
     /// states it.
     ///
     /// `None` for a native MSC4143 membership, whose `member_id` is already
-    /// fresh per join. The pre-sticky Element Call dialect reuses
+    /// fresh per join, or a legacy membership with no explicit generation
+    /// timestamp. The pre-sticky Element Call dialect reuses
     /// `{user}:{device}` as the member id across joins, and there this is the
     /// event's raw `created_ts` — pinned for the life of one join, new on the
     /// next — so `(member_id, membership_ts)` distinguishes two joins by the
     /// same device where `member_id` alone cannot. The js-sdk's encryption
     /// manager keys on the same value as `membershipTs`.
-    /// When the legacy field is absent, the first-join fallback is that
-    /// membership event's origin timestamp.
     /// Expiry/focus calculations clamp a fast clock separately; identity keeps
-    /// the raw generation timestamp across refreshes.
+    /// the raw generation timestamp across refreshes and never synthesizes one
+    /// from an event timestamp.
     pub membership_ts: Option<u64>,
     /// `origin_server_ts` of the *latest* member event, when the host reported
     /// one. Moves on every sticky refresh, like `membership_event_id`; a

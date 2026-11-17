@@ -14,7 +14,7 @@ log only.
 
 ### Fixed
 
-- Keep legacy generation timestamps stable across refreshes from peers with fast clocks (p-num/element-x-ios#411).
+- Keep explicit legacy generation timestamps stable across refreshes and leave absent generations unavailable (p-num/element-x-ios#411).
 - Forward Letro membership intent through explicit join intent resolution (element-hq/matrix-rust-rtc#64).
 
 ## v0.5.0-rc.11 - 2026-11-10
