@@ -28,8 +28,8 @@ use livekit::e2ee::EncryptionType;
 use livekit::id::ParticipantIdentity;
 use livekit::options::TrackPublishOptions;
 use livekit::prelude::{
-    LocalAudioTrack, LocalTrack, LocalVideoTrack, Participant, RemoteTrack, RoomEvent,
-    RtcAudioSource, TrackDimension, TrackKind, TrackPublication, TrackSource,
+    LocalAudioTrack, LocalTrack, LocalVideoTrack, Participant, RemoteTrack, RemoteTrackPublication,
+    RoomEvent, RtcAudioSource, TrackDimension, TrackKind, TrackPublication, TrackSource,
 };
 use livekit::track::VideoQuality as LkVideoQuality;
 use livekit::webrtc::audio_source::AudioSourceOptions;
@@ -57,14 +57,14 @@ use matrix_rtc_transport::{
     LocalTrackHandle, MediaStreamKind, MediaTransport, OwnFocusTransport, PublishOptions,
     QualityLimit, QualityLimitation, ReceiveStats, RemoteTrackHandle, ResolvedConstraints,
     SendLayerStats, SendStats, SpeakingParticipant, StreamDemand, TransportConnection,
-    TransportError, VideoDetail, VideoFrame, VideoRotation,
+    TransportError, VideoCodecPreference, VideoDetail, VideoFrame, VideoRotation,
 };
 
 use crate::local_publication::LocalPublicationMute;
 use crate::session::LiveKitSession;
+use crate::video_encoding::{supported_video_codecs, video_publish_options};
 use crate::{
-    LiveKitTarget, LiveKitTransportConfig, SfuToken, acquire_token, e2ee_room_options,
-    identity_mapper,
+    LiveKitTarget, LiveKitTransportConfig, SfuToken, acquire_token, identity_mapper, room_options,
 };
 
 /// Sample rate remote audio is resampled to before crossing the transport
@@ -191,11 +191,14 @@ impl OwnFocusTransport for LiveKitMediaTransport {
                     http: self.http.clone(),
                     backend: self.backend.clone(),
                     key_provider: self.key_providers.connection_provider(),
+                    e2ee: ctx.e2ee,
                     auto_subscribe: self.auto_subscribe,
                     config: Mutex::new(config),
                     token: Mutex::new(None),
                 },
+                wanted: Mutex::new(Default::default()),
                 installs: Mutex::new(Some(0)),
+                source_sizes: Mutex::new(Default::default()),
             }),
         }
     }
@@ -278,9 +281,17 @@ struct ConnectionShared {
     /// room. Weak: an unpublished or dropped one simply goes.
     local_tracks: Mutex<Vec<Weak<LiveKitLocalTrack>>>,
     connector: Connector,
+    /// The remote identities this connection subscribes to
+    /// ([`TransportConnection::set_wanted`]); nobody until the pool says.
+    wanted: Mutex<std::collections::HashSet<String>>,
     /// Bumped by every take-over; `None` after close. Earlier reconnects
     /// cannot install a room, and a closed handle cannot start another.
     installs: Mutex<Option<u64>>,
+    /// Each remote video publication's full size, by track sid, as the
+    /// publisher announced it: livekit overwrites `dimension()` with the last
+    /// size we asked for, so it is read before our first request. One entry
+    /// per publication this connection was asked to constrain.
+    source_sizes: Mutex<std::collections::HashMap<String, (u32, u32)>>,
 }
 
 /// What [`TransportConnection::hand_over`] gives: the connected room and how
@@ -297,6 +308,12 @@ struct Connector {
     backend: Arc<dyn MatrixBackend>,
     /// This connection's own: a reconnect sets the SFU's trailer on it again.
     key_provider: crate::ConnectionKeyProvider,
+    /// Whether frames are encrypted (spec 038 R11); when they are, a track
+    /// declared unencrypted is refused (R12).
+    e2ee: bool,
+    /// Whether this connection receives at all; when it does, only the wanted
+    /// participants ([`ConnectionShared::wanted`]). The room itself never
+    /// auto-subscribes.
     auto_subscribe: bool,
     /// The focus connects go to; a take-over moves it (034 R25).
     config: Mutex<LiveKitTransportConfig>,
@@ -319,11 +336,15 @@ impl Connector {
     }
 }
 
-/// A token failure: a 4xx from the JWT service, a 4xx other than a rate limit
-/// from the homeserver (a 404 there: it lacks MSC4195), or a host refusal, is a
-/// refusal; anything else may pass.
+/// A token failure: a homeserver without MSC4195's `get_token` ends the call
+/// (spec 038 R44); a 4xx from the JWT service, another 4xx other than a rate
+/// limit from the homeserver, or a host refusal, is a refusal; anything else
+/// may pass.
 fn classify_token_error(error: crate::Error) -> TransportError {
     match &error {
+        crate::Error::TokenEndpointUnsupported(_) => {
+            TransportError::TokenEndpointUnsupported(error.to_string())
+        }
         crate::Error::Service(TokenServiceError::Rejected { status, .. })
             if (400..500).contains(status) =>
         {
@@ -361,6 +382,25 @@ fn classify_room_error(error: crate::Error) -> TransportError {
 }
 
 impl LiveKitTransportConnection {
+    /// The full size `publication`'s publisher announced, cached on first
+    /// sight (see `ConnectionShared::source_sizes`); `None` while unknown.
+    fn source_size(&self, publication: &RemoteTrackPublication) -> Option<(u32, u32)> {
+        let mut sizes = self
+            .shared
+            .source_sizes
+            .lock()
+            .expect("source sizes mutex poisoned");
+        let sid = String::from(publication.sid());
+        if let Some(size) = sizes.get(&sid) {
+            return Some(*size);
+        }
+        let TrackDimension(width, height) = publication.dimension();
+        (width > 0 && height > 0).then(|| {
+            sizes.insert(sid, (width, height));
+            (width, height)
+        })
+    }
+
     /// The connected session, for the `LiveKitCall` facade's transition-period
     /// raw accessors; `None` before the first connect.
     pub fn session(&self) -> Option<Arc<LiveKitSession>> {
@@ -379,6 +419,41 @@ impl LiveKitTransportConnection {
 
     fn current_session(&self) -> Option<Arc<LiveKitSession>> {
         self.shared.session.borrow().clone()
+    }
+
+    fn wants(&self, identity: &str) -> bool {
+        self.shared.connector.auto_subscribe
+            && self
+                .shared
+                .wanted
+                .lock()
+                .expect("wanted mutex poisoned")
+                .contains(identity)
+    }
+
+    /// Subscribes to the tracks of every wanted participant already in
+    /// `session`; later ones are subscribed as they are published.
+    ///
+    /// A participant leaving the set is not unsubscribed: it leaves the set
+    /// because its member left or moved, and so its participant leaves the
+    /// room. Unsubscribing would also risk a later resubscribe, which livekit
+    /// does not recover from (see `apply_constraints`).
+    fn subscribe_wanted(&self, session: &LiveKitSession) {
+        for (identity, participant) in session.room().remote_participants() {
+            if !self.wants(identity.as_str()) {
+                continue;
+            }
+            for publication in participant.track_publications().into_values() {
+                if !publication.is_desired() {
+                    log::debug!(
+                        "subscribing to {identity}'s {:?} on {}",
+                        publication.source(),
+                        self.connection_key
+                    );
+                    publication.set_subscribed(true);
+                }
+            }
+        }
     }
 
     /// Re-assert the current index on our senders, for a track published after a
@@ -446,6 +521,19 @@ impl TransportConnection for LiveKitTransportConnection {
         &self.connection_key
     }
 
+    fn set_wanted(&self, identities: &[String]) {
+        let added = {
+            let mut wanted = self.shared.wanted.lock().expect("wanted mutex poisoned");
+            let added = identities.iter().any(|identity| !wanted.contains(identity));
+            *wanted = identities.iter().cloned().collect();
+            added
+        };
+        log::debug!("{} receives {identities:?}", self.connection_key);
+        if added && let Some(session) = self.current_session() {
+            self.subscribe_wanted(&session);
+        }
+    }
+
     /// Also remembered for tracks published later. The key provider's
     /// `set_key` only fills the key *ring*; the index a sender stamps lives on
     /// its frame cryptor and changes only here.
@@ -497,9 +585,12 @@ impl TransportConnection for LiveKitTransportConnection {
         }
         let connection = LiveKitSession::connect_with_options(
             &token,
-            e2ee_room_options(
-                connector.key_provider.provider().clone(),
-                connector.auto_subscribe,
+            room_options(
+                connector
+                    .e2ee
+                    .then(|| connector.key_provider.provider().clone()),
+                // Subscriptions are ours to make: see `subscribe_wanted`.
+                false,
             ),
         )
         .await
@@ -533,6 +624,7 @@ impl TransportConnection for LiveKitTransportConnection {
             self.clone(),
             Arc::downgrade(&session),
         ));
+        self.subscribe_wanted(&session);
         self.republish_local_tracks(&session).await;
         self.reassert_local_key_index();
         Ok(events_rx)
@@ -590,6 +682,8 @@ impl TransportConnection for LiveKitTransportConnection {
         if let Some(previous) = previous {
             close_room(previous);
         }
+        // The room was the other connection's, subscribed to its members.
+        self.subscribe_wanted(&session);
         let this = self.clone();
         tokio::spawn(async move {
             this.republish_local_tracks(&session).await;
@@ -622,6 +716,16 @@ impl TransportConnection for LiveKitTransportConnection {
                         "publishing video requires a VideoSourceConfig".into(),
                     )
                 })?;
+                // livekit falls back to its default without a word when the
+                // codec cannot be encoded here; say so, at least.
+                let mut codec = options.video_codec;
+                if codec != VideoCodecPreference::Auto && !supported_video_codecs().contains(&codec)
+                {
+                    log::warn!(
+                        "{codec:?} cannot be encoded on this platform; publishing {kind:?} with the default codec"
+                    );
+                    codec = VideoCodecPreference::Auto;
+                }
                 LocalSource::Video {
                     source: NativeVideoSource::new(
                         VideoResolution {
@@ -630,10 +734,17 @@ impl TransportConnection for LiveKitTransportConnection {
                         },
                         matches!(kind, MediaStreamKind::ScreenShare),
                     ),
-                    // Below 480px livekit computes a single simulcast encoding
-                    // (rid "q" only) — a degenerate shape the SFU delivered no
-                    // frames for in testing. One layer wants a plain encoding.
-                    simulcast: options.simulcast && u32::max(config.width, config.height) >= 480,
+                    options: video_publish_options(
+                        livekit_track_source(kind),
+                        config,
+                        // Below 480px livekit computes a single simulcast
+                        // encoding (rid "q" only) — a degenerate shape the SFU
+                        // delivered no frames for in testing. One layer wants
+                        // a plain encoding.
+                        options.simulcast && u32::max(config.width, config.height) >= 480,
+                        codec,
+                        options.video_encoding,
+                    ),
                 }
             }
             MediaStreamKind::Data => {
@@ -696,39 +807,47 @@ impl TransportConnection for LiveKitTransportConnection {
         // (observed against livekit-server v1.10.1). Until that works
         // upstream, `Off` maps to the pause path too: identical zero
         // bandwidth (dynacast even stops the publisher's encoder), only an
-        // idle decoder object is retained.
-        //
-        // `Paused`/`Off` keep the subscription: `set_enabled(false)` sets
-        // the `disabled` flag server-side — no data, instant resume.
-        publication.set_enabled(matches!(resolved.demand, StreamDemand::Active));
+        // idle decoder object is retained. `Paused`/`Off` keep the
+        // subscription and set the `disabled` flag server-side — no data,
+        // instant resume.
+        let active = matches!(resolved.demand, StreamDemand::Active);
+        if !matches!(kind, MediaStreamKind::Camera | MediaStreamKind::ScreenShare) {
+            publication.set_enabled(active);
+            return Ok(());
+        }
 
-        // CAUTION: every SDK setter sends a full-replacement
-        // `UpdateTrackSettings`. `set_video_quality` in particular sends
-        // *only* the (protocol-deprecated) quality field — zeroed dimensions
-        // and `disabled: false` — so it must never follow a pause or carry a
-        // size hint alongside. `VideoDetail` being an exclusive enum plus the
-        // pause guard below keeps every combination consistent.
-        if matches!(kind, MediaStreamKind::Camera | MediaStreamKind::ScreenShare) {
-            match resolved.detail {
-                VideoDetail::Auto => {}
-                VideoDetail::Dimensions(dimensions) => {
-                    // Sends {disabled, width, height}: consistent with the
-                    // pause state set above.
-                    publication.update_video_dimensions(TrackDimension(
-                        dimensions.width,
-                        dimensions.height,
-                    ));
-                }
-                VideoDetail::Quality(limit) => {
-                    if matches!(resolved.demand, StreamDemand::Active) {
-                        // No-op (with a livekit warning) on non-simulcast
-                        // tracks.
-                        publication.set_video_quality(match limit {
-                            QualityLimit::Low => LkVideoQuality::Low,
-                            QualityLimit::Medium => LkVideoQuality::Medium,
-                            QualityLimit::High => LkVideoQuality::High,
-                        });
+        // ONE `UpdateTrackSettings` per change. Every livekit setter spawns
+        // its own task sending a full-replacement message, and nothing orders
+        // two of them: `set_enabled` carries the size last asked for,
+        // `set_video_quality` none at all, so resuming with a quality could
+        // land as the stale size and pin the stream to an old layer. Instead
+        // the pause flag is flipped locally (`enable`/`disable` send nothing)
+        // and a single `update_video_dimensions` sends `{disabled, width,
+        // height}` as they stand. A quality becomes a size of the publisher's
+        // full one.
+        let source = self.source_size(&publication);
+        match requested_size(resolved.detail, source) {
+            Some((width, height)) => {
+                if let Some(track) = publication.track() {
+                    if active {
+                        track.enable();
+                    } else {
+                        track.disable();
                     }
+                }
+                publication.update_video_dimensions(TrackDimension(width, height));
+            }
+            None => {
+                publication.set_enabled(active);
+                // Only when the publisher's size is unknown. `set_video_quality`
+                // sends zeroed dimensions and `disabled: false`, so it must
+                // never follow a pause. A no-op on a non-simulcast track.
+                if let (VideoDetail::Quality(limit), true) = (resolved.detail, active) {
+                    publication.set_video_quality(match limit {
+                        QualityLimit::Low => LkVideoQuality::Low,
+                        QualityLimit::Medium => LkVideoQuality::Medium,
+                        QualityLimit::High => LkVideoQuality::High,
+                    });
                 }
             }
         }
@@ -784,7 +903,8 @@ enum LocalSource {
     Audio(NativeAudioSource),
     Video {
         source: NativeVideoSource,
-        simulcast: bool,
+        /// Fixed at publish, so every later room encodes the same way.
+        options: TrackPublishOptions,
     },
 }
 
@@ -838,19 +958,12 @@ impl LiveKitLocalTrack {
                     },
                 )
             }
-            LocalSource::Video { source, simulcast } => {
+            LocalSource::Video { source, options } => {
                 let track = LocalVideoTrack::create_video_track(
                     "video",
                     RtcVideoSource::Native(source.clone()),
                 );
-                (
-                    LocalTrack::Video(track),
-                    TrackPublishOptions {
-                        source: source_kind,
-                        simulcast: *simulcast,
-                        ..Default::default()
-                    },
-                )
+                (LocalTrack::Video(track), options.clone())
             }
         };
         let track = self
@@ -1061,6 +1174,7 @@ async fn translate_room_events(
     owner: LiveKitTransportConnection,
     session: std::sync::Weak<LiveKitSession>,
 ) {
+    let e2ee = owner.shared.connector.e2ee;
     while let Some(event) = events.recv().await {
         let translated = match event {
             RoomEvent::ParticipantConnected(participant) => Some(ConnectionEvent::RemoteJoined {
@@ -1069,17 +1183,26 @@ async fn translate_room_events(
             RoomEvent::ParticipantDisconnected(participant) => Some(ConnectionEvent::RemoteLeft {
                 identity: participant.identity().to_string(),
             }),
+            RoomEvent::TrackPublished {
+                publication,
+                participant,
+            } => {
+                if owner.wants(participant.identity().as_str()) {
+                    publication.set_subscribed(true);
+                }
+                None
+            }
             RoomEvent::TrackSubscribed {
                 track,
                 publication,
                 participant,
             } => {
                 let kind = stream_kind(publication.source(), publication.kind());
-                // Our rooms are always encrypted, and livekit attaches no frame
-                // cryptor to a track declared unencrypted: its frames would be
-                // played as they come. The SFU relays that declaration, so it
-                // could also inject frames of its own under this name.
-                if publication.encryption_type() == EncryptionType::None {
+                // In an encrypted call livekit attaches no frame cryptor to a
+                // track declared unencrypted: its frames would be played as
+                // they come. The SFU relays that declaration, so it could also
+                // inject frames of its own under this name (spec 038 R12).
+                if e2ee && publication.encryption_type() == EncryptionType::None {
                     publication.set_subscribed(false);
                     Some(ConnectionEvent::TrackNotEncrypted {
                         identity: participant.identity().to_string(),
@@ -1095,7 +1218,7 @@ async fn translate_room_events(
             }
             // A track refused as unencrypted was never added.
             RoomEvent::TrackUnsubscribed { publication, .. }
-                if publication.encryption_type() == EncryptionType::None =>
+                if e2ee && publication.encryption_type() == EncryptionType::None =>
             {
                 None
             }
@@ -1218,6 +1341,26 @@ fn livekit_track_source(kind: MediaStreamKind) -> TrackSource {
         MediaStreamKind::ScreenShare => TrackSource::Screenshare,
         MediaStreamKind::ScreenShareAudio => TrackSource::ScreenshareAudio,
         MediaStreamKind::Data => TrackSource::Unknown,
+    }
+}
+
+/// The size to ask the SFU for under `detail`, given the publisher's full
+/// `source` size; `None` for `Auto`, or a quality while the source is unknown.
+/// A quality is a fraction of the source matching livekit's default simulcast
+/// layers (full, half, quarter): the SFU forwards the layer that fits.
+fn requested_size(detail: VideoDetail, source: Option<(u32, u32)>) -> Option<(u32, u32)> {
+    match detail {
+        VideoDetail::Auto => None,
+        VideoDetail::Dimensions(dimensions) => Some((dimensions.width, dimensions.height)),
+        VideoDetail::Quality(limit) => {
+            let (width, height) = source?;
+            let divisor = match limit {
+                QualityLimit::High => 1,
+                QualityLimit::Medium => 2,
+                QualityLimit::Low => 4,
+            };
+            Some(((width / divisor).max(1), (height / divisor).max(1)))
+        }
     }
 }
 
@@ -1466,6 +1609,7 @@ mod tests {
             &ConnectionContext {
                 room_id: "!room:example.org".into(),
                 slot_id: "m.call#room".into(),
+                e2ee: true,
                 member: matrix_rtc_transport::OwnMemberClaims {
                     member_id: "member-1".into(),
                     user_id: "@alice:example.org".into(),
@@ -1514,6 +1658,37 @@ mod tests {
             .unwrap()
             .expect_err("closed handle");
         assert!(matches!(error, TransportError::Closed(_)), "{error:?}");
+    }
+
+    #[test]
+    fn a_quality_is_a_fraction_of_the_source_size() {
+        let source = Some((960, 720));
+        let quality = |limit| requested_size(VideoDetail::Quality(limit), source);
+        assert_eq!(quality(QualityLimit::High), Some((960, 720)));
+        assert_eq!(quality(QualityLimit::Medium), Some((480, 360)));
+        assert_eq!(quality(QualityLimit::Low), Some((240, 180)));
+    }
+
+    #[test]
+    fn a_size_is_asked_as_is_and_auto_asks_nothing() {
+        let dimensions = VideoDetail::Dimensions(matrix_rtc_transport::Dimensions {
+            width: 320,
+            height: 240,
+        });
+        assert_eq!(requested_size(dimensions, None), Some((320, 240)));
+        assert_eq!(requested_size(VideoDetail::Auto, Some((960, 720))), None);
+    }
+
+    #[test]
+    fn a_quality_without_a_known_source_asks_no_size() {
+        assert_eq!(
+            requested_size(VideoDetail::Quality(QualityLimit::High), None),
+            None
+        );
+        assert_eq!(
+            requested_size(VideoDetail::Quality(QualityLimit::Low), Some((2, 2))),
+            Some((1, 1))
+        );
     }
 
     fn signal_client_error(status: u16) -> crate::Error {
@@ -1580,22 +1755,34 @@ mod tests {
         );
     }
 
-    /// A homeserver without MSC4195 refuses for good; a rate limit may pass.
+    /// A homeserver without MSC4195 ends the call (spec 038 R44); another
+    /// refusal is one; a rate limit or a server error may pass.
     #[tokio::test]
-    async fn a_homeserver_without_the_endpoint_is_a_refusal() {
+    async fn a_homeserver_without_the_endpoint_is_told_from_a_refusal() {
         let backend = matrix_rtc_core::testing::MockBackend::new();
-        for (status, refused) in [(404, true), (403, true), (429, false), (502, false)] {
-            *backend.livekit_token_answer.lock().unwrap() = Err(
-                matrix_rtc_core::BackendError::with_matrix_error(None, Some(status), "no"),
-            );
+        for (errcode, status, expected) in [
+            (None, 404, "unsupported"),
+            (Some("M_UNRECOGNIZED"), 404, "unsupported"),
+            (Some("M_FORBIDDEN"), 403, "refused"),
+            (None, 429, "connect"),
+            (None, 502, "connect"),
+        ] {
+            *backend.livekit_token_answer.lock().unwrap() =
+                Err(matrix_rtc_core::BackendError::with_matrix_error(
+                    errcode.map(str::to_owned),
+                    Some(status),
+                    "no",
+                ));
             let error = acquire_token(&reqwest::Client::new(), &cs_api_config(), &backend)
                 .await
                 .expect_err("no token");
-            assert_eq!(
-                matches!(classify_token_error(error), TransportError::Refused(_)),
-                refused,
-                "status {status}"
-            );
+            let kind = match classify_token_error(error) {
+                TransportError::TokenEndpointUnsupported(_) => "unsupported",
+                TransportError::Refused(_) => "refused",
+                TransportError::Connect(_) => "connect",
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(kind, expected, "{errcode:?} / {status}");
         }
     }
 }

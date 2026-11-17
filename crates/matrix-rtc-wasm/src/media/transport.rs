@@ -21,10 +21,11 @@
 //! - `fetchJson(url, body) -> Promise<{status, body}>` — POST `body` (a plain
 //!   object) as JSON to `url`, resolving with the HTTP status and the raw
 //!   response text
-//! - `connect({connectionKey, sfuUrl, jwt}, sink) -> Promise<handle>` —
-//!   connect a livekit-js `Room` to `sfuUrl` with `jwt`, register the
-//!   RoomEvent translation onto `sink`, and resolve with a handle exposing
-//!   `close() -> Promise`
+//! - `connect({connectionKey, sfuUrl, jwt, e2ee}, sink) -> Promise<handle>` —
+//!   connect a livekit-js `Room` to `sfuUrl` with `jwt`, frame-encrypted
+//!   exactly when `e2ee` is set (refusing unencrypted tracks then), register
+//!   the RoomEvent translation onto `sink`, and resolve with a handle
+//!   exposing `close() -> Promise`
 //! - `setLocalKeyIndex(index)` — move the local sender onto a rotated key
 //!   index (see `MediaKeyHandler::set_local_sender`)
 //! - `setKey(identity, index, key: Uint8Array) -> Promise<boolean|void>` —
@@ -290,13 +291,17 @@ impl WasmConnectionEventSink {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ConnectRequest<'a> {
-    /// The engine's grouping key for this connection — the
-    /// `livekit_service_url` of the focus.
+    /// The engine's grouping key for this connection: an opaque string naming
+    /// the token flow and its target (`LiveKitTarget::connection_key`), not a
+    /// URL. The own-focus one is the session's `ownConnectionKey()`.
     connection_key: &'a str,
     /// WebSocket URL of the SFU, from the token response.
     sfu_url: &'a str,
     /// The LiveKit JWT to connect with.
     jwt: &'a str,
+    /// Whether frames are encrypted, from the room's encryption (spec 038
+    /// R11); when they are, an unencrypted track is refused (R12).
+    e2ee: bool,
 }
 
 /// `matrix-rtc-media`'s transport over the JS delegate.
@@ -370,7 +375,13 @@ impl JsConnector {
                         member_id: ctx.member.member_id.clone(),
                     })
                     .await
-                    .map_err(|error| backend_error("homeserver livekit token", error))?;
+                    .map_err(|error| {
+                        if error.is_unrecognized_endpoint() {
+                            TransportError::TokenEndpointUnsupported(error.to_string())
+                        } else {
+                            backend_error("homeserver livekit token", error)
+                        }
+                    })?;
                 return Ok(SfuToken { jwt, url });
             }
             LiveKitTarget::SfuGet { service_url } => service_url,
@@ -428,6 +439,7 @@ impl JsConnector {
         &self,
         connection_key: &str,
         sfu_token: &SfuToken,
+        e2ee: bool,
     ) -> Result<(JsValue, mpsc::UnboundedReceiver<ConnectionEvent>), TransportError> {
         let (tx, rx) = mpsc::unbounded_channel();
         let sink = WasmConnectionEventSink { tx };
@@ -435,6 +447,7 @@ impl JsConnector {
             connection_key,
             sfu_url: &sfu_token.url,
             jwt: &sfu_token.jwt,
+            e2ee,
         })
         .map_err(|error| {
             TransportError::Connect(format!("connect request did not serialize: {error}"))
@@ -476,6 +489,7 @@ impl OwnFocusTransport for JsMediaTransport {
             connection_key: connection_key.to_owned(),
             handle: Rc::new(RefCell::new(None)),
             token: Rc::new(RefCell::new(None)),
+            wanted: Rc::new(RefCell::new(Vec::new())),
             ctx: ctx.clone(),
             connector: self.connector.clone(),
         }
@@ -541,6 +555,9 @@ pub(crate) struct JsTransportConnection {
     handle: Rc<RefCell<Option<JsValue>>>,
     /// The token the last connect used, reused until it is refused.
     token: Rc<RefCell<Option<SfuToken>>>,
+    /// Who this connection receives ([`TransportConnection::set_wanted`]),
+    /// handed to every room it connects.
+    wanted: Rc<RefCell<Vec<String>>>,
     ctx: ConnectionContext,
     connector: Rc<JsConnector>,
 }
@@ -572,6 +589,15 @@ impl TransportConnection for JsTransportConnection {
         }
     }
 
+    /// Through the room handle's `setWanted(identities)`, now and on every
+    /// later room. A handle without it receives what its room subscribes to.
+    fn set_wanted(&self, identities: &[String]) {
+        *self.wanted.borrow_mut() = identities.to_vec();
+        if let Some(handle) = self.handle.borrow().as_ref() {
+            hand_wanted(handle, identities);
+        }
+    }
+
     /// A new livekit-js room through the delegate, with the token of the
     /// last connect or a fresh one; the previous room is closed.
     async fn reconnect(
@@ -590,7 +616,11 @@ impl TransportConnection for JsTransportConnection {
                 token
             }
         };
-        let (handle, events) = self.connector.connect(&self.connection_key, &token).await?;
+        let (handle, events) = self
+            .connector
+            .connect(&self.connection_key, &token, self.ctx.e2ee)
+            .await?;
+        hand_wanted(&handle, &self.wanted.borrow());
         let previous = self.handle.borrow_mut().replace(handle);
         if let Some(previous) = previous {
             wasm_bindgen_futures::spawn_local(async move {
@@ -608,6 +638,20 @@ impl TransportConnection for JsTransportConnection {
             Some(handle) => call_delegate(&handle, "close", &[]).await.map(|_| ()),
             None => Ok(()),
         }
+    }
+}
+
+/// Calls the room handle's optional `setWanted(identities)`.
+fn hand_wanted(handle: &JsValue, identities: &[String]) {
+    let method = Reflect::get(handle, &JsValue::from_str("setWanted"))
+        .ok()
+        .and_then(|method| method.dyn_into::<Function>().ok());
+    let Some(method) = method else {
+        return;
+    };
+    let list: Array = identities.iter().map(|id| JsValue::from_str(id)).collect();
+    if let Err(error) = method.call1(handle, &list) {
+        log::warn!("media: setWanted threw: {error:?}");
     }
 }
 

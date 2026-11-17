@@ -35,6 +35,7 @@ use matrix_rtc_core::{
 use tokio::sync::{Mutex, broadcast, watch};
 
 use crate::direct_call::{CallKind, DirectCall, DirectCallEnd, DirectCallState};
+use crate::intent::{CallIntent, CallIntentConsensus};
 use crate::reactions::{
     HandRequests, RaisedHand, ReactionError, ReactionsConfig, ReceivedReaction,
 };
@@ -74,6 +75,10 @@ pub enum RtcError {
     /// one.
     #[error("this session is over; join again for a new one")]
     SessionOver,
+    /// The join asked to notify nobody: no user named and not the room
+    /// (spec 038 R28).
+    #[error("the notification targets nobody: name users or the room")]
+    InviteTargetsNobody,
 }
 
 impl From<OpenError> for RtcError {
@@ -110,7 +115,7 @@ impl JoinOptions {
     pub fn application(application: impl Into<ApplicationInfo>) -> Self {
         let application = application.into();
         Self {
-            slot_id: slot_id_of(&application, ROOM_APPLICATION_SLOT_ID),
+            slot_id: matrix_rtc_core::slot_id_of(&application, ROOM_APPLICATION_SLOT_ID),
             application,
             transport: JoinTransport::Advertised,
             encryption_config: None,
@@ -123,7 +128,7 @@ impl JoinOptions {
 
     /// Joins the application's slot `{application}#{application_slot_id}`.
     pub fn slot(mut self, application_slot_id: impl AsRef<str>) -> Self {
-        self.slot_id = slot_id_of(&self.application, application_slot_id.as_ref());
+        self.slot_id = matrix_rtc_core::slot_id_of(&self.application, application_slot_id.as_ref());
         self
     }
 
@@ -158,14 +163,6 @@ impl JoinOptions {
     }
 }
 
-/// `{application_type}#{application_slot_id}`, MSC4143's slot id.
-fn slot_id_of(application: &ApplicationInfo, application_slot_id: &str) -> String {
-    format!(
-        "{}#{application_slot_id}",
-        application.application_type().unwrap_or_default()
-    )
-}
-
 /// A join into a call slot: the generic join plus what a call adds.
 #[derive(Clone, Debug)]
 pub struct CallJoinOptions {
@@ -176,6 +173,11 @@ pub struct CallJoinOptions {
     pub kind: CallKind,
     /// `None` is [`ReactionsConfig::default`].
     pub reactions: Option<ReactionsConfig>,
+    /// The user's explicit voice or video choice, from starting a call or
+    /// answering a ring that said which. It wins over a call in progress;
+    /// `None` (a room's call button) follows the call. See
+    /// [`CallIntentConsensus::resolve`].
+    pub intent: Option<CallIntent>,
 }
 
 impl CallJoinOptions {
@@ -186,6 +188,7 @@ impl CallJoinOptions {
             join: JoinOptions::application(CALL_APPLICATION),
             kind: CallKind::default(),
             reactions: None,
+            intent: None,
         }
     }
 
@@ -209,6 +212,12 @@ impl CallJoinOptions {
 
     pub fn reactions(mut self, reactions: ReactionsConfig) -> Self {
         self.reactions = Some(reactions);
+        self
+    }
+
+    /// See [`Self::intent`](CallJoinOptions#structfield.intent).
+    pub fn intent(mut self, intent: CallIntent) -> Self {
+        self.intent = Some(intent);
         self
     }
 }
@@ -258,6 +267,18 @@ impl<B: MatrixBackend + 'static> RtcClient<B> {
     /// exists.
     pub fn subscribe_signalling_health(&self) -> watch::Receiver<SignallingHealth> {
         self.base.subscribe_signalling_health()
+    }
+
+    /// Whether our homeserver offers what the MSC format needs (spec 038
+    /// R45), from the `unstable_features` of its `/versions` that are on,
+    /// which the host reads, and the transports it advertises, which this
+    /// asks for. Names each missing piece; never chooses the format.
+    pub async fn msc_support(
+        &self,
+        server_features: &[String],
+    ) -> Result<matrix_rtc_core::MscSupport, BackendError> {
+        let transports = self.backend().rtc_transports().await?;
+        Ok(matrix_rtc_core::msc_support(server_features, &transports))
     }
 
     /// The host reports its Matrix client offline, or online once a request
@@ -327,6 +348,13 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
 
     pub fn format(&self) -> MembershipFormat {
         self.mode
+    }
+
+    /// Whether the call in `slot_id` is a voice or a video call, by what the
+    /// members other than this device state: for a lobby to preview the
+    /// camera a join would start with ([`CallIntentConsensus::resolve`]).
+    pub async fn call_intent_consensus(&self, slot_id: &str) -> CallIntentConsensus {
+        self.state.lock().await.intent_consensus(slot_id)
     }
 
     /// The host's backend behind the dialect wrapper.
@@ -423,7 +451,15 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             join,
             kind,
             reactions,
+            intent,
         } = options;
+        if let CallKind::Group {
+            notify: Some(notify),
+        } = &kind
+            && notify.mentions.targets_nobody()
+        {
+            return Err(RtcError::InviteTargetsNobody);
+        }
         let slot_id = join.slot_id.clone();
         let transport = self.transport(join.transport.clone(), deadline).await?;
         let mut state = self.state.lock().await;
@@ -437,6 +473,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
                     rtc,
                     kind,
                     reactions,
+                    intent,
                 },
                 Some(deadline),
             )
@@ -471,6 +508,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
                 self.follow_hand(slot_id, moves, requests, outbox, session.end.clone())
             }),
             status: joined.status,
+            intent: joined.intent,
             _ring: ring,
             _follow_direct: follow_direct,
             session,
@@ -513,6 +551,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             &self.outbox,
             &self.room_id,
             chosen,
+            self.format(),
             deadline,
         )
         .await?)
@@ -539,14 +578,13 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             degraded_lifetime_ms,
         } = options;
 
-        if let Some(application_type) = application.application_type()
-            && !slot_id.starts_with(&format!("{application_type}#"))
-        {
-            return Err(CommandError::from_message(format!(
-                "slot id '{slot_id}' does not belong to application '{application_type}': \
-                 MSC4143 slot ids are '{{application_type}}#{{slot}}'"
-            ))
-            .into());
+        // Before anything below acts on the slot: MSC4143's grammar, and the
+        // slot belonging to the application joining it (spec 038 R8).
+        if let Err(reason) = matrix_rtc_core::validate_slot_id(
+            &slot_id,
+            application.application_type().unwrap_or_default(),
+        ) {
+            return Err(JoinError::InvalidSlotId { slot_id, reason }.into());
         }
 
         if self.live_session(&slot_id) {
@@ -611,7 +649,9 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         let end = Arc::new(SessionEnd::new());
         self.sessions().insert(slot_id.clone(), end.clone());
         RtcSession {
-            _follow_auto_leave: auto_leaves.map(|leaves| follow_auto_leave(leaves, end.clone())),
+            _follow_auto_leave: auto_leaves.map(|leaves| {
+                follow_auto_leave(leaves, end.clone(), self.state.clone(), slot_id.clone())
+            }),
             room_id: self.room_id.clone(),
             slot_id,
             member_id,
@@ -895,10 +935,12 @@ async fn issue_leave<B: MatrixBackend + 'static>(
 
 /// Ends a session when the core leaves its slot on its own. The core's channel
 /// is per slot, so this stops at the first leave rather than adopt a later
-/// join's.
-fn follow_auto_leave(
+/// join's. A slot closing withdraws the invite we sent to it (spec 038 R31).
+fn follow_auto_leave<B: MatrixBackend + 'static>(
     mut leaves: broadcast::Receiver<LeaveReason>,
     end: Arc<SessionEnd>,
+    state: Arc<Mutex<State<B>>>,
+    slot_id: String,
 ) -> AbortOnDrop<()> {
     executor::spawn(async move {
         let reason = loop {
@@ -908,7 +950,11 @@ fn follow_auto_leave(
                 Err(broadcast::error::RecvError::Closed) => return,
             }
         };
+        let slot_closed = reason.code == LeaveCode::SlotClosed;
         end.end(reason);
+        if slot_closed {
+            state.lock().await.withdraw_invite(&slot_id).await;
+        }
     })
     .abort_on_drop()
 }
@@ -1018,6 +1064,19 @@ impl<B: MatrixBackend + 'static> RtcSession<B> {
                 .set_encryption_signal_handler(&self.slot_id, handler)
     }
 
+    /// Whether this call's media is frame-encrypted: `false` in a room whose
+    /// encryption is off (spec 038 R11), and once the call has ended.
+    pub async fn encrypts_media(&self) -> bool {
+        self.is_live()
+            && self
+                .state
+                .lock()
+                .await
+                .rtc()
+                .encrypts_media(&self.slot_id)
+                .unwrap_or(false)
+    }
+
     pub async fn set_encryption_identity_mapper(&self, mapper: RtcIdentityMapper) -> bool {
         self.is_live()
             && self
@@ -1089,6 +1148,8 @@ pub struct RtcCall<B: MatrixBackend + 'static> {
     /// Ends the call when its media gives our own connection up.
     _follow_media_loss: AbortOnDrop<()>,
     status: Arc<CallStatusCell>,
+    /// The intent our membership states.
+    intent: CallIntent,
     /// Sends the ring and times it.
     _ring: Option<AbortOnDrop<()>>,
     /// Leaves when the lifecycle ends the call.
@@ -1098,6 +1159,13 @@ pub struct RtcCall<B: MatrixBackend + 'static> {
 impl<B: MatrixBackend + 'static> RtcCall<B> {
     pub fn session(&self) -> &RtcSession<B> {
         &self.session
+    }
+
+    /// Whether this is a voice or a video call, as the join settled it: the
+    /// call's own intent when it had one, else the one asked for. The host
+    /// starts with the camera on for [`CallIntent::Video`] only.
+    pub fn intent(&self) -> CallIntent {
+        self.intent
     }
 
     /// Sends an emoji reaction relating to our membership. Only the first

@@ -111,6 +111,11 @@ pub enum TransportError {
     /// cannot help (034 R24).
     #[error("refused: {0}")]
     Refused(String),
+    /// Our homeserver lacks MSC4195's `get_token` (a 404 or `M_UNRECOGNIZED`):
+    /// no token can be had for any SFU, ours or a peer's, so the call cannot
+    /// go on (spec 038 R44).
+    #[error("the homeserver does not support MSC4195 get_token: {0}")]
+    TokenEndpointUnsupported(String),
 }
 
 /// Our own membership identity, as transports need it for authentication and
@@ -129,6 +134,10 @@ pub struct ConnectionContext {
     pub room_id: String,
     pub slot_id: String,
     pub member: OwnMemberClaims,
+    /// Whether media is frame-encrypted: off in a room whose encryption is
+    /// off (spec 038 R11). When on, a track arriving unencrypted is refused
+    /// (R12).
+    pub e2ee: bool,
 }
 
 /// Handle to one subscribed remote track: opens frame streams on demand.
@@ -369,6 +378,14 @@ pub trait TransportConnection: MaybeSend {
     /// our frames carry changes here. The default ignores it, for transports
     /// without frame encryption.
     fn set_local_key_index(&self, _key_index: u8) {}
+
+    /// The remote participants this connection receives: the pool's members
+    /// for it, by identity, never ours. Everyone else in the media room is
+    /// left unsubscribed, so a peer reached through two connections, or our
+    /// own publication seen from a second one, does not arrive twice. Each
+    /// call replaces the set, and it holds across reconnects. The default
+    /// ignores it, for transports that receive whatever they are sent.
+    fn set_wanted(&self, _identities: &[String]) {}
 
     /// Establish this connection again behind the same handle, after a loss
     /// or for a first connect (034 R24): the handle, and every local

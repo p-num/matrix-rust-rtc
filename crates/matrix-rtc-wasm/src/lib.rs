@@ -116,6 +116,35 @@ impl WasmRtcClient {
         self.client.report_connectivity(online);
     }
 
+    /// Whether our homeserver offers what the MSC format needs (spec 038
+    /// R45), as `{ missing, warnings }`, each a list of `"matrix_rtc"`,
+    /// `"sticky_events"`, `"delayed_events"` or `"livekit_transport"`.
+    /// `serverFeatures` are the `unstable_features` of `/versions` that are
+    /// on (the host's `serverFeatures()`); the transports are asked of the
+    /// host. Never picks the format.
+    #[wasm_bindgen(js_name = mscSupport, unchecked_return_type = "MscSupport")]
+    pub async fn msc_support(&self, server_features: Vec<String>) -> Result<JsValue, JsError> {
+        let support = self
+            .client
+            .msc_support(&server_features)
+            .await
+            .map_err(|error| JsError::new(&error.to_string()))?;
+        let name = |requirement: &matrix_rtc_core::MscRequirement| match requirement {
+            matrix_rtc_core::MscRequirement::MatrixRtc => "matrix_rtc",
+            matrix_rtc_core::MscRequirement::StickyEvents => "sticky_events",
+            matrix_rtc_core::MscRequirement::DelayedEvents => "delayed_events",
+            matrix_rtc_core::MscRequirement::LiveKitTransport => "livekit_transport",
+        };
+        let names =
+            |list: &[matrix_rtc_core::MscRequirement]| list.iter().map(name).collect::<Vec<_>>();
+        serde_json::json!({
+            "missing": names(&support.missing),
+            "warnings": names(&support.warnings),
+        })
+        .serialize(&serde_wasm_bindgen::Serializer::json_compatible())
+        .map_err(|error| JsError::new(&error.to_string()))
+    }
+
     /// Opens a room: the library subscribes to what the room needs in the
     /// given mode and applies its current state. Resolves once that state is
     /// applied, so a `joinCall` issued afterwards sees it.
@@ -186,6 +215,20 @@ impl WasmRtcRoom {
         Ok(self.open().await?.debug_snapshot().await.to_string())
     }
 
+    /// `"audio"` or `"video"`: the intent a join into `slotId` would settle
+    /// on, without joining — `requested`, else the one its members agree on,
+    /// else video. For a lobby that previews the camera.
+    #[wasm_bindgen(js_name = callIntent)]
+    pub async fn call_intent(
+        &self,
+        slot_id: String,
+        requested: Option<String>,
+    ) -> Result<String, JsError> {
+        let requested = requested.as_deref().map(parse_intent).transpose()?;
+        let consensus = self.open().await?.call_intent_consensus(&slot_id).await;
+        Ok(consensus.resolve(requested).as_str().to_owned())
+    }
+
     /// How many members are joined to a slot, without joining it.
     #[wasm_bindgen(js_name = memberCount)]
     pub async fn member_count(&self, slot_id: String) -> Result<u32, JsError> {
@@ -205,6 +248,8 @@ impl WasmRtcRoom {
     ///   - `keep_alive_timeout_ms` (default 30000), `sticky_duration_ms`
     ///     (default 3600000), `degraded_lifetime_ms` (default 300000; not below)
     ///   - `encryption_config`, `notify`, `reactions`
+    ///   - `intent`: `"audio"` or `"video"`, the user's explicit choice, which
+    ///     wins over a call in progress; omitted follows the call
     ///
     /// The call keeps itself alive, and performs its key rotations when they
     /// fall due, until it leaves or is freed. The SDK generates the
@@ -358,6 +403,13 @@ impl WasmRtcCall {
     #[wasm_bindgen(getter, js_name = memberId)]
     pub fn member_id(&self) -> String {
         self.call.member_id().to_owned()
+    }
+
+    /// `"audio"` or `"video"`, as the join settled it. Start the camera for
+    /// `"video"` only.
+    #[wasm_bindgen(getter, js_name = callIntent)]
+    pub fn call_intent(&self) -> String {
+        self.call.intent().as_str().to_owned()
     }
 
     /// `false` once left, or once the room is closed.
@@ -516,9 +568,12 @@ pub struct WasmJoinSessionParams {
     /// room-wide call, `room`.
     #[serde(default)]
     pub application_slot_id: Option<String>,
-    /// What the join publishes on, if anything. Omitted is advertised.
+    /// What the join publishes on, if anything. Omitted or `undefined` is
+    /// advertised. An `Option` because `serde(default)` covers only a missing
+    /// key: an explicit `undefined` reaches serde as unit, which only an
+    /// `Option` reads as absent.
     #[serde(default)]
-    pub transport: WasmJoinTransport,
+    pub transport: Option<WasmJoinTransport>,
     #[serde(default)]
     pub keep_alive_timeout_ms: Option<u64>,
     #[serde(default)]
@@ -538,6 +593,17 @@ pub struct WasmJoinSessionParams {
     /// Omitted is enabled with Element Call's three-second window.
     #[serde(default)]
     pub reactions: Option<WasmReactionsConfig>,
+    /// `"audio"` or `"video"`: the user's explicit choice, which wins over a
+    /// call in progress; omitted follows the call, and with no call to follow
+    /// is video. Read the outcome from `callIntent` on the call.
+    #[serde(default)]
+    pub intent: Option<String>,
+}
+
+/// `"audio"` or `"video"`, or an error naming what was passed.
+fn parse_intent(intent: &str) -> Result<matrix_rtc_call::CallIntent, JsError> {
+    matrix_rtc_call::CallIntent::parse(intent)
+        .ok_or_else(|| JsError::new(&format!("unknown call intent {intent:?}")))
 }
 
 /// WASM-friendly reactions configuration (mirrors the core's
@@ -589,9 +655,10 @@ pub struct WasmNotifyConfig {
     /// 90000, capped at 120000 because that is what receivers honour).
     #[serde(default)]
     pub lifetime_ms: Option<u64>,
-    /// Users named individually in `m.mentions`. Usually empty.
+    /// Users named individually in `m.mentions`. Usually empty. An `Option`
+    /// so an explicit `undefined` reads as empty, like a missing key.
     #[serde(default)]
-    pub mention_user_ids: Vec<String>,
+    pub mention_user_ids: Option<Vec<String>>,
     /// Whether the whole room is targeted (default: true).
     #[serde(default = "default_true")]
     pub mention_room: bool,
@@ -617,7 +684,7 @@ impl WasmNotifyConfig {
             intent: self.intent,
             lifetime_ms: self.lifetime_ms,
             mentions: Mentions {
-                user_ids: self.mention_user_ids,
+                user_ids: self.mention_user_ids.unwrap_or_default(),
                 room: self.mention_room,
             },
         })
@@ -665,7 +732,7 @@ impl WasmJoinSessionParams {
             options = options.slot(name);
         }
         let join = &mut options.join;
-        join.transport = self.transport.into();
+        join.transport = self.transport.unwrap_or_default().into();
         join.encryption_config = self.encryption_config.map(Into::into);
         join.keep_alive_timeout_ms = self.keep_alive_timeout_ms;
         join.sticky_duration_ms = self.sticky_duration_ms;
@@ -674,6 +741,7 @@ impl WasmJoinSessionParams {
             notify: self.notify.map(WasmNotifyConfig::into_core).transpose()?,
         };
         options.reactions = self.reactions.map(Into::into);
+        options.intent = self.intent.as_deref().map(parse_intent).transpose()?;
         Ok(options)
     }
 }
@@ -839,7 +907,8 @@ mod tests {
         set(
             "rtcTransports",
             "",
-            "return Promise.resolve([{ type: 'livekit', livekit_service_url: 'https://sfu.example.org' }]);",
+            "return Promise.resolve([{ type: 'm.livekit', url: 'wss://sfu.example.org' }, \
+                 { type: 'livekit', livekit_service_url: 'https://jwt.example.org' }]);",
         );
         host.into()
     }
