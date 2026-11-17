@@ -3,6 +3,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
 // Please see LICENSE in the repository root for full details.
 
+//! Tests the client boundary for room feeds, transport selection, and media-key routing.
+
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
