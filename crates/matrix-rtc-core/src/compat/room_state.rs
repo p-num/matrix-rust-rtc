@@ -145,8 +145,7 @@ pub fn participant_identity(user_id: &str, device_id: &str) -> String {
     format!("{user_id}:{device_id}")
 }
 
-/// One `org.matrix.msc3401.call.member` state event: the content, plus the three
-/// event-level fields the translation needs and the content does not carry.
+/// One `org.matrix.msc3401.call.member` state event with its content and event metadata.
 #[derive(Clone, Debug)]
 pub struct StateMemberEvent {
     /// The event's id, when known. Carried through untouched: Element Call
@@ -167,20 +166,19 @@ pub struct StateMemberEvent {
     pub content: Value,
 }
 
-/// A pre-sticky membership rendered in the current MSC4143 shape.
-///
-/// Exactly the three things the caller cannot get out of `content` on its own.
-/// Everything else — the slot id, the member id, the application, the transports
-/// — is inside `content`, where the core's own `RawStickyEventContent` reads it.
+/// A pre-sticky membership rendered in the current MSC4143 shape with its
+/// original event metadata.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StateMembership {
     /// The state event's id, verbatim.
     pub event_id: Option<String>,
     /// The state event's sender, verbatim.
     pub sender: String,
+    /// The state event's `origin_server_ts`, verbatim.
+    pub origin_server_ts: u64,
     /// `content.device_id`. Self-asserted and unauthenticated: state events
     /// carry no decryption metadata anywhere in the SDK, and Element Call as a
-    /// widget could not read it if they did. Becomes `EventOrigin::Claimed`.
+    /// widget could not read it if they did. Becomes `EventOrigin::RoomState`.
     pub claimed_device_id: String,
     /// MSC4143 `m.rtc.member` content, ready to deserialize as the core's
     /// `RawStickyEventContent`.
@@ -192,6 +190,7 @@ pub struct StateMembership {
 struct Parsed<'a> {
     event_id: Option<&'a str>,
     sender: &'a str,
+    origin_server_ts: u64,
     state_key: &'a str,
     device_id: String,
     member_id: String,
@@ -206,8 +205,8 @@ struct Parsed<'a> {
     /// `origin_server_ts`. Taking the minimum is also what stops a peer with a
     /// fast clock from looking alive longer than it is.
     joined_at: u64,
-    /// Only the raw `created_ts`, when supplied by the peer. Expiry/focus may
-    /// fall back to the event timestamp; generation identity must not.
+    /// The raw `created_ts`, when supplied by the peer. The event timestamp
+    /// stays separate so public membership identity can report an absence.
     membership_ts: Option<u64>,
     /// `content["m.call.intent"]`, if stated.
     intent: Option<&'a Value>,
@@ -296,6 +295,7 @@ pub fn translate_state_memberships(
             StateMembership {
                 event_id: member.event_id.map(str::to_owned),
                 sender: member.sender.to_owned(),
+                origin_server_ts: member.origin_server_ts,
                 claimed_device_id: member.device_id.clone(),
                 content,
             }
@@ -397,6 +397,7 @@ fn parse<'a>(event: &'a StateMemberEvent, now_ms: u64) -> Option<Parsed<'a>> {
     Some(Parsed {
         event_id: event.event_id.as_deref(),
         sender: &event.sender,
+        origin_server_ts: event.origin_server_ts,
         state_key: &event.state_key,
         device_id: device_id.to_owned(),
         member_id,
@@ -1313,9 +1314,11 @@ mod tests {
             room_id: "!room:example.io".to_owned(),
             event_id: membership.event_id,
             sender: membership.sender,
-            origin: EventOrigin::claimed(membership.claimed_device_id),
+            origin: EventOrigin::RoomState {
+                device_id: membership.claimed_device_id,
+            },
             event_type: "m.rtc.member".to_owned(),
-            origin_server_ts: None,
+            origin_server_ts: Some(membership.origin_server_ts),
             content,
         };
 
@@ -1329,6 +1332,7 @@ mod tests {
 
         assert_eq!(joined.slot_id, "m.call#room");
         assert_eq!(joined.sender, "@alice:example.io");
+        assert_eq!(joined.origin_server_ts, Some(now));
         assert_eq!(joined.member_id, "@alice:example.io:V5cP8FErcB");
         assert_eq!(joined.sticky_key, joined.member_id);
         assert_eq!(joined.application.application_type(), Some("m.call"));

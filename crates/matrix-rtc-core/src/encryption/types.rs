@@ -25,12 +25,13 @@ pub struct ParticipantDeviceInfo {
     /// The `member.id` from the `m.rtc.member` event (MSC4143)
     /// This is globally unique per member instance
     pub member_id: String,
-    /// When this participation began, where the dialect states it.
+    /// Timestamp used by key distribution to identify this participation.
     ///
     /// `None` under native MSC4143, whose `member_id` is fresh per join. The
     /// pre-sticky Element Call dialect reuses `{user}:{device}` as the member
     /// id across joins, and this timestamp is then what tells two joins by the
-    /// same device apart — see [`Self::same_join`].
+    /// same device apart — see [`Self::same_join`]. Room-state events that
+    /// omit `created_ts` fall back to their `origin_server_ts` here.
     pub membership_ts: Option<u64>,
 }
 

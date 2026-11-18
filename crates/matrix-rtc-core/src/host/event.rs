@@ -68,6 +68,15 @@ pub enum EventOrigin {
         /// The device the event says sent it.
         device_id: String,
     },
+    /// A pre-sticky room-state membership with a self-asserted device.
+    ///
+    /// The claim has the same trust as [`Self::Claimed`]. The separate origin
+    /// lets key distribution detect a rejoin when a peer reuses its member ID
+    /// and omits `created_ts`.
+    RoomState {
+        /// The device the state event says sent it.
+        device_id: String,
+    },
 }
 
 impl EventOrigin {
@@ -89,7 +98,7 @@ impl EventOrigin {
     pub fn sender_device_id(&self) -> Option<&str> {
         match self {
             Self::Encrypted { sender_device_id } => sender_device_id.as_deref(),
-            Self::Claimed { device_id } => Some(device_id.as_str()),
+            Self::Claimed { device_id } | Self::RoomState { device_id } => Some(device_id.as_str()),
             Self::Cleartext => None,
         }
     }
@@ -99,7 +108,7 @@ impl EventOrigin {
     /// A claimed device says nothing about encryption, so it reports `None`.
     pub fn was_encrypted(&self) -> Option<bool> {
         match self {
-            Self::Claimed { .. } => None,
+            Self::Claimed { .. } | Self::RoomState { .. } => None,
             Self::Cleartext => Some(false),
             Self::Encrypted { .. } => Some(true),
         }

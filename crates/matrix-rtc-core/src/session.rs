@@ -1182,7 +1182,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         // device is the one that encrypted the event, never one the content
         // claims.
         //
-        // `Claimed` is the one exception, and it only ever comes from the
+        // Self-asserted devices are an exception that only comes from the
         // room-state format: Element Call's state events cannot be encrypted at
         // all, and that format exists to interoperate with it (spec 038 R32).
         // The MSC format never produces it.
@@ -1191,7 +1191,8 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
                 EventOrigin::Encrypted {
                     sender_device_id: Some(_),
                 }
-                | EventOrigin::Claimed { .. } => {}
+                | EventOrigin::Claimed { .. }
+                | EventOrigin::RoomState { .. } => {}
                 EventOrigin::Encrypted {
                     sender_device_id: None,
                 } => return JoinCondition::NoSendingDevice,
@@ -1760,16 +1761,14 @@ pub struct JoinedMembership {
     /// `{user}:{device}` as the member id across joins, and there this is the
     /// event's raw `created_ts` — pinned for the life of one join, new on the
     /// next — so `(member_id, membership_ts)` distinguishes two joins by the
-    /// same device where `member_id` alone cannot. The js-sdk's encryption
-    /// manager keys on the same value as `membershipTs`.
+    /// same device where `member_id` alone cannot.
     /// Expiry/focus calculations clamp a fast clock separately; identity keeps
     /// the raw generation timestamp across refreshes and never synthesizes one
     /// from an event timestamp.
     pub membership_ts: Option<u64>,
     /// `origin_server_ts` of the *latest* member event, when the host reported
-    /// one. Moves on every sticky refresh, like `membership_event_id`; a
-    /// consumer wanting a join time pins the first value it sees. Never an
-    /// identity: keys stay on `(member_id, membership_ts)`.
+    /// one. Moves on every refresh, like `membership_event_id`. Key distribution
+    /// uses it as a fallback for a room-state membership without `created_ts`.
     pub origin_server_ts: Option<u64>,
     /// `content.application`; a joined membership always has a `type`.
     pub application: ApplicationInfo,

@@ -277,17 +277,16 @@ pub fn to_core_state_memberships(
                 sender: membership.sender,
                 // The self-asserted device, which is all such a peer can state
                 // and all we can read — a state event carries no decryption
-                // metadata. Ranked below an authenticated device everywhere it
-                // matters (it never satisfies the encrypted-room rule), but it is
-                // what lets a media key travel in either direction at all.
-                origin: EventOrigin::claimed(membership.claimed_device_id),
+                // metadata. This is the device to address media keys to.
+                origin: EventOrigin::RoomState {
+                    device_id: membership.claimed_device_id,
+                },
                 // Not the type that was on the wire. What the core accepts is an
                 // MSC4143 membership, and after the translation that is exactly
                 // what this is; carrying the MSC3401 type here would only make
                 // the core reject it.
                 event_type: "m.rtc.member".to_owned(),
-                // The join time rides in the content's `created_ts` instead.
-                origin_server_ts: None,
+                origin_server_ts: Some(membership.origin_server_ts),
                 content,
             })
         })
