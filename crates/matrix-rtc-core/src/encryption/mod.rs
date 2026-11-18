@@ -2239,6 +2239,7 @@ mod tests {
             member_id: "bob-device456-uuid".to_string(),
             membership_event_id: None,
             membership_ts: None,
+            legacy_join_id: Default::default(),
             origin_server_ts: None,
             application: "m.call".into(),
             transports: Vec::new(),

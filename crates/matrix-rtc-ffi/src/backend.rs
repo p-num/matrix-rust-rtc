@@ -8,9 +8,10 @@
 //! and the adapter that turns it into the core's `MatrixBackend`. Content
 //! crosses as JSON strings; DTOs keep uniffi shapes out of the core.
 
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use async_trait::async_trait;
+use matrix_rtc_core::compat::LEGACY_JOIN_ID_FIELD;
 use matrix_rtc_core::{
     BackendError, CommandError, EventEncryption, EventIn, LiveKitTokenRequest,
     MatrixBackend as CoreBackend, OpenIdToken, RoomSink as CoreRoomSink, RoomSubjects,
@@ -454,8 +455,20 @@ fn log_command<T>(what: &str, outcome: Result<T, CommandError>) -> Result<T, Com
 }
 
 /// Kept at `trace`: the content of a to-device message is key material.
-fn trace_command_content(what: &str, content_json: &str) {
-    log::trace!("command sending: {what} content={content_json}");
+fn trace_command_content(what: &str, content: &Value) {
+    log::trace!(
+        "command sending: {what} content={}",
+        content_for_trace(content)
+    );
+}
+
+fn content_for_trace(content: &Value) -> Cow<'_, Value> {
+    if content.get(LEGACY_JOIN_ID_FIELD).is_none() {
+        return Cow::Borrowed(content);
+    }
+    let mut logged = content.clone();
+    logged[LEGACY_JOIN_ID_FIELD] = Value::String("[redacted]".to_owned());
+    Cow::Owned(logged)
 }
 
 fn to_json(content: &Value) -> Result<String, CommandError> {
@@ -501,7 +514,7 @@ impl CoreBackend for FfiBackend {
     ) -> Result<String, CommandError> {
         let content_json = to_json(&content)?;
         let what = format!("sticky [{room_id}] type={event_type}");
-        trace_command_content(&what, &content_json);
+        trace_command_content(&what, &content);
         log_command(
             &what,
             self.host
@@ -523,7 +536,7 @@ impl CoreBackend for FfiBackend {
         let what = format!(
             "delayed state [{room_id}] type={event_type} state_key={state_key} delay={delay_ms}ms"
         );
-        trace_command_content(&what, &content_json);
+        trace_command_content(&what, &content);
         log_command(
             &what,
             self.host
@@ -546,7 +559,7 @@ impl CoreBackend for FfiBackend {
             "delayed sticky [{room_id}] type={event_type} duration={sticky_duration_ms}ms \
              delay={delay_ms}ms"
         );
-        trace_command_content(&what, &content_json);
+        trace_command_content(&what, &content);
         log_command(
             &what,
             self.host
@@ -603,7 +616,7 @@ impl CoreBackend for FfiBackend {
             "to-device type={message_type} to {} recipient(s)",
             recipients.len()
         );
-        trace_command_content(&what, &content_json);
+        trace_command_content(&what, &content);
         let recipients = recipients
             .into_iter()
             .map(|recipient| FfiToDeviceRecipient {
@@ -639,7 +652,7 @@ impl CoreBackend for FfiBackend {
     ) -> Result<String, CommandError> {
         let content_json = to_json(&content)?;
         let what = format!("state [{room_id}] type={event_type} state_key={state_key}");
-        trace_command_content(&what, &content_json);
+        trace_command_content(&what, &content);
         log_command(
             &what,
             self.host
@@ -657,7 +670,7 @@ impl CoreBackend for FfiBackend {
     ) -> Result<String, CommandError> {
         let content_json = to_json(&content)?;
         let what = format!("room event [{room_id}] type={event_type}");
-        trace_command_content(&what, &content_json);
+        trace_command_content(&what, &content);
         log_command(
             &what,
             self.host
@@ -818,6 +831,8 @@ pub(crate) mod test_support {
         pub refuse_delayed: AtomicBool,
         /// When set, every sticky send fails with it.
         pub refuse_sticky: Mutex<Option<FfiBackendError>>,
+        /// The next state send records its payload and returns this error.
+        pub fail_state_once: Mutex<Option<FfiBackendError>>,
         pub room_sinks: Mutex<HashMap<String, (FfiRoomSubjects, Arc<RoomSink>)>>,
         pub to_device_sink: Mutex<Option<(Vec<String>, Arc<ToDeviceSink>)>>,
         pub transports_json: Mutex<String>,
@@ -1052,6 +1067,9 @@ pub(crate) mod test_support {
         ) -> Result<String, FfiBackendError> {
             self.record(&event_type);
             self.record_send(Carrier::State, &event_type, Some(state_key), &content_json);
+            if let Some(error) = self.fail_state_once.lock().unwrap().take() {
+                return Err(error);
+            }
             Ok(format!("$state-{}", self.sends.lock().unwrap().len()))
         }
 
@@ -1150,6 +1168,21 @@ mod tests {
     use uniffi::{LiftReturn, UnexpectedUniFFICallbackError};
 
     use super::*;
+
+    #[test]
+    fn command_trace_redacts_legacy_join_id_without_changing_wire_content() {
+        let content = serde_json::json!({
+            "application": "m.call",
+            (LEGACY_JOIN_ID_FIELD): "0123456789abcdef0123456789abcdef",
+        });
+        let logged = content_for_trace(&content);
+        assert_eq!(logged["application"], "m.call");
+        assert_eq!(logged[LEGACY_JOIN_ID_FIELD], "[redacted]");
+        assert_eq!(
+            content[LEGACY_JOIN_ID_FIELD],
+            "0123456789abcdef0123456789abcdef"
+        );
+    }
 
     /// The path uniffi takes when a host method throws an exception the
     /// interface does not declare.

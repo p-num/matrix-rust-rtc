@@ -370,14 +370,15 @@ specific to it:
 
 `JoinedMembership.membershipTs` is an optional unsigned 64-bit join timestamp
 in milliseconds since the Unix epoch (`UInt64?` in Swift, `ULong?` in Kotlin).
-Both room and call membership subscriptions expose it alongside `identityKind`,
-the closed `FfiMembershipIdentityKind` enum:
+Both room and call membership subscriptions also expose the optional
+`legacyJoinId` and the `FfiMembershipIdentityKind` enum.
 
 | Rust variant | Swift case | Kotlin entry | Identity inputs |
 | --- | --- | --- | --- |
 | `PerJoinMemberId` | `.perJoinMemberId` | `PER_JOIN_MEMBER_ID` | In MSC rooms, `memberId` is fresh per join and stable across membership refreshes. |
-| `LegacyMembershipTimestamp` | `.legacyMembershipTimestamp` | `LEGACY_MEMBERSHIP_TIMESTAMP` | In room-state rooms, use `memberId` and the non-null `membershipTs` together; a device can reuse its member ID on a later join. |
-| `Unavailable` | `.unavailable` | `UNAVAILABLE` | In room-state rooms without a join timestamp, no supported per-join identity is available. |
+| `LegacyJoinId` | `.legacyJoinId` | `LEGACY_JOIN_ID` | Use `memberId` and the validated `legacyJoinId` together. |
+| `LegacyMembershipTimestamp` | `.legacyMembershipTimestamp` | `LEGACY_MEMBERSHIP_TIMESTAMP` | When a peer omits the explicit legacy join ID, use `memberId` and the non-null `membershipTs` together. |
+| `Unavailable` | `.unavailable` | `UNAVAILABLE` | The peer supplied a malformed join ID or omitted both identity fields. |
 
 Scope any host-derived participation identity by room and slot. This metadata
 identifies one participation, not a whole room call. When `identityKind` is
@@ -386,14 +387,16 @@ shape, the latest `membershipEventId`, an event's `origin_server_ts`, or a
 locally observed time. Event IDs and origin timestamps move on refresh; the
 SDK never substitutes either for a missing `membershipTs`.
 
-For pre-sticky state memberships, the core carries only an explicit raw legacy
-`created_ts`; a missing field leaves generation identity unavailable.
-Expiry and focus ordering still use a separately clamped time, so a peer with a
-fast clock keeps its generation identity across refreshes without extending its
-membership lifetime. An event's origin timestamp can be an internal expiry/focus
-fallback, but never substitutes for a missing generation identity.
+The legacy membership's top-level `io.letro.call.join_id` field is 32 lowercase
+ASCII hexadecimal characters. The core carries the explicit raw `created_ts`
+separately. Expiry and focus ordering use the existing clamped time.
 
-These fields carry existing protocol metadata and add no logging or telemetry.
+`RtcCall.legacyJoinId()` returns the join ID this call published in legacy rooms.
+The local member ID can repeat on a later join. Attribute an own-device roster
+entry to the call only when its join ID matches the call's join ID.
+The legacy dialect supports one locally joined slot per room. A new join waits
+within its join budget for any outstanding leave in the room.
+
 Hosts must apply their privacy policy before deriving or emitting an identity;
 the fields do not authorize logging raw room, user, device, or member IDs.
 Generated Swift/Kotlin and the native FFI binary must be rebuilt and distributed

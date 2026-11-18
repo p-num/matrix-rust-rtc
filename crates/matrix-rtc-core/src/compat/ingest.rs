@@ -259,7 +259,9 @@ pub fn to_core_state_memberships(
     translated
         .into_iter()
         .filter_map(|membership| {
-            let content: RawStickyEventContent = match serde_json::from_value(membership.content) {
+            let mut content: RawStickyEventContent = match serde_json::from_value(
+                membership.content,
+            ) {
                 Ok(content) => content,
                 Err(error) => {
                     log::warn!(
@@ -271,6 +273,7 @@ pub fn to_core_state_memberships(
                     return None;
                 }
             };
+            content.legacy_join_id = membership.legacy_join_id;
             Some(RawStickyEvent {
                 room_id: room_id.to_owned(),
                 event_id: membership.event_id,

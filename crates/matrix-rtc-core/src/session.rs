@@ -15,11 +15,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, watch};
 
-use crate::compat::MembershipFormat;
+use crate::compat::{LegacyJoinId, MembershipFormat};
 use crate::encryption::types::ReceivedEncryptionKey;
 use crate::encryption::{EncryptionKeySignalHandler, EncryptionManager, RtcIdentityMapper};
 use crate::error::{CommandError, JoinError, LeaveError};
-use crate::executor::{self, AbortHandle, AbortOnDrop};
+use crate::executor::{self, AbortHandle};
 use crate::host::backend::MatrixBackend;
 use crate::host::event::EventOrigin;
 use crate::join::{JoinSessionParams, LeaveSessionParams, TransportIntent};
@@ -28,7 +28,7 @@ use crate::outbox::Outbox;
 use crate::own_membership::{MembershipTimings, OwnEntry, OwnMembershipMachine, transport_to_json};
 use crate::slot::{RoomEncryption, SlotState};
 use crate::transport::{LiveKitTransport, MemberTransports, RtcTransport};
-use crate::upkeep::{self, SessionUpkeep};
+use crate::upkeep::{self, SessionUpkeep, UpkeepStopHandle, UpkeepTask};
 
 #[allow(unused_imports)]
 use log::*;
@@ -138,7 +138,7 @@ const AUTO_LEAVES_CAPACITY: usize = 4;
 /// without the session or its room.
 pub struct PendingLeave<T: MatrixBackend + 'static> {
     machine: Arc<OwnMembershipMachine<T>>,
-    upkeep: Option<AbortOnDrop<()>>,
+    upkeep: Option<UpkeepTask>,
     leave_reason: Option<LeaveReason>,
     log_tag: String,
 }
@@ -192,7 +192,7 @@ pub struct SlotSession<T: MatrixBackend> {
     own_membership_machine: Option<Arc<OwnMembershipMachine<T>>>,
     /// The task keeping our membership alive and rotating keys on time, from
     /// join until leave; dropping the session stops it.
-    upkeep: Option<AbortOnDrop<()>>,
+    upkeep: Option<UpkeepTask>,
     /// Identity of the current join, or `None` while not joined.
     own_participation: Option<OwnParticipation>,
     /// Encryption manager for key distribution and management.
@@ -460,6 +460,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             JoinError::CommandError(CommandError::from_message("no backend configured"))
         })?;
 
+        let backend = backend.clone().for_own_membership(&self.room_id);
         let membership_id = params.membership_id();
         let user_id = backend.own_user_id();
         let device_id = backend.own_device_id();
@@ -822,7 +823,12 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
     /// Stops this join's upkeep when aborted, for an owner that lets go of
     /// the join without leaving; `None` while not joined or without one.
     pub fn upkeep_abort_handle(&self) -> Option<AbortHandle> {
-        self.upkeep.as_ref().map(AbortOnDrop::abort_handle)
+        self.upkeep.as_ref().map(UpkeepTask::abort_handle)
+    }
+
+    /// Stops this join's upkeep after its current membership attempts finish.
+    pub fn upkeep_stop_handle(&self) -> Option<UpkeepStopHandle> {
+        self.upkeep.as_ref().map(UpkeepTask::stop_handle)
     }
 
     /// Whether a dead man's switch is protecting our membership.
@@ -1766,6 +1772,9 @@ pub struct JoinedMembership {
     /// the raw generation timestamp across refreshes and never synthesizes one
     /// from an event timestamp.
     pub membership_ts: Option<u64>,
+    /// The explicit join identity of a translated legacy state membership.
+    #[serde(default, skip_serializing_if = "LegacyJoinId::is_absent")]
+    pub legacy_join_id: LegacyJoinId,
     /// `origin_server_ts` of the *latest* member event, when the host reported
     /// one. Moves on every refresh, like `membership_event_id`. Key distribution
     /// uses it as a fallback for a room-state membership without `created_ts`.

@@ -79,6 +79,7 @@ fn member_event(
             transports: None,
             leave_reason: None,
             created_ts: None,
+            legacy_join_id: Default::default(),
         },
     }
 }

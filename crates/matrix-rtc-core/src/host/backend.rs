@@ -321,6 +321,30 @@ pub trait MatrixBackend: MaybeSend {
     /// The device the client is logged in as.
     fn own_device_id(&self) -> String;
 
+    /// Captures routing for one participation, where the backend has mutable
+    /// per-room configuration.
+    fn for_own_membership(self: Arc<Self>, _room_id: &str) -> Arc<Self>
+    where
+        Self: Sized,
+    {
+        self
+    }
+
+    /// Whether this captured participation can still send.
+    fn own_membership_active(&self) -> bool {
+        true
+    }
+
+    /// Runs a synchronous outbox operation while this participation may still
+    /// send. Backends that deactivate captured routing serialize deactivation
+    /// with `action` so a retired participation cannot supersede its successor.
+    fn with_active_own_membership<T>(&self, action: impl FnOnce() -> T) -> Option<T>
+    where
+        Self: Sized,
+    {
+        self.own_membership_active().then(action)
+    }
+
     // ---- Send half ----
 
     /// Send a sticky event to a Matrix room.

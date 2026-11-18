@@ -9,13 +9,14 @@ import Foundation
 @main
 struct MembershipIdentityBindingTest {
     static func main() throws {
-        let cases: [(FfiMembershipIdentityKind, UInt64?)] = [
-            (.perJoinMemberId, nil),
-            (.legacyMembershipTimestamp, 0),
-            (.legacyMembershipTimestamp, UInt64.max),
-            (.unavailable, nil),
+        let cases: [(FfiMembershipIdentityKind, UInt64?, String?)] = [
+            (.perJoinMemberId, nil, nil),
+            (.legacyJoinId, 1, "0123456789abcdef0123456789abcdef"),
+            (.legacyMembershipTimestamp, 0, nil),
+            (.legacyMembershipTimestamp, UInt64.max, nil),
+            (.unavailable, nil, nil),
         ]
-        for (kind, timestamp) in cases {
+        for (kind, timestamp, legacyJoinId) in cases {
             let original = JoinedMembership(
                 roomId: "!room:example.org",
                 slotId: "m.call#room",
@@ -25,6 +26,7 @@ struct MembershipIdentityBindingTest {
                 memberId: "member",
                 membershipEventId: "$refresh",
                 membershipTs: timestamp,
+                legacyJoinId: legacyJoinId,
                 identityKind: kind,
                 application: "m.call",
                 transports: [],
@@ -34,6 +36,6 @@ struct MembershipIdentityBindingTest {
             let decoded = try FfiConverterTypeJoinedMembership_lift(buffer)
             precondition(decoded == original)
         }
-        print("Swift membership identity binding contract passed (4 cases)")
+        print("Swift membership identity binding contract passed (\(cases.count) cases)")
     }
 }

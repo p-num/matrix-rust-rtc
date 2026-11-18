@@ -17,6 +17,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use serde_json::Value;
+use tokio::sync::watch;
 
 use super::{MemberEventRoute, OutboundDialect};
 
@@ -26,9 +27,11 @@ pub struct DialectBackend<B> {
     /// Keyed by room: a to-device media key names only its room. Never held
     /// across an await.
     dialects: Mutex<HashMap<String, OutboundDialect>>,
+    membership_dialect: Option<OutboundDialect>,
     /// Rooms whose dialect is held for a send still to go out, by count, and
     /// those of them forgotten meanwhile. See [`Self::hold_dialect`].
     holds: Mutex<Holds>,
+    holds_released: watch::Sender<()>,
 }
 
 #[derive(Default)]
@@ -47,23 +50,23 @@ pub struct DialectHold<B> {
 // Without the backend bound, which a `Drop` may not add.
 impl<B> DialectBackend<B> {
     fn release_hold(&self, room_id: &str) {
-        let forget = {
-            let Ok(mut holds) = self.holds.lock() else {
-                return;
-            };
-            let Some(count) = holds.counts.get_mut(room_id) else {
-                return;
-            };
-            *count -= 1;
-            if *count > 0 {
-                return;
-            }
-            holds.counts.remove(room_id);
-            holds.forgotten.remove(room_id)
+        let Ok(mut holds) = self.holds.lock() else {
+            return;
         };
-        if forget && let Ok(mut dialects) = self.dialects.lock() {
-            dialects.remove(room_id);
+        let Some(count) = holds.counts.get_mut(room_id) else {
+            return;
+        };
+        *count -= 1;
+        if *count > 0 {
+            return;
         }
+        holds.counts.remove(room_id);
+        if holds.forgotten.remove(room_id)
+            && let Ok(mut dialects) = self.dialects.lock()
+        {
+            deactivate_state_dialect(dialects.remove(room_id));
+        }
+        self.holds_released.send_replace(());
     }
 }
 
@@ -78,7 +81,9 @@ impl<B: MatrixBackend> DialectBackend<B> {
         Self {
             inner,
             dialects: Mutex::new(HashMap::new()),
+            membership_dialect: None,
             holds: Mutex::new(Holds::default()),
+            holds_released: watch::Sender::new(()),
         }
     }
 
@@ -94,14 +99,11 @@ impl<B: MatrixBackend> DialectBackend<B> {
             holds.forgotten.remove(room_id);
         }
         if let Ok(mut dialects) = self.dialects.lock() {
-            match dialect {
-                OutboundDialect::None => {
-                    dialects.remove(room_id);
-                }
-                dialect => {
-                    dialects.insert(room_id.to_owned(), dialect);
-                }
-            }
+            let previous = match dialect {
+                OutboundDialect::None => dialects.remove(room_id),
+                dialect => dialects.insert(room_id.to_owned(), dialect),
+            };
+            deactivate_state_dialect(previous);
         }
     }
 
@@ -115,7 +117,7 @@ impl<B: MatrixBackend> DialectBackend<B> {
             return;
         }
         if let Ok(mut dialects) = self.dialects.lock() {
-            dialects.remove(room_id);
+            deactivate_state_dialect(dialects.remove(room_id));
         }
     }
 
@@ -137,12 +139,43 @@ impl<B: MatrixBackend> DialectBackend<B> {
         }
     }
 
+    /// Waits for the room's detached leaves to use their original dialect.
+    /// A new join can then publish to the same state key safely.
+    pub(crate) async fn wait_for_dialect_holds(&self, room_id: &str) {
+        let mut releases = self.holds_released.subscribe();
+        while self
+            .holds
+            .lock()
+            .is_ok_and(|holds| holds.counts.contains_key(room_id))
+        {
+            if releases.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     pub fn dialect(&self, room_id: &str) -> OutboundDialect {
+        if let Some(dialect) = &self.membership_dialect {
+            return dialect.clone();
+        }
         self.dialects
             .lock()
             .ok()
             .and_then(|dialects| dialects.get(room_id).cloned())
             .unwrap_or(OutboundDialect::None)
+    }
+
+    fn check_own_membership(&self) -> Result<(), CommandError>
+    where
+        B: 'static,
+    {
+        if self.own_membership_active() {
+            Ok(())
+        } else {
+            Err(crate::BackendError::new("RTC participation ended")
+                .permanent()
+                .into())
+        }
     }
 
     /// The dialect a to-device message is rendered in: a media key names its
@@ -153,6 +186,12 @@ impl<B: MatrixBackend> DialectBackend<B> {
             .and_then(Value::as_str)
             .map(|room_id| self.dialect(room_id))
             .unwrap_or(OutboundDialect::None)
+    }
+}
+
+fn deactivate_state_dialect(dialect: Option<OutboundDialect>) {
+    if let Some(OutboundDialect::State(dialect)) = dialect {
+        dialect.deactivate();
     }
 }
 
@@ -171,6 +210,27 @@ impl<B: MatrixBackend + 'static> MatrixBackend for DialectBackend<B> {
         self.inner.own_device_id()
     }
 
+    fn for_own_membership(self: Arc<Self>, room_id: &str) -> Arc<Self> {
+        Arc::new(Self {
+            membership_dialect: Some(self.dialect(room_id)),
+            ..Self::new(self.inner.clone())
+        })
+    }
+
+    fn own_membership_active(&self) -> bool {
+        match &self.membership_dialect {
+            Some(OutboundDialect::State(dialect)) => dialect.is_active(),
+            _ => true,
+        }
+    }
+
+    fn with_active_own_membership<T>(&self, action: impl FnOnce() -> T) -> Option<T> {
+        match &self.membership_dialect {
+            Some(OutboundDialect::State(dialect)) => dialect.with_active(action),
+            _ => Some(action()),
+        }
+    }
+
     async fn send_sticky_event(
         &self,
         room_id: String,
@@ -178,6 +238,7 @@ impl<B: MatrixBackend + 'static> MatrixBackend for DialectBackend<B> {
         content: Value,
         duration_ms: u64,
     ) -> Result<String, CommandError> {
+        self.check_own_membership()?;
         let dialect = self.dialect(&room_id);
         let content = dialect.rewrite_notification(&event_type, content);
         match dialect.route_member_event(event_type, content, Some(duration_ms)) {
@@ -234,6 +295,7 @@ impl<B: MatrixBackend + 'static> MatrixBackend for DialectBackend<B> {
         sticky_duration_ms: u64,
         delay_ms: u64,
     ) -> Result<String, CommandError> {
+        self.check_own_membership()?;
         // The delayed leave follows the same routing as the join it pairs
         // with. No lifetime: its legacy content is `{}`.
         match self
@@ -281,6 +343,7 @@ impl<B: MatrixBackend + 'static> MatrixBackend for DialectBackend<B> {
         room_id: String,
         delay_id: String,
     ) -> Result<(), CommandError> {
+        self.check_own_membership()?;
         self.inner.restart_delayed_event(room_id, delay_id).await
     }
 
@@ -298,6 +361,7 @@ impl<B: MatrixBackend + 'static> MatrixBackend for DialectBackend<B> {
         message_type: String,
         content: Value,
     ) -> Result<Vec<ToDeviceDelivery>, CommandError> {
+        self.check_own_membership()?;
         // A to-device message has one type, so in compat mode the key goes
         // out in the legacy dialect alone.
         let (message_type, content) = self

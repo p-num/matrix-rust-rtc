@@ -32,6 +32,7 @@ use crate::slot::{
     RawSlotEvent, RawSlotEventContent, RoomEncryption, SLOT_EVENT_TYPE, SlotEncryption, SlotState,
 };
 use crate::transport::RtcTransport;
+use crate::upkeep::UpkeepStopHandle;
 
 /// One room's RTC state and the slot sessions in it.
 pub struct BaseRtcRoom<T: MatrixBackend> {
@@ -201,6 +202,7 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
             );
             return Err(JoinError::AlreadyJoined(member_id));
         }
+        self.check_legacy_slot(&params.slot_id)?;
 
         let session = self.session_for_slot(&params.slot_id);
         if !session.has_backend() {
@@ -447,6 +449,21 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
             .collect()
     }
 
+    /// The room-state dialect has one outbound slot per room, including the
+    /// slot carried by legacy media keys.
+    pub fn check_legacy_slot(&self, slot_id: &str) -> Result<(), JoinError> {
+        if self.format == MembershipFormat::RoomState
+            && let Some(member_id) = self
+                .sessions
+                .iter()
+                .filter(|(id, _)| *id != slot_id)
+                .find_map(|(_, session)| session.own_member_id())
+        {
+            return Err(JoinError::AlreadyJoined(member_id.to_owned()));
+        }
+        Ok(())
+    }
+
     /// The event id of our current membership event in one slot, or `None` if
     /// it is not joined.
     ///
@@ -518,6 +535,13 @@ impl<T: MatrixBackend + 'static> BaseRtcRoom<T> {
         self.sessions
             .get(slot_id)
             .and_then(SlotSession::upkeep_abort_handle)
+    }
+
+    /// Stops this slot's upkeep after its current membership attempts finish.
+    pub fn upkeep_stop_handle(&self, slot_id: &str) -> Option<UpkeepStopHandle> {
+        self.sessions
+            .get(slot_id)
+            .and_then(SlotSession::upkeep_stop_handle)
     }
 
     /// Follows [`Self::key_rotation_due_at_ms`] for one slot; `None` if the slot

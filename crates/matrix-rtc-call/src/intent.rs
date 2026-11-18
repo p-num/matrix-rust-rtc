@@ -147,6 +147,7 @@ mod tests {
             member_id: format!("{sender}{device}"),
             membership_event_id: None,
             membership_ts: None,
+            legacy_join_id: Default::default(),
             origin_server_ts: None,
             application,
             transports: Vec::new(),

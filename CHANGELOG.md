@@ -13,6 +13,7 @@ log only.
 ### Added
 
 - Native membership snapshots expose join timestamps and conservative per-participation identity metadata (p-num/element-x-ios#411).
+- Legacy room-state joins publish and expose a stable per-join ID (p-num/element-x-ios#411).
 
 ### Fixed
 

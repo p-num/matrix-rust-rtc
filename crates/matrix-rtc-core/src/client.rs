@@ -15,11 +15,12 @@
 //! alone, an application's room state over it otherwise.
 
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard};
+use std::time::Duration;
 
 use tokio::sync::{Mutex, watch};
 
 use crate::compat::ingest::{member_id, outbound_dialect};
-use crate::compat::{DialectBackend, MembershipFormat};
+use crate::compat::{DialectBackend, MembershipFormat, OutboundDialect};
 use crate::executor::{self, AbortOnDrop, JoinHandleExt};
 use crate::feeder::{RoomAlreadyOpen, RoomAttachment, RoomFeeder, RoomRegistry, ToDeviceFeeder};
 use crate::outbox::{Outbox, SignallingHealth};
@@ -310,8 +311,25 @@ impl<B: MatrixBackend + 'static, M> BaseRtcRoomHandle<B, M> {
     /// membership and arms the delayed leave, so a dialect registered
     /// afterwards would let the two events that announce us go out in the
     /// current format.
-    pub fn prepare_join(&self, params: &mut JoinSessionParams) {
+    ///
+    /// Waits for a detached leave to finish before replacing the room's
+    /// dialect. Returns the explicit join ID the legacy dialect will publish.
+    pub async fn prepare_join(
+        &self,
+        params: &mut JoinSessionParams,
+        deadline: executor::Instant,
+    ) -> Result<Option<String>, JoinError> {
         let backend = &self.client.backend;
+        if self.format == MembershipFormat::RoomState
+            || matches!(backend.dialect(&self.room_id), OutboundDialect::State(_))
+        {
+            executor::timeout(
+                deadline.saturating_duration_since(executor::Instant::now()),
+                backend.wait_for_dialect_holds(&self.room_id),
+            )
+            .await
+            .map_err(|_| JoinError::TimedOut)?;
+        }
         let user_id = backend.own_user_id();
         let device_id = backend.own_device_id();
         // Not always a fresh id: see `compat::ingest::member_id` for the one
@@ -319,16 +337,19 @@ impl<B: MatrixBackend + 'static, M> BaseRtcRoomHandle<B, M> {
         params
             .membership_id
             .get_or_insert_with(|| member_id(self.format, &user_id, &device_id));
-        backend.set_dialect(
+        let dialect = outbound_dialect(
+            self.format,
+            &user_id,
+            &device_id,
             &self.room_id,
-            outbound_dialect(
-                self.format,
-                &user_id,
-                &device_id,
-                &self.room_id,
-                &params.slot_id,
-            ),
+            &params.slot_id,
         );
+        let join_id = match &dialect {
+            OutboundDialect::None => None,
+            OutboundDialect::State(dialect) => Some(dialect.legacy_join_id().to_owned()),
+        };
+        backend.set_dialect(&self.room_id, dialect);
+        Ok(join_id)
     }
 
     /// Resolves once the room's current state is applied, so a join issued
@@ -365,8 +386,14 @@ impl<B: MatrixBackend + 'static> BaseRtcRoomHandle<B> {
     /// See [`BaseRtcRoom::join`], rendered in the room's format (see
     /// [`Self::prepare_join`]): the joined slot keeps itself alive until left.
     pub async fn join(&self, mut params: JoinSessionParams) -> Result<String, JoinError> {
-        self.prepare_join(&mut params);
-        self.room.lock().await.join(params).await
+        let deadline =
+            executor::Instant::now() + Duration::from_millis(crate::DEFAULT_JOIN_BUDGET_MS);
+        let mut room = self.room.lock().await;
+        room.check_legacy_slot(&params.slot_id)?;
+        if room.own_member_id(&params.slot_id).is_none() {
+            self.prepare_join(&mut params, deadline).await?;
+        }
+        room.join_within(params, Some(deadline)).await
     }
 
     pub async fn leave(&self, slot_id: &str, params: LeaveSessionParams) -> Result<(), LeaveError> {

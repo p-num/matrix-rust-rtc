@@ -7,7 +7,7 @@
 //! These DTO tests keep core memberships independent of native binding types.
 
 use super::*;
-use matrix_rtc_core::compat::{MembershipFormat, ingest};
+use matrix_rtc_core::compat::{LegacyJoinId, MembershipFormat, ingest};
 
 fn member(
     member_id: &str,
@@ -79,10 +79,33 @@ async fn msc_identity_survives_refresh_and_changes_on_rejoin() {
             FfiMembershipIdentityKind::PerJoinMemberId
         );
         assert_eq!(value.membership_ts, None);
+        assert_eq!(value.legacy_join_id, None);
     }
     assert_eq!(first.member_id, refresh.member_id);
     assert_ne!(first.membership_event_id, refresh.membership_event_id);
     assert_ne!(first.member_id, rejoin.member_id);
+}
+
+#[tokio::test]
+async fn explicit_legacy_join_id_is_carried_only_in_room_state() {
+    let join_id = "0123456789abcdef0123456789abcdef";
+    let mut member = member("@alice:example.org:DEVICE", "$first", Some(100), 110);
+    member.legacy_join_id = LegacyJoinId::Valid(join_id.to_owned());
+
+    let legacy = snapshot_roundtrip(member.clone(), MembershipFormat::RoomState).await;
+    assert_eq!(
+        legacy.identity_kind,
+        FfiMembershipIdentityKind::LegacyJoinId
+    );
+    assert_eq!(legacy.legacy_join_id.as_deref(), Some(join_id));
+    assert_eq!(legacy.membership_ts, Some(100));
+
+    let msc = snapshot_roundtrip(member, MembershipFormat::Msc).await;
+    assert_eq!(
+        msc.identity_kind,
+        FfiMembershipIdentityKind::PerJoinMemberId
+    );
+    assert_eq!(msc.legacy_join_id, None);
 }
 
 #[tokio::test]

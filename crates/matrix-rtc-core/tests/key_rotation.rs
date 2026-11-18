@@ -419,6 +419,7 @@ impl Peer {
             member_id: self.member_id.clone(),
             membership_event_id: None,
             membership_ts: None,
+            legacy_join_id: Default::default(),
             origin_server_ts: None,
             application: "m.call".into(),
             transports: Vec::new(),

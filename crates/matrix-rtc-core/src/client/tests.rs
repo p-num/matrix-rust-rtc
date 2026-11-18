@@ -11,8 +11,8 @@ use std::time::Duration;
 use serde_json::json;
 
 use super::*;
-use crate::compat::{OutboundDialect, STATE_MEMBER_EVENT_TYPE};
-use crate::testing::MockBackend;
+use crate::compat::{LEGACY_JOIN_ID_FIELD, OutboundDialect, STATE_MEMBER_EVENT_TYPE};
+use crate::testing::{MockBackend, MockMethod, MockOutcome};
 use crate::{
     EventEncryption, EventIn, KEY_MESSAGE_TYPE, LiveKitTransport, RtcTransport, SLOT_EVENT_TYPE,
     ToDeviceMessageIn,
@@ -259,6 +259,122 @@ async fn a_room_state_room_reads_its_membership_from_state_and_joins_as_state() 
         "the membership went out as room state"
     );
     assert!(mock.sticky_events.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn legacy_join_id_survives_a_refused_duplicate_repair_and_scheduled_refresh() {
+    let mock = mock();
+    let origin = tokio::time::Instant::now();
+    let outbox = Outbox::with_clock(Arc::new(move || {
+        10_000 + origin.elapsed().as_millis() as u64
+    }));
+    let client = BaseRtcClient::with_outbox(mock.clone(), outbox);
+    let room = open_in(&client, &mock, MembershipFormat::RoomState).await;
+    room.join(
+        join_params()
+            .keep_alive_interval_ms(100)
+            .sticky_duration_ms(2_100),
+    )
+    .await
+    .expect("join");
+    let join_id = mock.state_events.lock().unwrap()[0].3[LEGACY_JOIN_ID_FIELD].clone();
+    assert!(join_id.is_string());
+    assert!(matches!(
+        room.join(join_params()).await,
+        Err(JoinError::AlreadyJoined(_))
+    ));
+    let mut other_slot = join_params();
+    other_slot.slot_id = "m.call#alternate".to_owned();
+    assert!(matches!(
+        room.join(other_slot).await,
+        Err(JoinError::AlreadyJoined(_))
+    ));
+
+    mock.script(
+        MockMethod::RestartDelayedEvent,
+        [MockOutcome::Fail(BackendError::with_matrix_error(
+            Some("M_NOT_FOUND".to_owned()),
+            Some(404),
+            "delayed leave fired",
+        ))],
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(mock.delayed_events.lock().unwrap().len(), 2);
+    assert_eq!(
+        mock.state_events.lock().unwrap().len(),
+        2,
+        "repair republished"
+    );
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let state = mock.state_events.lock().unwrap();
+    assert!(state.len() > 2, "scheduled refresh republished");
+    for (_, _, _, content) in state.iter() {
+        assert_eq!(content[LEGACY_JOIN_ID_FIELD], join_id);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_new_legacy_join_waits_for_the_old_detached_leave() {
+    let mock = mock();
+    let client = BaseRtcClient::new(mock.clone());
+    let room = open_in(&client, &mock, MembershipFormat::RoomState).await;
+    room.join(join_params()).await.expect("join");
+
+    let hold = client.backend().hold_dialect(ROOM);
+    let pending = room
+        .state()
+        .lock()
+        .await
+        .begin_leave(SLOT, LeaveSessionParams::new())
+        .await
+        .expect("begin leave");
+    let mut other_slot = join_params();
+    other_slot.slot_id = "m.call#alternate".to_owned();
+    assert!(matches!(
+        room.join(other_slot.clone()).await,
+        Err(JoinError::TimedOut)
+    ));
+    let replacement = room.join(other_slot);
+    tokio::pin!(replacement);
+    assert!(futures_util::poll!(&mut replacement).is_pending());
+    assert_eq!(mock.state_events.lock().unwrap().len(), 1);
+    pending.send().await.expect("old leave");
+    drop(hold);
+    replacement.await.expect("new join");
+
+    let state = mock.state_events.lock().unwrap();
+    assert_eq!(state.len(), 3);
+    assert_eq!(state[0].2, state[1].2);
+    assert_eq!(state[1].3, json!({}));
+    assert_ne!(state[1].2, state[2].2);
+    assert_ne!(
+        state[0].3[LEGACY_JOIN_ID_FIELD],
+        state[2].3[LEGACY_JOIN_ID_FIELD]
+    );
+}
+
+#[tokio::test]
+async fn a_new_msc_join_can_precede_a_detached_msc_leave() {
+    let mock = mock();
+    let client = BaseRtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+    room.join(join_params()).await.expect("join");
+    let hold = client.backend().hold_dialect(ROOM);
+    let pending = room
+        .state()
+        .lock()
+        .await
+        .begin_leave(SLOT, LeaveSessionParams::new())
+        .await
+        .expect("begin leave");
+    room.join(join_params()).await.expect("new join");
+    pending.send().await.expect("old leave");
+    drop(hold);
+
+    let sent = mock.sticky_events.lock().unwrap();
+    assert_eq!(sent.len(), 3);
+    assert_eq!(sent[0].2["member"]["id"], sent[2].2["member"]["id"]);
+    assert_ne!(sent[1].2["member"]["id"], sent[2].2["member"]["id"]);
 }
 
 #[tokio::test]

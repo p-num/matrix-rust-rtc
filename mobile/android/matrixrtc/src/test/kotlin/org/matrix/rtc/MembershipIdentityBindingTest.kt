@@ -14,12 +14,13 @@ class MembershipIdentityBindingTest {
     @Test
     fun membershipIdentityMetadataSurvivesTheGeneratedCodec() {
         val cases = listOf(
-            FfiMembershipIdentityKind.PER_JOIN_MEMBER_ID to null,
-            FfiMembershipIdentityKind.LEGACY_MEMBERSHIP_TIMESTAMP to 0uL,
-            FfiMembershipIdentityKind.LEGACY_MEMBERSHIP_TIMESTAMP to ULong.MAX_VALUE,
-            FfiMembershipIdentityKind.UNAVAILABLE to null,
+            Triple(FfiMembershipIdentityKind.PER_JOIN_MEMBER_ID, null, null),
+            Triple(FfiMembershipIdentityKind.LEGACY_JOIN_ID, 1uL, "0123456789abcdef0123456789abcdef"),
+            Triple(FfiMembershipIdentityKind.LEGACY_MEMBERSHIP_TIMESTAMP, 0uL, null),
+            Triple(FfiMembershipIdentityKind.LEGACY_MEMBERSHIP_TIMESTAMP, ULong.MAX_VALUE, null),
+            Triple(FfiMembershipIdentityKind.UNAVAILABLE, null, null),
         )
-        for ((kind, timestamp) in cases) {
+        for ((kind, timestamp, legacyJoinId) in cases) {
             val original = JoinedMembership(
                 roomId = "!room:example.org",
                 slotId = "m.call#room",
@@ -29,6 +30,7 @@ class MembershipIdentityBindingTest {
                 memberId = "member",
                 membershipEventId = "\$refresh",
                 membershipTs = timestamp,
+                legacyJoinId = legacyJoinId,
                 identityKind = kind,
                 application = "m.call",
                 transports = emptyList(),

@@ -486,6 +486,9 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
 
     /// Gets the current state of the membership machine.
     pub fn state(&self) -> OwnMembershipState {
+        if !self.backend.own_membership_active() {
+            return OwnMembershipState::Leaving;
+        }
         self.state.lock().unwrap().clone()
     }
 
@@ -677,7 +680,11 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
     /// either sees the send and cancels it, or the send sees the leave.
     fn begin_if_joined(&self, kind: SendKind) -> Option<PendingSend> {
         let state = self.state.lock().unwrap();
-        (*state == OwnMembershipState::Joined).then(|| self.outbox.begin(self.key(kind)))
+        if *state != OwnMembershipState::Joined {
+            return None;
+        }
+        self.backend
+            .with_active_own_membership(|| self.outbox.begin(self.key(kind)))
     }
 
     /// One attempt at putting `content` in the sticky map.
@@ -1038,7 +1045,8 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
                 return;
             }
             *state_guard = OwnMembershipState::Leaving;
-            self.outbox.cancel_scope(&self.scope);
+            self.backend
+                .with_active_own_membership(|| self.outbox.cancel_scope(&self.scope));
         }
         self.update_lapsed();
     }

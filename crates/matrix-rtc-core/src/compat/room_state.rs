@@ -91,7 +91,7 @@
 //! content missing any of them fails the whole parse instead of degrading. Raw
 //! JSON is both more permissive and more honest here.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 // `std::time::SystemTime::now()` panics on wasm32-unknown-unknown; web-time's
 // is the same API over `Date.now()`.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -99,12 +99,50 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use web_time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::element_call::{is_leave, legacy_session};
 
 /// The state event type carrying a pre-sticky Element Call membership.
 pub const STATE_MEMBER_EVENT_TYPE: &str = "org.matrix.msc3401.call.member";
+
+/// Optional per-participation identity in a legacy room-state membership.
+pub const LEGACY_JOIN_ID_FIELD: &str = "io.letro.call.join_id";
+
+/// Whether a legacy room-state membership supplied a usable join ID.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyJoinId {
+    /// Older peers omit the field and may identify the join using `created_ts`.
+    #[default]
+    Absent,
+    /// Exactly 32 lowercase ASCII hexadecimal characters.
+    Valid(String),
+    /// A present but malformed field leaves telemetry identity unavailable.
+    Invalid,
+}
+
+impl LegacyJoinId {
+    fn parse(value: Option<&Value>) -> Self {
+        match value {
+            None => Self::Absent,
+            Some(Value::String(id)) if is_legacy_join_id(id) => Self::Valid(id.clone()),
+            Some(_) => Self::Invalid,
+        }
+    }
+
+    pub(crate) fn is_absent(&self) -> bool {
+        matches!(self, Self::Absent)
+    }
+}
+
+fn is_legacy_join_id(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
 
 /// The `call_id` sentinel an MSC4143 slot id uses for the room-wide session,
 /// where this dialect uses an empty string. The same convention
@@ -180,6 +218,8 @@ pub struct StateMembership {
     /// carry no decryption metadata anywhere in the SDK, and Element Call as a
     /// widget could not read it if they did. Becomes `EventOrigin::RoomState`.
     pub claimed_device_id: String,
+    /// Join identity metadata read from the original legacy state event.
+    pub legacy_join_id: LegacyJoinId,
     /// MSC4143 `m.rtc.member` content, ready to deserialize as the core's
     /// `RawStickyEventContent`.
     pub content: Value,
@@ -208,6 +248,8 @@ struct Parsed<'a> {
     /// The raw `created_ts`, when supplied by the peer. The event timestamp
     /// stays separate so public membership identity can report an absence.
     membership_ts: Option<u64>,
+    /// The optional join ID field, including malformed values.
+    legacy_join_id: Option<&'a Value>,
     /// `content["m.call.intent"]`, if stated.
     intent: Option<&'a Value>,
     /// `foci_preferred[0]`, verbatim.
@@ -297,6 +339,7 @@ pub fn translate_state_memberships(
                 sender: member.sender.to_owned(),
                 origin_server_ts: member.origin_server_ts,
                 claimed_device_id: member.device_id.clone(),
+                legacy_join_id: LegacyJoinId::parse(member.legacy_join_id),
                 content,
             }
         })
@@ -405,6 +448,7 @@ fn parse<'a>(event: &'a StateMemberEvent, now_ms: u64) -> Option<Parsed<'a>> {
         application_type: application_type.to_owned(),
         joined_at,
         membership_ts,
+        legacy_join_id: object.get(LEGACY_JOIN_ID_FIELD),
         intent: object.get("m.call.intent"),
         own_focus: object
             .get("foci_preferred")
@@ -466,6 +510,9 @@ pub struct RoomStateDialect {
     own_device_id: String,
     room_id: String,
     slot_id: String,
+    /// Generated for this join and shared by every send from this dialect.
+    legacy_join_id: String,
+    active: Arc<Mutex<bool>>,
     /// Pinned on the first join and never moved.
     ///
     /// It is the join instant, and peers read it as one: this generation's
@@ -494,6 +541,8 @@ impl RoomStateDialect {
             own_device_id: own_device_id.into(),
             room_id: room_id.into(),
             slot_id: slot_id.into(),
+            legacy_join_id: crate::generate_member_id(),
+            active: Arc::new(Mutex::new(true)),
             created_ts: Arc::new(OnceLock::new()),
         }
     }
@@ -517,6 +566,24 @@ impl RoomStateDialect {
     /// our SFU participant identity.
     pub fn membership_id(&self) -> String {
         participant_identity(&self.own_user_id, &self.own_device_id)
+    }
+
+    /// The explicit join ID published throughout this participation.
+    pub fn legacy_join_id(&self) -> &str {
+        &self.legacy_join_id
+    }
+
+    pub(super) fn is_active(&self) -> bool {
+        self.with_active(|| ()).is_some()
+    }
+
+    pub(super) fn with_active<T>(&self, action: impl FnOnce() -> T) -> Option<T> {
+        let active = self.active.lock().unwrap();
+        (*active).then(action)
+    }
+
+    pub(super) fn deactivate(&self) {
+        *self.active.lock().unwrap() = false;
     }
 
     /// The device we publish, for the shared key-message builder.
@@ -582,6 +649,7 @@ impl RoomStateDialect {
             "scope": "m.room",
             "device_id": self.own_device_id,
             "membershipID": self.membership_id(),
+            (LEGACY_JOIN_ID_FIELD): self.legacy_join_id,
             "created_ts": created_ts,
             "expires": expires,
             // We publish on exactly one focus, so which selection mode we
@@ -643,6 +711,55 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn retiring_a_dialect_cannot_be_overtaken_by_its_paused_registration() {
+        use std::sync::{TryLockError, mpsc};
+
+        use crate::{Outbox, SendFailure, SendKind, SendPolicy, SlotKey};
+
+        let dialect = RoomStateDialect::new(
+            "@alice:example.org",
+            "ALICE",
+            "!room:example.org",
+            "m.call#room",
+        );
+        let outbox = Outbox::new();
+        let key = SlotKey::new("membership lane", SendKind::Membership);
+        let (checked, wait_for_check) = mpsc::sync_channel(0);
+        let (resume, wait_to_resume) = mpsc::sync_channel(0);
+
+        let (old_send, new_send) = std::thread::scope(|scope| {
+            let (dialect, outbox, key) = (&dialect, &outbox, &key);
+            let register = scope.spawn(move || {
+                dialect.with_active(|| {
+                    checked.send(()).unwrap();
+                    wait_to_resume.recv().unwrap();
+                    outbox.begin(key.clone())
+                })
+            });
+            wait_for_check.recv().unwrap();
+            let gate = dialect.active.try_lock().map(drop);
+            resume.send(()).unwrap();
+            assert!(matches!(gate, Err(TryLockError::WouldBlock)));
+            dialect.deactivate();
+            let new_send = outbox.begin(key.clone());
+            (register.join().unwrap().unwrap(), new_send)
+        });
+        assert!(dialect.with_active(|| outbox.begin(key)).is_none());
+        assert!(matches!(
+            old_send
+                .run(SendPolicy::single_attempt(), || async { Ok(()) })
+                .await,
+            Err(SendFailure::Superseded),
+        ));
+        assert!(
+            new_send
+                .run(SendPolicy::single_attempt(), || async { Ok(()) })
+                .await
+                .is_ok()
+        );
+    }
 
     /// A join as observed from Element Call on the JS SDK, pre-sticky.
     const EC_JOIN: &str = r#"{
@@ -1178,6 +1295,9 @@ mod tests {
             "!room:example.io"
         );
         assert!(legacy["created_ts"].is_u64());
+        assert!(is_legacy_join_id(
+            legacy[LEGACY_JOIN_ID_FIELD].as_str().unwrap()
+        ));
         // No spec field survives: this event serves one dialect only.
         assert!(legacy.get("slot_id").is_none());
         assert!(legacy.get("member").is_none());
@@ -1217,6 +1337,15 @@ mod tests {
             first["created_ts"],
             dialect.clone().member_content(&spec, Some(60_000))["created_ts"],
         );
+    }
+
+    #[test]
+    fn a_legacy_join_id_survives_refreshes_and_clones() {
+        let legacy = dialect();
+        let spec = content(SPEC_JOIN);
+        let first = legacy.member_content(&spec, Some(60_000));
+        let refreshed = legacy.clone().member_content(&spec, Some(90_000));
+        assert_eq!(first[LEGACY_JOIN_ID_FIELD], refreshed[LEGACY_JOIN_ID_FIELD]);
     }
 
     /// The deadline peers compute is `created_ts + expires`, and `created_ts`
