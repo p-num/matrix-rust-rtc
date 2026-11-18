@@ -20,7 +20,8 @@ use std::time::Duration;
 
 use matrix_rtc_core::compat::{DialectBackend, MembershipFormat};
 use matrix_rtc_core::outbox::{
-    BACKOFF_INITIAL, BACKOFF_MAX, Outbox, SendFailure, SendKind, SendPolicy, SlotKey,
+    ATTEMPT_TIMEOUT, BACKOFF_INITIAL, BACKOFF_MAX, Outbox, SendFailure, SendKind, SendPolicy,
+    SlotKey,
 };
 use matrix_rtc_core::{
     ApplicationIntake, BaseRtcRoom, CommandError, JoinError, JoinSessionParams, JoinedMembership,
@@ -492,14 +493,16 @@ impl<T: MatrixBackend + 'static> CallRoomState<T> {
         let hand_up = self
             .with_state(slot_id, |state| state.reactions.own_raised_hand().is_some())
             .unwrap_or(false);
-        if hand_up
-            && self.rtc.own_member_id(slot_id).is_some()
-            && let Err(error) = self.lower_hand(slot_id).await
-        {
-            log::warn!(
-                "[{room_id}/{slot_id}] the raised hand was not lowered before leaving ({error}); \
-                 peers drop it with the membership",
-            );
+        if hand_up && self.rtc.own_member_id(slot_id).is_some() {
+            match executor::timeout(ATTEMPT_TIMEOUT, self.lower_hand(slot_id)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => log::warn!(
+                    "[{room_id}/{slot_id}] the raised hand was not lowered before leaving ({error})"
+                ),
+                Err(error) => log::warn!(
+                    "[{room_id}/{slot_id}] the raised hand was not lowered before leaving ({error})"
+                ),
+            }
         }
 
         if let Some(Some(direct)) = self.with_state(slot_id, |state| state.direct.clone()) {
@@ -512,7 +515,12 @@ impl<T: MatrixBackend + 'static> CallRoomState<T> {
                 .with_state(slot_id, |state| state.members.clone())
                 .unwrap_or_default();
             if others_joined(&members, &backend.own_user_id(), &backend.own_device_id()) == 0 {
-                self.withdraw_invite(slot_id).await;
+                if executor::timeout(ATTEMPT_TIMEOUT, self.withdraw_invite(slot_id))
+                    .await
+                    .is_err()
+                {
+                    log::warn!("[{room_id}/{slot_id}] invite withdrawal timed out");
+                }
             } else {
                 self.with_state(slot_id, |state| state.invite_sticky_ms = None);
             }

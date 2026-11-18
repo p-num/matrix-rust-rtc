@@ -1030,7 +1030,12 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
                 user_id: m.sender.clone(),
                 device_id: m.origin.sender_device_id().unwrap_or_default().to_owned(),
                 member_id: m.member_id.clone(),
-                membership_ts: m.membership_ts,
+                // A legacy state join may omit `created_ts` while reusing a
+                // member ID. Use that event's timestamp to detect a rejoin.
+                membership_ts: m.membership_ts.or(match m.origin {
+                    EventOrigin::RoomState { .. } => m.origin_server_ts,
+                    _ => None,
+                }),
             })
             .collect();
 
@@ -1822,7 +1827,9 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
             // than MSC4143 wants, but not vacuous: the key still has to arrive
             // Olm-encrypted from that exact device, so a forged claim only ever
             // names a device its author cannot send as.
-            EventOrigin::Claimed { device_id } => device_id.as_str(),
+            EventOrigin::Claimed { device_id } | EventOrigin::RoomState { device_id } => {
+                device_id.as_str()
+            }
 
             // Either the member event was encrypted but could not be attributed
             // to a device — which should not happen, since Olm messages carry
@@ -2184,9 +2191,12 @@ impl<T: MatrixBackend + 'static> EncryptionManager<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compat::MembershipFormat;
+    use crate::compat::ingest::{LegacyStateMemberEventIn, to_core_state_memberships};
+    use crate::compat::room_state::now_ms;
     use crate::host::backend::{MockBackend, NoopBackend, ToDeviceDelivery};
     use crate::host::event::EventOrigin;
-    use crate::session::JoinedMembership;
+    use crate::session::{JoinedMembership, RtcMembershipEvent};
     use std::sync::Arc;
 
     const ROOM_ID: &str = "!room:example.org";
@@ -2229,6 +2239,7 @@ mod tests {
             member_id: "bob-device456-uuid".to_string(),
             membership_event_id: None,
             membership_ts: None,
+            legacy_join_id: Default::default(),
             origin_server_ts: None,
             application: "m.call".into(),
             transports: Vec::new(),
@@ -2864,20 +2875,79 @@ mod tests {
         );
     }
 
-    /// A membership re-sent to extend its lifetime keeps its `created_ts`: the
-    /// same participation restated must not read as a rejoin and cost a send or
-    /// an owed rotation.
     #[tokio::test]
-    async fn a_membership_refresh_with_an_unchanged_timestamp_distributes_nothing() {
+    async fn legacy_state_key_distribution_distinguishes_rejoins_from_refreshes() {
+        let now = now_ms();
+        for (first_created_ts, second_created_ts, deliveries) in [
+            (None, None, 2),
+            (None, Some(now), 1),
+            (Some(now), Some(now), 1),
+        ] {
+            let sender = Arc::new(MockBackend::new());
+            let memberships = Arc::new(Mutex::new(Vec::new()));
+            let mut manager = manager_over(sender.clone(), memberships.clone());
+            let clock = TestClock::new();
+            manager.set_clock(clock.as_rtc_clock());
+            manager.join().await.expect("join should succeed");
+
+            for (event_id, origin_server_ts, created_ts, expected_messages) in [
+                ("$first", now, first_created_ts, 1),
+                ("$second", now + 1_000, second_created_ts, deliveries),
+            ] {
+                let mut content = serde_json::json!({
+                    "application": "m.call",
+                    "device_id": "device456",
+                    "membershipID": "@bob:example.org:device456",
+                });
+                if let Some(created_ts) = created_ts {
+                    content["created_ts"] = created_ts.into();
+                }
+                let event = to_core_state_memberships(
+                    ROOM_ID,
+                    vec![LegacyStateMemberEventIn {
+                        event_id: Some(event_id.to_owned()),
+                        sender: "@bob:example.org".to_owned(),
+                        state_key: "_@bob:example.org_device456_m.call".to_owned(),
+                        origin_server_ts,
+                        content,
+                    }],
+                )
+                .pop()
+                .expect("a live membership");
+                let RtcMembershipEvent::Joined(joined) = event
+                    .try_into_membership_event_in(MembershipFormat::RoomState)
+                    .expect("converts to a membership event")
+                else {
+                    panic!("expected a joined membership");
+                };
+                assert_eq!(joined.membership_ts, created_ts);
+                *memberships.lock().unwrap() = vec![joined];
+                manager
+                    .on_memberships_update()
+                    .await
+                    .expect("update should succeed");
+                assert_eq!(
+                    sender
+                        .to_device_messages_for("@bob:example.org", "device456")
+                        .len(),
+                    expected_messages,
+                    "a new state event without created_ts must be served, while a refresh with \
+                     the same created_ts must not be sent another key"
+                );
+            }
+        }
+    }
+
+    /// A native MSC4143 membership keeps its member ID on refresh, which
+    /// identifies the join even when the event timestamp moves.
+    #[tokio::test]
+    async fn a_native_membership_refresh_distributes_nothing() {
         let sender = Arc::new(MockBackend::new());
-        let memberships = Arc::new(Mutex::new(vec![JoinedMembership {
-            membership_ts: Some(1_000),
-            origin_server_ts: None,
-            ..bob_membership()
-        }]));
+        let memberships = Arc::new(Mutex::new(vec![bob_membership()]));
         let manager = manager_over(sender.clone(), memberships.clone());
         manager.join().await.expect("join should succeed");
-        for _ in 0..3 {
+        for origin_server_ts in [1_000, 2_000, 3_000] {
+            memberships.lock().unwrap()[0].origin_server_ts = Some(origin_server_ts);
             manager
                 .on_memberships_update()
                 .await

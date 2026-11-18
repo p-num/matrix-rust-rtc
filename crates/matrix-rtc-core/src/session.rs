@@ -15,11 +15,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, watch};
 
-use crate::compat::MembershipFormat;
+use crate::compat::{LegacyJoinId, MembershipFormat};
 use crate::encryption::types::ReceivedEncryptionKey;
 use crate::encryption::{EncryptionKeySignalHandler, EncryptionManager, RtcIdentityMapper};
 use crate::error::{CommandError, JoinError, LeaveError};
-use crate::executor::{self, AbortHandle, AbortOnDrop};
+use crate::executor::{self, AbortHandle};
 use crate::host::backend::MatrixBackend;
 use crate::host::event::EventOrigin;
 use crate::join::{JoinSessionParams, LeaveSessionParams, TransportIntent};
@@ -28,7 +28,7 @@ use crate::outbox::Outbox;
 use crate::own_membership::{MembershipTimings, OwnEntry, OwnMembershipMachine, transport_to_json};
 use crate::slot::{RoomEncryption, SlotState};
 use crate::transport::{LiveKitTransport, MemberTransports, RtcTransport};
-use crate::upkeep::{self, SessionUpkeep};
+use crate::upkeep::{self, SessionUpkeep, UpkeepStopHandle, UpkeepTask};
 
 #[allow(unused_imports)]
 use log::*;
@@ -138,7 +138,7 @@ const AUTO_LEAVES_CAPACITY: usize = 4;
 /// without the session or its room.
 pub struct PendingLeave<T: MatrixBackend + 'static> {
     machine: Arc<OwnMembershipMachine<T>>,
-    upkeep: Option<AbortOnDrop<()>>,
+    upkeep: Option<UpkeepTask>,
     leave_reason: Option<LeaveReason>,
     log_tag: String,
 }
@@ -192,7 +192,7 @@ pub struct SlotSession<T: MatrixBackend> {
     own_membership_machine: Option<Arc<OwnMembershipMachine<T>>>,
     /// The task keeping our membership alive and rotating keys on time, from
     /// join until leave; dropping the session stops it.
-    upkeep: Option<AbortOnDrop<()>>,
+    upkeep: Option<UpkeepTask>,
     /// Identity of the current join, or `None` while not joined.
     own_participation: Option<OwnParticipation>,
     /// Encryption manager for key distribution and management.
@@ -460,6 +460,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             JoinError::CommandError(CommandError::from_message("no backend configured"))
         })?;
 
+        let backend = backend.clone().for_own_membership(&self.room_id);
         let membership_id = params.membership_id();
         let user_id = backend.own_user_id();
         let device_id = backend.own_device_id();
@@ -822,7 +823,12 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
     /// Stops this join's upkeep when aborted, for an owner that lets go of
     /// the join without leaving; `None` while not joined or without one.
     pub fn upkeep_abort_handle(&self) -> Option<AbortHandle> {
-        self.upkeep.as_ref().map(AbortOnDrop::abort_handle)
+        self.upkeep.as_ref().map(UpkeepTask::abort_handle)
+    }
+
+    /// Stops this join's upkeep after its current membership attempts finish.
+    pub fn upkeep_stop_handle(&self) -> Option<UpkeepStopHandle> {
+        self.upkeep.as_ref().map(UpkeepTask::stop_handle)
     }
 
     /// Whether a dead man's switch is protecting our membership.
@@ -1182,7 +1188,7 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
         // device is the one that encrypted the event, never one the content
         // claims.
         //
-        // `Claimed` is the one exception, and it only ever comes from the
+        // Self-asserted devices are an exception that only comes from the
         // room-state format: Element Call's state events cannot be encrypted at
         // all, and that format exists to interoperate with it (spec 038 R32).
         // The MSC format never produces it.
@@ -1191,7 +1197,8 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
                 EventOrigin::Encrypted {
                     sender_device_id: Some(_),
                 }
-                | EventOrigin::Claimed { .. } => {}
+                | EventOrigin::Claimed { .. }
+                | EventOrigin::RoomState { .. } => {}
                 EventOrigin::Encrypted {
                     sender_device_id: None,
                 } => return JoinCondition::NoSendingDevice,
@@ -1755,17 +1762,22 @@ pub struct JoinedMembership {
     /// states it.
     ///
     /// `None` for a native MSC4143 membership, whose `member_id` is already
-    /// fresh per join. The pre-sticky Element Call dialect reuses
+    /// fresh per join, or a legacy membership with no explicit generation
+    /// timestamp. The pre-sticky Element Call dialect reuses
     /// `{user}:{device}` as the member id across joins, and there this is the
-    /// event's `created_ts` — pinned for the life of one join, new on the
+    /// event's raw `created_ts` — pinned for the life of one join, new on the
     /// next — so `(member_id, membership_ts)` distinguishes two joins by the
-    /// same device where `member_id` alone cannot. The js-sdk's encryption
-    /// manager keys on the same value as `membershipTs`.
+    /// same device where `member_id` alone cannot.
+    /// Expiry/focus calculations clamp a fast clock separately; identity keeps
+    /// the raw generation timestamp across refreshes and never synthesizes one
+    /// from an event timestamp.
     pub membership_ts: Option<u64>,
+    /// The explicit join identity of a translated legacy state membership.
+    #[serde(default, skip_serializing_if = "LegacyJoinId::is_absent")]
+    pub legacy_join_id: LegacyJoinId,
     /// `origin_server_ts` of the *latest* member event, when the host reported
-    /// one. Moves on every sticky refresh, like `membership_event_id`; a
-    /// consumer wanting a join time pins the first value it sees. Never an
-    /// identity: keys stay on `(member_id, membership_ts)`.
+    /// one. Moves on every refresh, like `membership_event_id`. Key distribution
+    /// uses it as a fallback for a room-state membership without `created_ts`.
     pub origin_server_ts: Option<u64>,
     /// `content.application`; a joined membership always has a `type`.
     pub application: ApplicationInfo,

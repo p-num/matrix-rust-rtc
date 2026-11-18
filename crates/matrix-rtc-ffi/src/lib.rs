@@ -26,6 +26,8 @@ use matrix_rtc_core::compat::DialectBackend;
 mod backend;
 pub mod compat;
 mod logging;
+#[cfg(test)]
+mod membership_identity_tests;
 mod params;
 mod runtime;
 pub use backend::{
@@ -292,6 +294,24 @@ pub fn reaction_sound_for(name: String) -> String {
     matrix_rtc_call::sound_for(&name).asset_name().to_owned()
 }
 
+/// Which roster fields can distinguish one participation from a later rejoin.
+/// This is metadata for the host; it does not create or emit a correlation ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum FfiMembershipIdentityKind {
+    /// In the MSC format, `member_id` is fresh per join and survives refreshes.
+    PerJoinMemberId,
+    /// In the room-state format, use `(member_id, legacy_join_id)` together.
+    LegacyJoinId,
+    /// In the room-state format, use `(member_id, membership_ts)` when the
+    /// peer omitted the explicit join ID field.
+    LegacyMembershipTimestamp,
+    /// No supported per-join identity is available. Do not derive a correlation
+    /// ID from the member, event ID, origin timestamp, or a local observation.
+    Unavailable,
+}
+
+/// A joined roster entry. Identity metadata describes a participation, not an
+/// entire room call, and never authorizes logging raw Matrix identifiers.
 #[derive(Clone, Debug, PartialEq, Eq, uniffi::Record)]
 pub struct JoinedMembership {
     pub room_id: String,
@@ -303,6 +323,14 @@ pub struct JoinedMembership {
     /// Event id of the member's latest membership event. Moves on every sticky
     /// refresh.
     pub membership_event_id: Option<String>,
+    /// Join timestamp in milliseconds since the Unix epoch, when the dialect
+    /// provides one. Pinned across legacy refreshes; never replaced by the
+    /// latest event's `origin_server_ts` or a locally observed time.
+    pub membership_ts: Option<u64>,
+    /// The validated explicit join ID of a legacy room-state membership.
+    pub legacy_join_id: Option<String>,
+    /// Which fields can safely identify this participation across clients.
+    pub identity_kind: FfiMembershipIdentityKind,
     pub application: Option<String>,
     /// Transports this member publishes media on (MSC4143).
     pub transports: Vec<FfiRtcTransport>,
@@ -459,7 +487,6 @@ impl RtcRoom {
         );
         Ok(Arc::new(RtcCall {
             call: joined,
-            #[cfg(feature = "media")]
             compat: room.format(),
             #[cfg(feature = "media")]
             backend: room.backend().clone(),
@@ -547,8 +574,9 @@ impl RtcRoom {
         &self,
         slot_id: String,
     ) -> Result<Arc<MembershipSnapshotSubscription>, MatrixRtcFfiError> {
-        let receiver = self.open().await?.observe(&slot_id).await;
-        Ok(MembershipSnapshotSubscription::new(receiver))
+        let room = self.open().await?;
+        let receiver = room.observe(&slot_id).await;
+        Ok(MembershipSnapshotSubscription::new(receiver, room.format()))
     }
 
     /// A JSON dump of everything the room currently believes: its room state,
@@ -607,8 +635,7 @@ impl RtcRoom {
 #[derive(uniffi::Object)]
 pub struct RtcCall {
     call: Arc<call::RtcCall<FfiBackend>>,
-    /// The room's mode and backend, for the media layer.
-    #[cfg(feature = "media")]
+    /// The room's mode, for membership identity metadata and the media layer.
     compat: matrix_rtc_core::compat::MembershipFormat,
     #[cfg(feature = "media")]
     backend: Arc<DialectBackend<FfiBackend>>,
@@ -646,6 +673,12 @@ impl RtcCall {
         self.call.member_id().to_owned()
     }
 
+    /// The explicit join ID published by this call in the legacy format.
+    /// Match it against the roster entry before attributing it to this join.
+    pub fn legacy_join_id(&self) -> Option<String> {
+        self.call.legacy_join_id().map(str::to_owned)
+    }
+
     pub fn is_live(&self) -> bool {
         self.call.is_live()
     }
@@ -669,7 +702,7 @@ impl RtcCall {
     /// The slot's joined roster as it changes; see
     /// [`RtcRoom::subscribe_membership_snapshots`].
     pub async fn subscribe_membership_snapshots(&self) -> Arc<MembershipSnapshotSubscription> {
-        MembershipSnapshotSubscription::new(self.call.subscribe_memberships().await)
+        MembershipSnapshotSubscription::new(self.call.subscribe_memberships().await, self.compat)
     }
 
     /// Resolves once the call is over (left, slot closed, room closed), with
@@ -1064,14 +1097,19 @@ impl CallStatusSubscription {
 #[derive(uniffi::Object)]
 pub struct MembershipSnapshotSubscription {
     receiver: tokio::sync::Mutex<watch::Receiver<Vec<CoreJoinedMembership>>>,
+    format: matrix_rtc_core::compat::MembershipFormat,
 }
 
 impl MembershipSnapshotSubscription {
-    fn new(mut receiver: watch::Receiver<Vec<CoreJoinedMembership>>) -> Arc<Self> {
+    fn new(
+        mut receiver: watch::Receiver<Vec<CoreJoinedMembership>>,
+        format: matrix_rtc_core::compat::MembershipFormat,
+    ) -> Arc<Self> {
         // The first `next` yields the roster as it is now.
         receiver.mark_changed();
         Arc::new(Self {
             receiver: tokio::sync::Mutex::new(receiver),
+            format,
         })
     }
 }
@@ -1084,11 +1122,32 @@ impl MembershipSnapshotSubscription {
         let mut receiver = self.receiver.lock().await;
         receiver.changed().await.ok()?;
         let members = receiver.borrow_and_update().clone();
-        Some(members.into_iter().map(to_ffi_joined_membership).collect())
+        Some(
+            members
+                .into_iter()
+                .map(|member| to_ffi_joined_membership(member, self.format))
+                .collect(),
+        )
     }
 }
 
-fn to_ffi_joined_membership(member: CoreJoinedMembership) -> JoinedMembership {
+fn to_ffi_joined_membership(
+    member: CoreJoinedMembership,
+    format: matrix_rtc_core::compat::MembershipFormat,
+) -> JoinedMembership {
+    use matrix_rtc_core::compat::{LegacyJoinId, MembershipFormat};
+
+    let (identity_kind, legacy_join_id) =
+        match (format, member.legacy_join_id, member.membership_ts) {
+            (MembershipFormat::Msc, _, _) => (FfiMembershipIdentityKind::PerJoinMemberId, None),
+            (MembershipFormat::RoomState, LegacyJoinId::Valid(id), _) => {
+                (FfiMembershipIdentityKind::LegacyJoinId, Some(id))
+            }
+            (MembershipFormat::RoomState, LegacyJoinId::Absent, Some(_)) => {
+                (FfiMembershipIdentityKind::LegacyMembershipTimestamp, None)
+            }
+            (MembershipFormat::RoomState, _, _) => (FfiMembershipIdentityKind::Unavailable, None),
+        };
     JoinedMembership {
         room_id: member.room_id,
         slot_id: member.slot_id,
@@ -1097,6 +1156,9 @@ fn to_ffi_joined_membership(member: CoreJoinedMembership) -> JoinedMembership {
         sticky_key: member.sticky_key,
         member_id: member.member_id,
         membership_event_id: member.membership_event_id,
+        membership_ts: member.membership_ts,
+        legacy_join_id,
+        identity_kind,
         application: member.application.application_type,
         transports: member.transports.iter().map(Into::into).collect(),
         can_subscribe: member.can_subscribe,
@@ -1493,6 +1555,11 @@ mod tests {
         assert_eq!(joined[0].sender, "@bob:example.org");
         assert_eq!(joined[0].sender_device_id.as_deref(), Some("BOBDEV"));
         assert_eq!(joined[0].membership_event_id.as_deref(), Some("$m1"));
+        assert_eq!(joined[0].membership_ts, None);
+        assert_eq!(
+            joined[0].identity_kind,
+            FfiMembershipIdentityKind::PerJoinMemberId
+        );
         assert_eq!(
             joined[0].transports,
             vec![FfiRtcTransport::LiveKit {
@@ -1511,6 +1578,41 @@ mod tests {
 
         room.shutdown().await;
         assert_eq!(subscription.next().await, None, "the room's end ends it");
+    }
+
+    #[tokio::test]
+    async fn call_and_room_subscriptions_use_the_same_identity_format() {
+        for (format, expected) in [
+            (None, FfiMembershipIdentityKind::PerJoinMemberId),
+            (
+                Some(FfiMembershipFormat::RoomState),
+                FfiMembershipIdentityKind::Unavailable,
+            ),
+        ] {
+            let mock = MockHost::new();
+            let client = RtcClient::new(mock.clone());
+            let room = open(
+                &client,
+                &mock,
+                format,
+                false,
+                vec![open_slot(None)],
+                vec![member_event("@bob:example.org", "BOBDEV", "bob-a", "$m1")],
+            )
+            .await;
+            let room_subscription = room
+                .subscribe_membership_snapshots(SLOT.to_owned())
+                .await
+                .unwrap();
+            let call = room.clone().join_call(join_params()).await.unwrap();
+            let call_subscription = call.subscribe_membership_snapshots().await;
+            let room_members = room_subscription.next().await.unwrap();
+            let call_members = call_subscription.next().await.unwrap();
+            assert_eq!(room_members, call_members);
+            assert_eq!(call_members.len(), 1);
+            assert_eq!(call_members[0].identity_kind, expected);
+            room.shutdown().await;
+        }
     }
 
     #[tokio::test]
@@ -1649,12 +1751,141 @@ mod tests {
                 .collect::<Vec<_>>(),
             [Some("ALICEDEV"), Some("BOBDEV"), Some("CARLDEV")],
         );
+        assert_eq!(
+            joined
+                .iter()
+                .map(|member| member.identity_kind)
+                .collect::<Vec<_>>(),
+            [
+                FfiMembershipIdentityKind::Unavailable,
+                FfiMembershipIdentityKind::Unavailable,
+                FfiMembershipIdentityKind::Unavailable,
+            ],
+        );
+        assert_eq!(joined[0].membership_ts, None);
+        assert_eq!(joined[1].membership_ts, None);
+        assert_eq!(joined[2].membership_ts, None);
         assert!(
             joined
                 .iter()
                 .all(|member| member.transports.len() == 1 && member.can_subscribe.len() == 1),
             "every generation's SFU must survive the translation: {joined:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_identity_reaches_both_subscriptions() {
+        use matrix_rtc_core::compat::LEGACY_JOIN_ID_FIELD;
+        use serde_json::{Value, json};
+
+        fn state_event(
+            created_ts: Option<u64>,
+            legacy_join_id: Option<&Value>,
+            origin_server_ts: u64,
+            event_id: &str,
+        ) -> FfiEventIn {
+            let mut content = json!({
+                "application": "m.call",
+                "call_id": "",
+                "device_id": "BOBDEV",
+                "membershipID": "@bob:example.org:BOBDEV",
+                "expires": 14_400_000_u64,
+                "foci_preferred": [{ "type": "livekit", "livekit_service_url": SFU }],
+            });
+            if let Some(ts) = created_ts {
+                content["created_ts"] = ts.into();
+            }
+            if let Some(id) = legacy_join_id {
+                content[LEGACY_JOIN_ID_FIELD] = id.clone();
+            }
+            FfiEventIn {
+                event_id: event_id.to_owned(),
+                sender: "@bob:example.org".to_owned(),
+                event_type: STATE_MEMBER_EVENT_TYPE.to_owned(),
+                state_key: Some("_@bob:example.org_BOBDEV_m.call".to_owned()),
+                origin_server_ts,
+                content_json: content.to_string(),
+                encryption: cleartext(),
+            }
+        }
+
+        let now = matrix_rtc_core::compat::room_state::now_ms();
+        let ts = Some(now + 60_000);
+        let id = "0123456789abcdef0123456789abcdef";
+        use FfiMembershipIdentityKind::{LegacyJoinId, LegacyMembershipTimestamp, Unavailable};
+        for (created_ts, field, expected_kind) in [
+            (None, None, Unavailable),
+            (ts, None, LegacyMembershipTimestamp),
+            (None, Some(json!(id)), LegacyJoinId),
+            (ts, Some(json!(id)), LegacyJoinId),
+            (
+                ts,
+                Some(json!("0123456789ABCDEF0123456789ABCDEF")),
+                Unavailable,
+            ),
+            (ts, Some(json!("too-short")), Unavailable),
+            (ts, Some(json!(123)), Unavailable),
+            (ts, Some(Value::Null), Unavailable),
+        ] {
+            let assert_identity = |members: &[JoinedMembership]| {
+                assert_eq!(members.len(), 1);
+                assert_eq!(members[0].membership_ts, created_ts);
+                assert_eq!(
+                    members[0].legacy_join_id.as_deref(),
+                    (expected_kind == LegacyJoinId).then_some(id)
+                );
+                assert_eq!(members[0].identity_kind, expected_kind);
+            };
+            let mock = MockHost::new();
+            let client = RtcClient::new(mock.clone());
+            let room = open(
+                &client,
+                &mock,
+                Some(FfiMembershipFormat::RoomState),
+                false,
+                Vec::new(),
+                Vec::new(),
+            )
+            .await;
+            // The raw state feed traverses `ingest::to_core_state_memberships`
+            // before projection and either public membership subscription.
+            mock.room_sink(ROOM).on_state_events(
+                STATE_MEMBER_EVENT_TYPE.to_owned(),
+                vec![state_event(created_ts, field.as_ref(), now, "$first")],
+            );
+            wait_until(async || room.member_count(SLOT.to_owned()).await.unwrap() == 1).await;
+            let room_subscription = room
+                .subscribe_membership_snapshots(SLOT.to_owned())
+                .await
+                .unwrap();
+            let call = room.clone().join_call(join_params()).await.unwrap();
+            let call_subscription = call.subscribe_membership_snapshots().await;
+            for members in [
+                room_subscription.next().await.unwrap(),
+                call_subscription.next().await.unwrap(),
+            ] {
+                assert_identity(&members);
+            }
+
+            mock.room_sink(ROOM).on_state_events(
+                STATE_MEMBER_EVENT_TYPE.to_owned(),
+                vec![state_event(
+                    created_ts,
+                    field.as_ref(),
+                    now + 1_000,
+                    "$refresh",
+                )],
+            );
+            for subscription in [room_subscription, call_subscription] {
+                let members = tokio::time::timeout(Duration::from_secs(2), subscription.next())
+                    .await
+                    .expect("refreshed state must reach the roster")
+                    .unwrap();
+                assert_identity(&members);
+                assert_eq!(members[0].membership_event_id.as_deref(), Some("$refresh"));
+            }
+            room.shutdown().await;
+        }
     }
 
     /// The SDK owns the `member.id`, and a rejoin must not reuse the previous
@@ -1675,6 +1906,7 @@ mod tests {
             })
             .await
             .expect("first join");
+        assert_eq!(first.legacy_join_id(), None);
         let membership = mock
             .sends()
             .into_iter()
@@ -1697,6 +1929,94 @@ mod tests {
             second.member_id(),
             "a rejoin must not reuse the member id"
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_call_identity_survives_retry_and_distinguishes_a_stale_roster_on_rejoin() {
+        use matrix_rtc_core::compat::{LEGACY_JOIN_ID_FIELD, room_state::now_ms};
+
+        let mock = MockHost::new();
+        *mock.fail_state_once.lock().unwrap() = Some(FfiBackendError::Failed {
+            errcode: None,
+            status: Some(503),
+            retry_after_ms: None,
+            permanent: false,
+            reason: "temporary outage".to_owned(),
+        });
+        let client = RtcClient::new(mock.clone());
+        let room = open(
+            &client,
+            &mock,
+            Some(FfiMembershipFormat::RoomState),
+            false,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await;
+        let first = room.clone().join_call(join_params()).await.unwrap();
+        let first_id = first.legacy_join_id().expect("published join ID");
+        let first_attempts: Vec<_> = mock
+            .sends()
+            .into_iter()
+            .filter(|send| send.carrier == Carrier::State)
+            .collect();
+        assert_eq!(first_attempts.len(), 2);
+        for attempt in &first_attempts {
+            assert_eq!(attempt.content[LEGACY_JOIN_ID_FIELD], first_id);
+        }
+        first.leave(no_reason()).await.unwrap();
+
+        let old = &first_attempts[1];
+        let echo = |state_key, content_json, event_id: String| {
+            mock.room_sink(ROOM).on_state_events(
+                STATE_MEMBER_EVENT_TYPE.to_owned(),
+                vec![FfiEventIn {
+                    event_id,
+                    sender: "@alice:example.org".to_owned(),
+                    event_type: STATE_MEMBER_EVENT_TYPE.to_owned(),
+                    state_key,
+                    origin_server_ts: now_ms(),
+                    content_json,
+                    encryption: cleartext(),
+                }],
+            );
+        };
+        echo(
+            old.state_key.clone(),
+            old.content.to_string(),
+            "$old".to_owned(),
+        );
+        wait_until(async || room.member_count(SLOT.to_owned()).await.unwrap() == 1).await;
+
+        let second = room.clone().join_call(join_params()).await.unwrap();
+        let expected_id = second.legacy_join_id().expect("new join ID");
+        assert_eq!(first.member_id(), second.member_id());
+        assert_ne!(first_id, expected_id);
+        let roster = second.subscribe_membership_snapshots().await;
+        let stale = roster.next().await.unwrap();
+        assert_eq!(stale[0].member_id, second.member_id());
+        assert_eq!(stale[0].legacy_join_id.as_deref(), Some(first_id.as_str()));
+        assert_ne!(
+            stale[0].legacy_join_id.as_deref(),
+            Some(expected_id.as_str())
+        );
+
+        let new = mock
+            .sends()
+            .into_iter()
+            .rev()
+            .find(|send| send.content[LEGACY_JOIN_ID_FIELD] == expected_id)
+            .expect("published new membership");
+        echo(new.state_key, new.content.to_string(), "$new".to_owned());
+        let current = tokio::time::timeout(Duration::from_secs(2), roster.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            current[0].legacy_join_id.as_deref(),
+            Some(expected_id.as_str())
+        );
+        room.shutdown().await;
     }
 
     /// The first `next` is the status now, and nothing follows `Ended`, so a
@@ -1783,6 +2103,59 @@ mod tests {
             room.clone().join_call(join_params()).await,
             Err(MatrixRtcFfiError::InvalidInput(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn overlapping_legacy_joins_keep_the_winning_call_generation() {
+        use matrix_rtc_core::compat::LEGACY_JOIN_ID_FIELD;
+
+        let mock = MockHost::new();
+        let client = RtcClient::new(mock.clone());
+        let room = open(
+            &client,
+            &mock,
+            Some(FfiMembershipFormat::RoomState),
+            false,
+            Vec::new(),
+            Vec::new(),
+        )
+        .await;
+        let (first, second) = tokio::join!(
+            room.clone().join_call(join_params()),
+            room.clone().join_call(join_params()),
+        );
+        let call = match (first, second) {
+            (Ok(call), Err(MatrixRtcFfiError::InvalidInput(_)))
+            | (Err(MatrixRtcFfiError::InvalidInput(_)), Ok(call)) => call,
+            _ => panic!("one join succeeds and the other is refused"),
+        };
+        let other_slot = FfiJoinSessionParams {
+            application_slot_id: Some("alternate".to_owned()),
+            ..join_params()
+        };
+        assert!(matches!(
+            room.clone().join_call(other_slot.clone()).await,
+            Err(MatrixRtcFfiError::InvalidInput(_))
+        ));
+
+        let sends = mock.sends();
+        let states: Vec<_> = sends
+            .iter()
+            .filter(|send| send.carrier == Carrier::State)
+            .collect();
+        assert_eq!(states.len(), 1);
+        assert_eq!(
+            states[0].content[LEGACY_JOIN_ID_FIELD].as_str(),
+            call.legacy_join_id().as_deref(),
+        );
+        drop(call);
+        let next = room.clone().join_call(other_slot).await.unwrap();
+        assert_eq!(next.slot_id(), "m.call#alternate");
+        assert_ne!(
+            states[0].content[LEGACY_JOIN_ID_FIELD].as_str(),
+            next.legacy_join_id().as_deref()
+        );
+        room.shutdown().await;
     }
 
     /// A slot closing under a call makes it leave on its own, with

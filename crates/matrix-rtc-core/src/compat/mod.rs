@@ -103,7 +103,8 @@ pub mod room_state;
 pub use dialect_backend::{DialectBackend, DialectHold};
 pub use element_call::{LEGACY_KEY_EVENT_TYPE, LegacyKeyMessage, MemberContent};
 pub use room_state::{
-    RoomStateDialect, STATE_MEMBER_EVENT_TYPE, StateMemberEvent, StateMembership,
+    LEGACY_JOIN_ID_FIELD, LegacyJoinId, RoomStateDialect, STATE_MEMBER_EVENT_TYPE,
+    StateMemberEvent, StateMembership,
 };
 
 /// Which MatrixRTC membership format a room is read and written in.

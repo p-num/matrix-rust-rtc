@@ -6,7 +6,7 @@
 //! The task that keeps one joined slot session alive, spawned by
 //! [`SlotSession::join`](crate::SlotSession::join) on the
 //! [`executor`](crate::executor) and stopped by the leave, by dropping the
-//! session, or through its [`AbortHandle`](crate::executor::AbortHandle).
+//! session, or through its [`UpkeepStopHandle`].
 //!
 //! Its wake-ups: the keep-alive interval (restart the delayed leave, refresh
 //! the sticky membership), the moment our membership would lapse (034 R17),
@@ -29,10 +29,41 @@ use futures_util::stream::FuturesUnordered;
 use tokio::sync::watch;
 
 use crate::encryption::{EncryptionManager, KeyRetry, Undelivered};
-use crate::executor::{self, AbortOnDrop, JoinHandleExt};
+use crate::executor::{self, AbortHandle, JoinHandle};
 use crate::host::backend::MatrixBackend;
 use crate::outbox::{BACKOFF_INITIAL, BACKOFF_MAX, SendFailure, SendKind, SendPolicy, SlotKey};
 use crate::own_membership::{OwnMembershipMachine, OwnMembershipState};
+
+/// Stops a participation's upkeep without interrupting membership writes in flight.
+#[derive(Clone)]
+pub struct UpkeepStopHandle(watch::Sender<bool>);
+
+impl UpkeepStopHandle {
+    pub fn stop(&self) {
+        self.0.send_replace(true);
+    }
+}
+
+pub(crate) struct UpkeepTask {
+    task: JoinHandle<()>,
+    stop: UpkeepStopHandle,
+}
+
+impl UpkeepTask {
+    pub fn abort_handle(&self) -> AbortHandle {
+        self.task.abort_handle()
+    }
+
+    pub fn stop_handle(&self) -> UpkeepStopHandle {
+        self.stop.clone()
+    }
+}
+
+impl Drop for UpkeepTask {
+    fn drop(&mut self) {
+        self.stop.stop();
+    }
+}
 
 /// What a joined slot session's upkeep needs.
 pub(crate) struct SessionUpkeep<T: MatrixBackend + 'static> {
@@ -46,7 +77,7 @@ impl<T: MatrixBackend + 'static> SessionUpkeep<T> {
     /// Starts it, or returns `None` with nowhere to run it (natively, no
     /// current tokio runtime): the host then ticks
     /// [`SlotSession::keep_alive`](crate::SlotSession::keep_alive) itself.
-    pub fn spawn(self) -> Option<AbortOnDrop<()>> {
+    pub fn spawn(self) -> Option<UpkeepTask> {
         if !executor::can_spawn() {
             log::warn!(
                 "[{}] no runtime to run the keep-alive on; the host must tick it",
@@ -54,10 +85,14 @@ impl<T: MatrixBackend + 'static> SessionUpkeep<T> {
             );
             return None;
         }
-        Some(executor::spawn(self.run()).abort_on_drop())
+        let (stop, stopped) = watch::channel(false);
+        Some(UpkeepTask {
+            task: executor::spawn(self.run(stopped)),
+            stop: UpkeepStopHandle(stop),
+        })
     }
 
-    async fn run(self) {
+    async fn run(self, mut stopped: watch::Receiver<bool>) {
         let Self {
             machine,
             encryption,
@@ -113,6 +148,10 @@ impl<T: MatrixBackend + 'static> SessionUpkeep<T> {
         if let Some(undelivered) = &mut undelivered {
             start_key_retries(undelivered, &mut retrying, &mut key_retries);
         }
+        let wait_for_stop = async move {
+            let _ = stopped.wait_for(|stopped| *stopped).await;
+        };
+        tokio::pin!(wait_for_stop);
 
         loop {
             let due = rotation_due
@@ -127,6 +166,7 @@ impl<T: MatrixBackend + 'static> SessionUpkeep<T> {
                 .map(|at| Duration::from_millis(at.saturating_sub(machine.now_ms())));
 
             tokio::select! {
+                _ = &mut wait_for_stop => break,
                 _ = &mut beat => {
                     if machine.state() != OwnMembershipState::Joined {
                         break;
@@ -201,6 +241,16 @@ impl<T: MatrixBackend + 'static> SessionUpkeep<T> {
                 }
             }
         }
+        // Retire registrations first, then retain the lanes of membership
+        // writes that already reached the host until their attempts finish.
+        machine.begin_leave();
+        tokio::join!(
+            finish(restart.as_mut()),
+            finish(refresh.as_mut()),
+            finish(recover.as_mut()),
+            finish(republish.as_mut()),
+            finish(departure.as_mut()),
+        );
         log::debug!("[{log_tag}] upkeep stopped");
     }
 }
@@ -275,6 +325,13 @@ async fn drive<F: Future<Output = ()>>(slot: Pin<&mut Option<F>>) {
     match slot.as_pin_mut() {
         Some(operation) => operation.await,
         None => std::future::pending().await,
+    }
+}
+
+/// Drains a membership operation that was already started, if any.
+async fn finish<F: Future<Output = ()>>(slot: Pin<&mut Option<F>>) {
+    if let Some(operation) = slot.as_pin_mut() {
+        operation.await;
     }
 }
 

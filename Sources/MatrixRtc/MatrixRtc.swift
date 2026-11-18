@@ -2741,6 +2741,13 @@ public protocol MediaSessionProtocol: AnyObject, Sendable {
     func unpublish(kind: FfiStreamKind) async throws 
     
     /**
+     * Participants on an SFU whose membership we have not received, by
+     * transport identity (spec 038 R25): listed once unmapped for 10 s
+     * while signalling is healthy, apart from [`Self::interruptions`].
+     */
+    func unverifiedParticipants()  -> [String]
+    
+    /**
      * The video frame stream of a participant's stream (latest-frame-wins).
      */
     func videoStream(memberId: String, kind: FfiStreamKind)  -> VideoFrameStream?
@@ -3192,6 +3199,18 @@ open func unpublish(kind: FfiStreamKind)async throws   {
 }
     
     /**
+     * Participants on an SFU whose membership we have not received, by
+     * transport identity (spec 038 R25): listed once unmapped for 10 s
+     * while signalling is healthy, apart from [`Self::interruptions`].
+     */
+open func unverifiedParticipants() -> [String]  {
+    return try!  FfiConverterSequenceString.lift(try! rustCall() {
+    uniffi_matrix_rtc_ffi_fn_method_mediasession_unverified_participants(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
      * The video frame stream of a participant's stream (latest-frame-wins).
      */
 open func videoStream(memberId: String, kind: FfiStreamKind) -> VideoFrameStream?  {
@@ -3600,6 +3619,12 @@ public func FfiConverterTypeRoomSink_lower(_ value: RoomSink) -> UnsafeMutableRa
  */
 public protocol RtcCallProtocol: AnyObject, Sendable {
     
+    /**
+     * Whether this is a voice or a video call, as the join settled it. Start
+     * the camera for [`FfiCallIntent::Video`] only.
+     */
+    func callIntent()  -> FfiCallIntent
+    
     func isLive()  -> Bool
     
     /**
@@ -3610,6 +3635,12 @@ public protocol RtcCallProtocol: AnyObject, Sendable {
      * call was already over.
      */
     func leave(params: FfiLeaveSessionParams) async throws 
+    
+    /**
+     * The explicit join ID published by this call in the legacy format.
+     * Match it against the roster entry before attributing it to this join.
+     */
+    func legacyJoinId()  -> String?
     
     /**
      * Lowers our hand by redacting the annotation, as [`Self::raise_hand`]
@@ -3744,6 +3775,17 @@ open class RtcCall: RtcCallProtocol, @unchecked Sendable {
     
 
     
+    /**
+     * Whether this is a voice or a video call, as the join settled it. Start
+     * the camera for [`FfiCallIntent::Video`] only.
+     */
+open func callIntent() -> FfiCallIntent  {
+    return try!  FfiConverterTypeFfiCallIntent_lift(try! rustCall() {
+    uniffi_matrix_rtc_ffi_fn_method_rtccall_call_intent(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
 open func isLive() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_matrix_rtc_ffi_fn_method_rtccall_is_live(self.uniffiClonePointer(),$0
@@ -3773,6 +3815,17 @@ open func leave(params: FfiLeaveSessionParams)async throws   {
             liftFunc: { $0 },
             errorHandler: FfiConverterTypeMatrixRtcFfiError_lift
         )
+}
+    
+    /**
+     * The explicit join ID published by this call in the legacy format.
+     * Match it against the roster entry before attributing it to this join.
+     */
+open func legacyJoinId() -> String?  {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_matrix_rtc_ffi_fn_method_rtccall_legacy_join_id(self.uniffiClonePointer(),$0
+    )
+})
 }
     
     /**
@@ -4064,6 +4117,15 @@ public func FfiConverterTypeRtcCall_lower(_ value: RtcCall) -> UnsafeMutableRawP
 public protocol RtcClientProtocol: AnyObject, Sendable {
     
     /**
+     * Whether our homeserver offers what the MSC format needs (spec 038
+     * R45). `server_features` are the `unstable_features` of `/versions`
+     * that are on, which the host reads from its SDK; the transports are
+     * asked of the backend. Names each missing piece; never picks the
+     * format.
+     */
+    func mscSupport(serverFeatures: [String]) async throws  -> FfiMscSupport
+    
+    /**
      * Reports the host's Matrix client offline, or online once a request to
      * the homeserver has succeeded since it was offline — never on sync merely
      * starting (034 R11). Online retries every pending send at once. Optional:
@@ -4157,6 +4219,30 @@ public convenience init(backend: MatrixBackend) {
 
     
 
+    
+    /**
+     * Whether our homeserver offers what the MSC format needs (spec 038
+     * R45). `server_features` are the `unstable_features` of `/versions`
+     * that are on, which the host reads from its SDK; the transports are
+     * asked of the backend. Names each missing piece; never picks the
+     * format.
+     */
+open func mscSupport(serverFeatures: [String])async throws  -> FfiMscSupport  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_matrix_rtc_ffi_fn_method_rtcclient_msc_support(
+                    self.uniffiClonePointer(),
+                    FfiConverterSequenceString.lower(serverFeatures)
+                )
+            },
+            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeFfiMscSupport_lift,
+            errorHandler: FfiConverterTypeMatrixRtcFfiError_lift
+        )
+}
     
     /**
      * Reports the host's Matrix client offline, or online once a request to
@@ -4472,6 +4558,13 @@ public func FfiConverterTypeRtcLogSink_lower(_ value: RtcLogSink) -> UnsafeMutab
 public protocol RtcRoomProtocol: AnyObject, Sendable {
     
     /**
+     * The intent a join into `slot_id` would settle on, without joining:
+     * `requested`, else the one its members agree on, else video. For a lobby
+     * that previews the camera the join will start with.
+     */
+    func callIntent(slotId: String, requested: FfiCallIntent?) async throws  -> FfiCallIntent
+    
+    /**
      * Closes a slot, by setting its `m.rtc.slot` status to `closed`.
      *
      * Every member of it becomes left as soon as clients apply the new state —
@@ -4608,6 +4701,28 @@ open class RtcRoom: RtcRoomProtocol, @unchecked Sendable {
 
     
 
+    
+    /**
+     * The intent a join into `slot_id` would settle on, without joining:
+     * `requested`, else the one its members agree on, else video. For a lobby
+     * that previews the camera the join will start with.
+     */
+open func callIntent(slotId: String, requested: FfiCallIntent?)async throws  -> FfiCallIntent  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_matrix_rtc_ffi_fn_method_rtcroom_call_intent(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(slotId),FfiConverterOptionTypeFfiCallIntent.lower(requested)
+                )
+            },
+            pollFunc: ffi_matrix_rtc_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_matrix_rtc_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_matrix_rtc_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeFfiCallIntent_lift,
+            errorHandler: FfiConverterTypeMatrixRtcFfiError_lift
+        )
+}
     
     /**
      * Closes a slot, by setting its `m.rtc.slot` status to `closed`.
@@ -6628,6 +6743,14 @@ public struct FfiJoinSessionParams {
      * Unset is enabled with Element Call's three-second window.
      */
     public var reactions: FfiReactionsConfig?
+    /**
+     * The user's explicit voice or video choice: starting a call, or
+     * answering a ring that said which. It wins over a call in progress.
+     * Unset (a room's call button, which cannot know) follows the call, and
+     * with no call to follow is video. Read the outcome from
+     * [`crate::RtcCall::call_intent`].
+     */
+    public var intent: FfiCallIntent?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -6681,7 +6804,14 @@ public struct FfiJoinSessionParams {
         /**
          * How this session handles Element Call reactions and the raised hand.
          * Unset is enabled with Element Call's three-second window.
-         */reactions: FfiReactionsConfig? = nil) {
+         */reactions: FfiReactionsConfig? = nil, 
+        /**
+         * The user's explicit voice or video choice: starting a call, or
+         * answering a ring that said which. It wins over a call in progress.
+         * Unset (a room's call button, which cannot know) follows the call, and
+         * with no call to follow is video. Read the outcome from
+         * [`crate::RtcCall::call_intent`].
+         */intent: FfiCallIntent? = nil) {
         self.applicationSlotId = applicationSlotId
         self.callIntent = callIntent
         self.transport = transport
@@ -6691,6 +6821,7 @@ public struct FfiJoinSessionParams {
         self.degradedLifetimeMs = degradedLifetimeMs
         self.encryptionConfig = encryptionConfig
         self.reactions = reactions
+        self.intent = intent
     }
 }
 
@@ -6728,6 +6859,9 @@ extension FfiJoinSessionParams: Equatable, Hashable {
         if lhs.reactions != rhs.reactions {
             return false
         }
+        if lhs.intent != rhs.intent {
+            return false
+        }
         return true
     }
 
@@ -6741,6 +6875,7 @@ extension FfiJoinSessionParams: Equatable, Hashable {
         hasher.combine(degradedLifetimeMs)
         hasher.combine(encryptionConfig)
         hasher.combine(reactions)
+        hasher.combine(intent)
     }
 }
 
@@ -6761,7 +6896,8 @@ public struct FfiConverterTypeFfiJoinSessionParams: FfiConverterRustBuffer {
                 stickyDurationMs: FfiConverterOptionUInt64.read(from: &buf), 
                 degradedLifetimeMs: FfiConverterOptionUInt64.read(from: &buf), 
                 encryptionConfig: FfiConverterOptionTypeFfiEncryptionConfig.read(from: &buf), 
-                reactions: FfiConverterOptionTypeFfiReactionsConfig.read(from: &buf)
+                reactions: FfiConverterOptionTypeFfiReactionsConfig.read(from: &buf), 
+                intent: FfiConverterOptionTypeFfiCallIntent.read(from: &buf)
         )
     }
 
@@ -6775,6 +6911,7 @@ public struct FfiConverterTypeFfiJoinSessionParams: FfiConverterRustBuffer {
         FfiConverterOptionUInt64.write(value.degradedLifetimeMs, into: &buf)
         FfiConverterOptionTypeFfiEncryptionConfig.write(value.encryptionConfig, into: &buf)
         FfiConverterOptionTypeFfiReactionsConfig.write(value.reactions, into: &buf)
+        FfiConverterOptionTypeFfiCallIntent.write(value.intent, into: &buf)
     }
 }
 
@@ -7237,6 +7374,91 @@ public func FfiConverterTypeFfiMediaConstraints_lower(_ value: FfiMediaConstrain
 
 
 /**
+ * What the MSC support check found missing.
+ */
+public struct FfiMscSupport {
+    /**
+     * Without these an MSC call cannot work.
+     */
+    public var missing: [FfiMscRequirement]
+    /**
+     * Without these an MSC call works, worse.
+     */
+    public var warnings: [FfiMscRequirement]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Without these an MSC call cannot work.
+         */missing: [FfiMscRequirement], 
+        /**
+         * Without these an MSC call works, worse.
+         */warnings: [FfiMscRequirement]) {
+        self.missing = missing
+        self.warnings = warnings
+    }
+}
+
+#if compiler(>=6)
+extension FfiMscSupport: Sendable {}
+#endif
+
+
+extension FfiMscSupport: Equatable, Hashable {
+    public static func ==(lhs: FfiMscSupport, rhs: FfiMscSupport) -> Bool {
+        if lhs.missing != rhs.missing {
+            return false
+        }
+        if lhs.warnings != rhs.warnings {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(missing)
+        hasher.combine(warnings)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiMscSupport: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiMscSupport {
+        return
+            try FfiMscSupport(
+                missing: FfiConverterSequenceTypeFfiMscRequirement.read(from: &buf), 
+                warnings: FfiConverterSequenceTypeFfiMscRequirement.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiMscSupport, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeFfiMscRequirement.write(value.missing, into: &buf)
+        FfiConverterSequenceTypeFfiMscRequirement.write(value.warnings, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiMscSupport_lift(_ buf: RustBuffer) throws -> FfiMscSupport {
+    return try FfiConverterTypeFfiMscSupport.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiMscSupport_lower(_ value: FfiMscSupport) -> RustBuffer {
+    return FfiConverterTypeFfiMscSupport.lower(value)
+}
+
+
+/**
  * A Matrix OpenID token, as returned by
  * `POST /_matrix/client/v3/user/{userId}/openid/request_token`.
  */
@@ -7518,6 +7740,14 @@ public struct FfiPublishOptions {
      * Publish already muted, for a lobby that joins muted.
      */
     public var muted: Bool
+    /**
+     * Codec to encode with (video only).
+     */
+    public var videoCodec: FfiVideoCodecPreference
+    /**
+     * Encoder caps (video only).
+     */
+    public var videoEncoding: FfiVideoEncodingLimits?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -7533,12 +7763,20 @@ public struct FfiPublishOptions {
          */simulcast: Bool, 
         /**
          * Publish already muted, for a lobby that joins muted.
-         */muted: Bool) {
+         */muted: Bool, 
+        /**
+         * Codec to encode with (video only).
+         */videoCodec: FfiVideoCodecPreference, 
+        /**
+         * Encoder caps (video only).
+         */videoEncoding: FfiVideoEncodingLimits? = nil) {
         self.kind = kind
         self.audio = audio
         self.video = video
         self.simulcast = simulcast
         self.muted = muted
+        self.videoCodec = videoCodec
+        self.videoEncoding = videoEncoding
     }
 }
 
@@ -7564,6 +7802,12 @@ extension FfiPublishOptions: Equatable, Hashable {
         if lhs.muted != rhs.muted {
             return false
         }
+        if lhs.videoCodec != rhs.videoCodec {
+            return false
+        }
+        if lhs.videoEncoding != rhs.videoEncoding {
+            return false
+        }
         return true
     }
 
@@ -7573,6 +7817,8 @@ extension FfiPublishOptions: Equatable, Hashable {
         hasher.combine(video)
         hasher.combine(simulcast)
         hasher.combine(muted)
+        hasher.combine(videoCodec)
+        hasher.combine(videoEncoding)
     }
 }
 
@@ -7589,7 +7835,9 @@ public struct FfiConverterTypeFfiPublishOptions: FfiConverterRustBuffer {
                 audio: FfiConverterOptionTypeFfiAudioSourceConfig.read(from: &buf), 
                 video: FfiConverterOptionTypeFfiVideoSourceConfig.read(from: &buf), 
                 simulcast: FfiConverterBool.read(from: &buf), 
-                muted: FfiConverterBool.read(from: &buf)
+                muted: FfiConverterBool.read(from: &buf), 
+                videoCodec: FfiConverterTypeFfiVideoCodecPreference.read(from: &buf), 
+                videoEncoding: FfiConverterOptionTypeFfiVideoEncodingLimits.read(from: &buf)
         )
     }
 
@@ -7599,6 +7847,8 @@ public struct FfiConverterTypeFfiPublishOptions: FfiConverterRustBuffer {
         FfiConverterOptionTypeFfiVideoSourceConfig.write(value.video, into: &buf)
         FfiConverterBool.write(value.simulcast, into: &buf)
         FfiConverterBool.write(value.muted, into: &buf)
+        FfiConverterTypeFfiVideoCodecPreference.write(value.videoCodec, into: &buf)
+        FfiConverterOptionTypeFfiVideoEncodingLimits.write(value.videoEncoding, into: &buf)
     }
 }
 
@@ -9489,6 +9739,82 @@ public func FfiConverterTypeFfiToDeviceRecipient_lower(_ value: FfiToDeviceRecip
 
 
 /**
+ * Encoder caps of a video publication (mirrors
+ * `matrix_rtc_transport::VideoEncodingLimits`). A `None` field is computed
+ * from the source resolution; with simulcast, the caps apply to the top
+ * layer.
+ */
+public struct FfiVideoEncodingLimits {
+    public var maxBitrateBps: UInt64?
+    public var maxFramerate: UInt32?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(maxBitrateBps: UInt64? = nil, maxFramerate: UInt32? = nil) {
+        self.maxBitrateBps = maxBitrateBps
+        self.maxFramerate = maxFramerate
+    }
+}
+
+#if compiler(>=6)
+extension FfiVideoEncodingLimits: Sendable {}
+#endif
+
+
+extension FfiVideoEncodingLimits: Equatable, Hashable {
+    public static func ==(lhs: FfiVideoEncodingLimits, rhs: FfiVideoEncodingLimits) -> Bool {
+        if lhs.maxBitrateBps != rhs.maxBitrateBps {
+            return false
+        }
+        if lhs.maxFramerate != rhs.maxFramerate {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(maxBitrateBps)
+        hasher.combine(maxFramerate)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiVideoEncodingLimits: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiVideoEncodingLimits {
+        return
+            try FfiVideoEncodingLimits(
+                maxBitrateBps: FfiConverterOptionUInt64.read(from: &buf), 
+                maxFramerate: FfiConverterOptionUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FfiVideoEncodingLimits, into buf: inout [UInt8]) {
+        FfiConverterOptionUInt64.write(value.maxBitrateBps, into: &buf)
+        FfiConverterOptionUInt32.write(value.maxFramerate, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiVideoEncodingLimits_lift(_ buf: RustBuffer) throws -> FfiVideoEncodingLimits {
+    return try FfiConverterTypeFfiVideoEncodingLimits.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiVideoEncodingLimits_lower(_ value: FfiVideoEncodingLimits) -> RustBuffer {
+    return FfiConverterTypeFfiVideoEncodingLimits.lower(value)
+}
+
+
+/**
  * A captured I420 frame the host pushes into a video publication.
  */
 public struct FfiVideoFrameData {
@@ -9704,6 +10030,10 @@ public func FfiConverterTypeFfiVideoSourceConfig_lower(_ value: FfiVideoSourceCo
 }
 
 
+/**
+ * A joined roster entry. Identity metadata describes a participation, not an
+ * entire room call, and never authorizes logging raw Matrix identifiers.
+ */
 public struct JoinedMembership {
     public var roomId: String
     public var slotId: String
@@ -9716,6 +10046,20 @@ public struct JoinedMembership {
      * refresh.
      */
     public var membershipEventId: String?
+    /**
+     * Join timestamp in milliseconds since the Unix epoch, when the dialect
+     * provides one. Pinned across legacy refreshes; never replaced by the
+     * latest event's `origin_server_ts` or a locally observed time.
+     */
+    public var membershipTs: UInt64?
+    /**
+     * The validated explicit join ID of a legacy room-state membership.
+     */
+    public var legacyJoinId: String?
+    /**
+     * Which fields can safely identify this participation across clients.
+     */
+    public var identityKind: FfiMembershipIdentityKind
     public var application: String?
     /**
      * Transports this member publishes media on (MSC4143).
@@ -9732,7 +10076,18 @@ public struct JoinedMembership {
         /**
          * Event id of the member's latest membership event. Moves on every sticky
          * refresh.
-         */membershipEventId: String?, application: String?, 
+         */membershipEventId: String?, 
+        /**
+         * Join timestamp in milliseconds since the Unix epoch, when the dialect
+         * provides one. Pinned across legacy refreshes; never replaced by the
+         * latest event's `origin_server_ts` or a locally observed time.
+         */membershipTs: UInt64?, 
+        /**
+         * The validated explicit join ID of a legacy room-state membership.
+         */legacyJoinId: String?, 
+        /**
+         * Which fields can safely identify this participation across clients.
+         */identityKind: FfiMembershipIdentityKind, application: String?, 
         /**
          * Transports this member publishes media on (MSC4143).
          */transports: [FfiRtcTransport], 
@@ -9746,6 +10101,9 @@ public struct JoinedMembership {
         self.stickyKey = stickyKey
         self.memberId = memberId
         self.membershipEventId = membershipEventId
+        self.membershipTs = membershipTs
+        self.legacyJoinId = legacyJoinId
+        self.identityKind = identityKind
         self.application = application
         self.transports = transports
         self.canSubscribe = canSubscribe
@@ -9780,6 +10138,15 @@ extension JoinedMembership: Equatable, Hashable {
         if lhs.membershipEventId != rhs.membershipEventId {
             return false
         }
+        if lhs.membershipTs != rhs.membershipTs {
+            return false
+        }
+        if lhs.legacyJoinId != rhs.legacyJoinId {
+            return false
+        }
+        if lhs.identityKind != rhs.identityKind {
+            return false
+        }
         if lhs.application != rhs.application {
             return false
         }
@@ -9800,6 +10167,9 @@ extension JoinedMembership: Equatable, Hashable {
         hasher.combine(stickyKey)
         hasher.combine(memberId)
         hasher.combine(membershipEventId)
+        hasher.combine(membershipTs)
+        hasher.combine(legacyJoinId)
+        hasher.combine(identityKind)
         hasher.combine(application)
         hasher.combine(transports)
         hasher.combine(canSubscribe)
@@ -9822,6 +10192,9 @@ public struct FfiConverterTypeJoinedMembership: FfiConverterRustBuffer {
                 stickyKey: FfiConverterString.read(from: &buf), 
                 memberId: FfiConverterString.read(from: &buf), 
                 membershipEventId: FfiConverterOptionString.read(from: &buf), 
+                membershipTs: FfiConverterOptionUInt64.read(from: &buf), 
+                legacyJoinId: FfiConverterOptionString.read(from: &buf), 
+                identityKind: FfiConverterTypeFfiMembershipIdentityKind.read(from: &buf), 
                 application: FfiConverterOptionString.read(from: &buf), 
                 transports: FfiConverterSequenceTypeFfiRtcTransport.read(from: &buf), 
                 canSubscribe: FfiConverterSequenceString.read(from: &buf)
@@ -9836,6 +10209,9 @@ public struct FfiConverterTypeJoinedMembership: FfiConverterRustBuffer {
         FfiConverterString.write(value.stickyKey, into: &buf)
         FfiConverterString.write(value.memberId, into: &buf)
         FfiConverterOptionString.write(value.membershipEventId, into: &buf)
+        FfiConverterOptionUInt64.write(value.membershipTs, into: &buf)
+        FfiConverterOptionString.write(value.legacyJoinId, into: &buf)
+        FfiConverterTypeFfiMembershipIdentityKind.write(value.identityKind, into: &buf)
         FfiConverterOptionString.write(value.application, into: &buf)
         FfiConverterSequenceTypeFfiRtcTransport.write(value.transports, into: &buf)
         FfiConverterSequenceString.write(value.canSubscribe, into: &buf)
@@ -10737,6 +11113,79 @@ extension FfiCallEvent: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * MSC4196 `m.call.intent`: a voice or a video call.
+ */
+
+public enum FfiCallIntent {
+    
+    case audio
+    case video
+}
+
+
+#if compiler(>=6)
+extension FfiCallIntent: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiCallIntent: FfiConverterRustBuffer {
+    typealias SwiftType = FfiCallIntent
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiCallIntent {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .audio
+        
+        case 2: return .video
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiCallIntent, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .audio:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .video:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCallIntent_lift(_ buf: RustBuffer) throws -> FfiCallIntent {
+    return try FfiConverterTypeFfiCallIntent.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiCallIntent_lower(_ value: FfiCallIntent) -> RustBuffer {
+    return FfiConverterTypeFfiCallIntent.lower(value)
+}
+
+
+extension FfiCallIntent: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * What kind of call a join is. Only a DM call can ring, so a group call
  * cannot express a ring and a DM call cannot take a group's notification.
  */
@@ -10960,6 +11409,10 @@ public enum FfiConnectionLossReason {
      * Never established within the budget from the connect request.
      */
     case neverConnected
+    /**
+     * Our homeserver lacks MSC4195's `get_token` (spec 038 R44).
+     */
+    case tokenEndpointUnsupported
 }
 
 
@@ -10983,6 +11436,8 @@ public struct FfiConverterTypeFfiConnectionLossReason: FfiConverterRustBuffer {
         
         case 3: return .neverConnected
         
+        case 4: return .tokenEndpointUnsupported
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -11001,6 +11456,10 @@ public struct FfiConverterTypeFfiConnectionLossReason: FfiConverterRustBuffer {
         
         case .neverConnected:
             writeInt(&buf, Int32(3))
+        
+        
+        case .tokenEndpointUnsupported:
+            writeInt(&buf, Int32(4))
         
         }
     }
@@ -11750,6 +12209,208 @@ public func FfiConverterTypeFfiMembershipFormat_lower(_ value: FfiMembershipForm
 
 
 extension FfiMembershipFormat: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Which roster fields can distinguish one participation from a later rejoin.
+ * This is metadata for the host; it does not create or emit a correlation ID.
+ */
+
+public enum FfiMembershipIdentityKind {
+    
+    /**
+     * In the MSC format, `member_id` is fresh per join and survives refreshes.
+     */
+    case perJoinMemberId
+    /**
+     * In the room-state format, use `(member_id, legacy_join_id)` together.
+     */
+    case legacyJoinId
+    /**
+     * In the room-state format, use `(member_id, membership_ts)` when the
+     * peer omitted the explicit join ID field.
+     */
+    case legacyMembershipTimestamp
+    /**
+     * No supported per-join identity is available. Do not derive a correlation
+     * ID from the member, event ID, origin timestamp, or a local observation.
+     */
+    case unavailable
+}
+
+
+#if compiler(>=6)
+extension FfiMembershipIdentityKind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiMembershipIdentityKind: FfiConverterRustBuffer {
+    typealias SwiftType = FfiMembershipIdentityKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiMembershipIdentityKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .perJoinMemberId
+        
+        case 2: return .legacyJoinId
+        
+        case 3: return .legacyMembershipTimestamp
+        
+        case 4: return .unavailable
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiMembershipIdentityKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .perJoinMemberId:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .legacyJoinId:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .legacyMembershipTimestamp:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .unavailable:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiMembershipIdentityKind_lift(_ buf: RustBuffer) throws -> FfiMembershipIdentityKind {
+    return try FfiConverterTypeFfiMembershipIdentityKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiMembershipIdentityKind_lower(_ value: FfiMembershipIdentityKind) -> RustBuffer {
+    return FfiConverterTypeFfiMembershipIdentityKind.lower(value)
+}
+
+
+extension FfiMembershipIdentityKind: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * One thing the MSC format relies on (spec 038 R45).
+ */
+
+public enum FfiMscRequirement {
+    
+    /**
+     * MatrixRTC (MSC4143).
+     */
+    case matrixRtc
+    /**
+     * Sticky events (MSC4354).
+     */
+    case stickyEvents
+    /**
+     * Delayed events (MSC4140): without them a call works on a 5 minute
+     * membership lifetime.
+     */
+    case delayedEvents
+    /**
+     * An `m.livekit` transport with an SFU `url`.
+     */
+    case liveKitTransport
+}
+
+
+#if compiler(>=6)
+extension FfiMscRequirement: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiMscRequirement: FfiConverterRustBuffer {
+    typealias SwiftType = FfiMscRequirement
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiMscRequirement {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .matrixRtc
+        
+        case 2: return .stickyEvents
+        
+        case 3: return .delayedEvents
+        
+        case 4: return .liveKitTransport
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiMscRequirement, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .matrixRtc:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .stickyEvents:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .delayedEvents:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .liveKitTransport:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiMscRequirement_lift(_ buf: RustBuffer) throws -> FfiMscRequirement {
+    return try FfiConverterTypeFfiMscRequirement.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiMscRequirement_lower(_ value: FfiMscRequirement) -> RustBuffer {
+    return FfiConverterTypeFfiMscRequirement.lower(value)
+}
+
+
+extension FfiMscRequirement: Equatable, Hashable {}
 
 
 
@@ -12540,6 +13201,106 @@ extension FfiUnableToDecrypt: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * Video codec to publish with (mirrors
+ * `matrix_rtc_transport::VideoCodecPreference`). A preference: a codec this
+ * platform cannot encode falls back to the default; see
+ * [`supported_video_codecs`].
+ */
+
+public enum FfiVideoCodecPreference {
+    
+    /**
+     * The transport's default (VP8).
+     */
+    case auto
+    case vp8
+    case h264
+    case vp9
+    case av1
+}
+
+
+#if compiler(>=6)
+extension FfiVideoCodecPreference: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFfiVideoCodecPreference: FfiConverterRustBuffer {
+    typealias SwiftType = FfiVideoCodecPreference
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FfiVideoCodecPreference {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .auto
+        
+        case 2: return .vp8
+        
+        case 3: return .h264
+        
+        case 4: return .vp9
+        
+        case 5: return .av1
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: FfiVideoCodecPreference, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .auto:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .vp8:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .h264:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .vp9:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .av1:
+            writeInt(&buf, Int32(5))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiVideoCodecPreference_lift(_ buf: RustBuffer) throws -> FfiVideoCodecPreference {
+    return try FfiConverterTypeFfiVideoCodecPreference.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFfiVideoCodecPreference_lower(_ value: FfiVideoCodecPreference) -> RustBuffer {
+    return FfiConverterTypeFfiVideoCodecPreference.lower(value)
+}
+
+
+extension FfiVideoCodecPreference: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * How much detail to receive for a video stream; the variants are mutually
  * exclusive. Prefer `Dimensions` — the renderer knows its surface size, the
  * server knows the publisher's layer ladder.
@@ -12840,6 +13601,16 @@ public enum MatrixRtcFfiError: Swift.Error {
      */
     case JoinRefused(errcode: String?, reason: String
     )
+    /**
+     * The homeserver advertises no LiveKit transport of the room's format
+     * to publish on (spec 038 R18).
+     */
+    case NoLiveKitTransport(transportType: String
+    )
+    /**
+     * Our homeserver lacks MSC4195's `get_token` (spec 038 R44).
+     */
+    case TokenEndpointUnsupported
 }
 
 
@@ -12880,6 +13651,10 @@ public struct FfiConverterTypeMatrixRtcFfiError: FfiConverterRustBuffer {
             errcode: try FfiConverterOptionString.read(from: &buf), 
             reason: try FfiConverterString.read(from: &buf)
             )
+        case 10: return .NoLiveKitTransport(
+            transportType: try FfiConverterString.read(from: &buf)
+            )
+        case 11: return .TokenEndpointUnsupported
 
          default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -12935,6 +13710,15 @@ public struct FfiConverterTypeMatrixRtcFfiError: FfiConverterRustBuffer {
             FfiConverterOptionString.write(errcode, into: &buf)
             FfiConverterString.write(reason, into: &buf)
             
+        
+        case let .NoLiveKitTransport(transportType):
+            writeInt(&buf, Int32(10))
+            FfiConverterString.write(transportType, into: &buf)
+            
+        
+        case .TokenEndpointUnsupported:
+            writeInt(&buf, Int32(11))
+        
         }
     }
 }
@@ -13743,6 +14527,30 @@ fileprivate struct FfiConverterOptionTypeFfiTileRoster: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeFfiVideoEncodingLimits: FfiConverterRustBuffer {
+    typealias SwiftType = FfiVideoEncodingLimits?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiVideoEncodingLimits.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiVideoEncodingLimits.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeFfiVideoSourceConfig: FfiConverterRustBuffer {
     typealias SwiftType = FfiVideoSourceConfig?
 
@@ -13783,6 +14591,30 @@ fileprivate struct FfiConverterOptionTypeFfiCallEvent: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeFfiCallEvent.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeFfiCallIntent: FfiConverterRustBuffer {
+    typealias SwiftType = FfiCallIntent?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeFfiCallIntent.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeFfiCallIntent.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -14335,6 +15167,31 @@ fileprivate struct FfiConverterSequenceTypeJoinedMembership: FfiConverterRustBuf
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeFfiMscRequirement: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiMscRequirement]
+
+    public static func write(_ value: [FfiMscRequirement], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiMscRequirement.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiMscRequirement] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiMscRequirement]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiMscRequirement.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeFfiRtcTransport: FfiConverterRustBuffer {
     typealias SwiftType = [FfiRtcTransport]
 
@@ -14352,6 +15209,31 @@ fileprivate struct FfiConverterSequenceTypeFfiRtcTransport: FfiConverterRustBuff
         seq.reserveCapacity(Int(len))
         for _ in 0 ..< len {
             seq.append(try FfiConverterTypeFfiRtcTransport.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeFfiVideoCodecPreference: FfiConverterRustBuffer {
+    typealias SwiftType = [FfiVideoCodecPreference]
+
+    public static func write(_ value: [FfiVideoCodecPreference], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeFfiVideoCodecPreference.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [FfiVideoCodecPreference] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [FfiVideoCodecPreference]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeFfiVideoCodecPreference.read(from: &buf))
         }
         return seq
     }
@@ -14583,6 +15465,16 @@ public func setupLogging(config: RtcLogConfig, sink: RtcLogSink?)throws   {try r
     )
 }
 }
+/**
+ * The video codecs this device can encode, for a codec picker. Depends on
+ * the platform and its hardware encoders, so ask rather than assume.
+ */
+public func supportedVideoCodecs() -> [FfiVideoCodecPreference]  {
+    return try!  FfiConverterSequenceTypeFfiVideoCodecPreference.lift(try! rustCall() {
+    uniffi_matrix_rtc_ffi_fn_func_supported_video_codecs($0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -14618,6 +15510,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_func_setup_logging() != 17783) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_func_supported_video_codecs() != 58726) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_method_audioframestream_next() != 33587) {
@@ -14749,6 +15644,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_unpublish() != 65138) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_unverified_participants() != 64638) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_matrix_rtc_ffi_checksum_method_mediasession_video_stream() != 53821) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14773,10 +15671,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_matrix_rtc_ffi_checksum_method_roomsink_on_timeline_events() != 30554) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_call_intent() != 45916) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_is_live() != 60709) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_leave() != 63866) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_legacy_join_id() != 812) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_lower_hand() != 2682) {
@@ -14818,6 +15722,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_matrix_rtc_ffi_checksum_method_rtccall_wait_for_end() != 2943) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtcclient_msc_support() != 54790) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_matrix_rtc_ffi_checksum_method_rtcclient_report_connectivity() != 62959) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14831,6 +15738,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_method_rtclogsink_log() != 41057) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_matrix_rtc_ffi_checksum_method_rtcroom_call_intent() != 28250) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_matrix_rtc_ffi_checksum_method_rtcroom_close_slot() != 47104) {

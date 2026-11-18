@@ -2396,6 +2396,7 @@ mod tests {
             member_id: member_id.to_owned(),
             membership_event_id: None,
             membership_ts: None,
+            legacy_join_id: Default::default(),
             origin_server_ts: None,
             application: "m.call".into(),
             transports: vec![RtcTransport::LiveKit(LiveKitTransport::service(

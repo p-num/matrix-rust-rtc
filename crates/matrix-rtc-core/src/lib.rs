@@ -79,6 +79,7 @@ pub use transport::{
     LEGACY_LIVEKIT_TYPE, LiveKitAuthFlow, LiveKitTransport, MIN_MEDIA_KEY_LEN, MSC_LIVEKIT_TYPE,
     MemberTransports, RawRtcTransport, RtcTransport, UnsupportedTransport, server_name_of,
 };
+pub use upkeep::UpkeepStopHandle;
 pub use wire::wire_event_type;
 
 /// Test doubles for crates built on the core, behind the `testing` feature.
@@ -125,6 +126,7 @@ mod tests {
                 transports: None,
                 leave_reason,
                 created_ts: None,
+                legacy_join_id: Default::default(),
             },
         }
     }
@@ -2034,6 +2036,7 @@ mod tests {
                 })),
                 leave_reason: None,
                 created_ts: None,
+                legacy_join_id: Default::default(),
             },
         };
 
@@ -2088,6 +2091,7 @@ mod tests {
                 })),
                 leave_reason: None,
                 created_ts: None,
+                legacy_join_id: Default::default(),
             },
         };
 

@@ -91,7 +91,7 @@
 //! content missing any of them fails the whole parse instead of degrading. Raw
 //! JSON is both more permissive and more honest here.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 // `std::time::SystemTime::now()` panics on wasm32-unknown-unknown; web-time's
 // is the same API over `Date.now()`.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -99,12 +99,50 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 use web_time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::element_call::{is_leave, legacy_session};
 
 /// The state event type carrying a pre-sticky Element Call membership.
 pub const STATE_MEMBER_EVENT_TYPE: &str = "org.matrix.msc3401.call.member";
+
+/// Optional per-participation identity in a legacy room-state membership.
+pub const LEGACY_JOIN_ID_FIELD: &str = "io.letro.call.join_id";
+
+/// Whether a legacy room-state membership supplied a usable join ID.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyJoinId {
+    /// Older peers omit the field and may identify the join using `created_ts`.
+    #[default]
+    Absent,
+    /// Exactly 32 lowercase ASCII hexadecimal characters.
+    Valid(String),
+    /// A present but malformed field leaves telemetry identity unavailable.
+    Invalid,
+}
+
+impl LegacyJoinId {
+    fn parse(value: Option<&Value>) -> Self {
+        match value {
+            None => Self::Absent,
+            Some(Value::String(id)) if is_legacy_join_id(id) => Self::Valid(id.clone()),
+            Some(_) => Self::Invalid,
+        }
+    }
+
+    pub(crate) fn is_absent(&self) -> bool {
+        matches!(self, Self::Absent)
+    }
+}
+
+fn is_legacy_join_id(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
 
 /// The `call_id` sentinel an MSC4143 slot id uses for the room-wide session,
 /// where this dialect uses an empty string. The same convention
@@ -145,8 +183,7 @@ pub fn participant_identity(user_id: &str, device_id: &str) -> String {
     format!("{user_id}:{device_id}")
 }
 
-/// One `org.matrix.msc3401.call.member` state event: the content, plus the three
-/// event-level fields the translation needs and the content does not carry.
+/// One `org.matrix.msc3401.call.member` state event with its content and event metadata.
 #[derive(Clone, Debug)]
 pub struct StateMemberEvent {
     /// The event's id, when known. Carried through untouched: Element Call
@@ -167,21 +204,22 @@ pub struct StateMemberEvent {
     pub content: Value,
 }
 
-/// A pre-sticky membership rendered in the current MSC4143 shape.
-///
-/// Exactly the three things the caller cannot get out of `content` on its own.
-/// Everything else — the slot id, the member id, the application, the transports
-/// — is inside `content`, where the core's own `RawStickyEventContent` reads it.
+/// A pre-sticky membership rendered in the current MSC4143 shape with its
+/// original event metadata.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StateMembership {
     /// The state event's id, verbatim.
     pub event_id: Option<String>,
     /// The state event's sender, verbatim.
     pub sender: String,
+    /// The state event's `origin_server_ts`, verbatim.
+    pub origin_server_ts: u64,
     /// `content.device_id`. Self-asserted and unauthenticated: state events
     /// carry no decryption metadata anywhere in the SDK, and Element Call as a
-    /// widget could not read it if they did. Becomes `EventOrigin::Claimed`.
+    /// widget could not read it if they did. Becomes `EventOrigin::RoomState`.
     pub claimed_device_id: String,
+    /// Join identity metadata read from the original legacy state event.
+    pub legacy_join_id: LegacyJoinId,
     /// MSC4143 `m.rtc.member` content, ready to deserialize as the core's
     /// `RawStickyEventContent`.
     pub content: Value,
@@ -192,6 +230,7 @@ pub struct StateMembership {
 struct Parsed<'a> {
     event_id: Option<&'a str>,
     sender: &'a str,
+    origin_server_ts: u64,
     state_key: &'a str,
     device_id: String,
     member_id: String,
@@ -206,6 +245,11 @@ struct Parsed<'a> {
     /// `origin_server_ts`. Taking the minimum is also what stops a peer with a
     /// fast clock from looking alive longer than it is.
     joined_at: u64,
+    /// The raw `created_ts`, when supplied by the peer. The event timestamp
+    /// stays separate so public membership identity can report an absence.
+    membership_ts: Option<u64>,
+    /// The optional join ID field, including malformed values.
+    legacy_join_id: Option<&'a Value>,
     /// `content["m.call.intent"]`, if stated.
     intent: Option<&'a Value>,
     /// `foci_preferred[0]`, verbatim.
@@ -258,17 +302,18 @@ pub fn translate_state_memberships(
             // `created_ts` rides along because this dialect's member id is
             // `{user}:{device}`, reused across joins: the timestamp is the only
             // thing that tells a rejoined session — which holds no keys — apart
-            // from the join we may already have served keys to. `joined_at` is
-            // pinned for the life of one join (a refresh keeps `created_ts` and
-            // the minimum with `origin_server_ts` does not move), so it changes
-            // exactly when the participation does.
+            // from the join we may already have served keys to. Preserve the
+            // raw generation timestamp here: clamping it to each refresh's
+            // origin timestamp would change identity while a fast clock catches up.
             let mut content = json!({
                 "slot_id": member.slot_id,
                 "msc4354_sticky_key": member.member_id,
                 "member": { "id": member.member_id, "membership": "join" },
                 "application": application,
-                "created_ts": member.joined_at,
             });
+            if let Some(membership_ts) = member.membership_ts {
+                content["created_ts"] = json!(membership_ts);
+            }
 
             // The focus object goes through **verbatim**: `RawRtcTransport`
             // flattens what it does not know, so `livekit_alias` rides along
@@ -292,7 +337,9 @@ pub fn translate_state_memberships(
             StateMembership {
                 event_id: member.event_id.map(str::to_owned),
                 sender: member.sender.to_owned(),
+                origin_server_ts: member.origin_server_ts,
                 claimed_device_id: member.device_id.clone(),
+                legacy_join_id: LegacyJoinId::parse(member.legacy_join_id),
                 content,
             }
         })
@@ -348,10 +395,10 @@ fn parse<'a>(event: &'a StateMemberEvent, now_ms: u64) -> Option<Parsed<'a>> {
     };
 
     // See `Parsed::joined_at` for why this is a minimum rather than a preference.
-    let joined_at = match object.get("created_ts").and_then(Value::as_u64) {
-        Some(created_ts) => created_ts.min(event.origin_server_ts),
-        None => event.origin_server_ts,
-    };
+    let membership_ts = object.get("created_ts").and_then(Value::as_u64);
+    let joined_at = membership_ts
+        .unwrap_or(event.origin_server_ts)
+        .min(event.origin_server_ts);
     let expires = object
         .get("expires")
         .and_then(Value::as_u64)
@@ -393,12 +440,15 @@ fn parse<'a>(event: &'a StateMemberEvent, now_ms: u64) -> Option<Parsed<'a>> {
     Some(Parsed {
         event_id: event.event_id.as_deref(),
         sender: &event.sender,
+        origin_server_ts: event.origin_server_ts,
         state_key: &event.state_key,
         device_id: device_id.to_owned(),
         member_id,
         slot_id,
         application_type: application_type.to_owned(),
         joined_at,
+        membership_ts,
+        legacy_join_id: object.get(LEGACY_JOIN_ID_FIELD),
         intent: object.get("m.call.intent"),
         own_focus: object
             .get("foci_preferred")
@@ -460,6 +510,9 @@ pub struct RoomStateDialect {
     own_device_id: String,
     room_id: String,
     slot_id: String,
+    /// Generated for this join and shared by every send from this dialect.
+    legacy_join_id: String,
+    active: Arc<Mutex<bool>>,
     /// Pinned on the first join and never moved.
     ///
     /// It is the join instant, and peers read it as one: this generation's
@@ -488,6 +541,8 @@ impl RoomStateDialect {
             own_device_id: own_device_id.into(),
             room_id: room_id.into(),
             slot_id: slot_id.into(),
+            legacy_join_id: crate::generate_member_id(),
+            active: Arc::new(Mutex::new(true)),
             created_ts: Arc::new(OnceLock::new()),
         }
     }
@@ -511,6 +566,24 @@ impl RoomStateDialect {
     /// our SFU participant identity.
     pub fn membership_id(&self) -> String {
         participant_identity(&self.own_user_id, &self.own_device_id)
+    }
+
+    /// The explicit join ID published throughout this participation.
+    pub fn legacy_join_id(&self) -> &str {
+        &self.legacy_join_id
+    }
+
+    pub(super) fn is_active(&self) -> bool {
+        self.with_active(|| ()).is_some()
+    }
+
+    pub(super) fn with_active<T>(&self, action: impl FnOnce() -> T) -> Option<T> {
+        let active = self.active.lock().unwrap();
+        (*active).then(action)
+    }
+
+    pub(super) fn deactivate(&self) {
+        *self.active.lock().unwrap() = false;
     }
 
     /// The device we publish, for the shared key-message builder.
@@ -576,6 +649,7 @@ impl RoomStateDialect {
             "scope": "m.room",
             "device_id": self.own_device_id,
             "membershipID": self.membership_id(),
+            (LEGACY_JOIN_ID_FIELD): self.legacy_join_id,
             "created_ts": created_ts,
             "expires": expires,
             // We publish on exactly one focus, so which selection mode we
@@ -637,6 +711,55 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn retiring_a_dialect_cannot_be_overtaken_by_its_paused_registration() {
+        use std::sync::{TryLockError, mpsc};
+
+        use crate::{Outbox, SendFailure, SendKind, SendPolicy, SlotKey};
+
+        let dialect = RoomStateDialect::new(
+            "@alice:example.org",
+            "ALICE",
+            "!room:example.org",
+            "m.call#room",
+        );
+        let outbox = Outbox::new();
+        let key = SlotKey::new("membership lane", SendKind::Membership);
+        let (checked, wait_for_check) = mpsc::sync_channel(0);
+        let (resume, wait_to_resume) = mpsc::sync_channel(0);
+
+        let (old_send, new_send) = std::thread::scope(|scope| {
+            let (dialect, outbox, key) = (&dialect, &outbox, &key);
+            let register = scope.spawn(move || {
+                dialect.with_active(|| {
+                    checked.send(()).unwrap();
+                    wait_to_resume.recv().unwrap();
+                    outbox.begin(key.clone())
+                })
+            });
+            wait_for_check.recv().unwrap();
+            let gate = dialect.active.try_lock().map(drop);
+            resume.send(()).unwrap();
+            assert!(matches!(gate, Err(TryLockError::WouldBlock)));
+            dialect.deactivate();
+            let new_send = outbox.begin(key.clone());
+            (register.join().unwrap().unwrap(), new_send)
+        });
+        assert!(dialect.with_active(|| outbox.begin(key)).is_none());
+        assert!(matches!(
+            old_send
+                .run(SendPolicy::single_attempt(), || async { Ok(()) })
+                .await,
+            Err(SendFailure::Superseded),
+        ));
+        assert!(
+            new_send
+                .run(SendPolicy::single_attempt(), || async { Ok(()) })
+                .await
+                .is_ok()
+        );
+    }
 
     /// A join as observed from Element Call on the JS SDK, pre-sticky.
     const EC_JOIN: &str = r#"{
@@ -882,6 +1005,45 @@ mod tests {
         // origin_server_ts is old, so despite the future `created_ts` this is
         // judged from the server's stamp and has expired.
         assert!(translate_values(&[("a", 1_000, skewed)], NOW).is_empty());
+    }
+
+    #[test]
+    fn a_fast_clocks_raw_generation_timestamp_survives_refreshes() {
+        let created_ts = NOW + 60_000;
+        let content = join_with(&[("created_ts", json!(created_ts))]);
+        for origin_server_ts in [NOW, NOW + 1_000, created_ts + 1_000] {
+            let membership = translate_values(
+                &[("a", origin_server_ts, content.clone())],
+                origin_server_ts,
+            )
+            .pop()
+            .expect("a live membership at each refresh");
+            assert_eq!(membership.content["created_ts"], json!(created_ts));
+        }
+    }
+
+    #[test]
+    fn a_missing_generation_timestamp_is_not_synthesized_from_the_events_origin() {
+        let origin_server_ts = NOW - 1_000;
+        let content = join_with(&[("created_ts", Value::Null)]);
+        for observed_at in [NOW, NOW + 500] {
+            let membership =
+                translate_values(&[("a", origin_server_ts, content.clone())], observed_at)
+                    .pop()
+                    .expect("a live membership at either observation time");
+            assert!(membership.content.get("created_ts").is_none());
+        }
+    }
+
+    #[test]
+    fn a_raw_generation_timestamp_does_not_extend_the_clamped_expiry() {
+        let created_ts = NOW + 60_000;
+        let content = join_with(&[("created_ts", json!(created_ts)), ("expires", json!(1_000))]);
+        let live = translate_values(&[("a", NOW, content.clone())], NOW + 999)
+            .pop()
+            .expect("live immediately before server-based expiry");
+        assert_eq!(live.content["created_ts"], json!(created_ts));
+        assert!(translate_values(&[("a", NOW, content)], NOW + 1_000).is_empty());
     }
 
     #[test]
@@ -1133,6 +1295,9 @@ mod tests {
             "!room:example.io"
         );
         assert!(legacy["created_ts"].is_u64());
+        assert!(is_legacy_join_id(
+            legacy[LEGACY_JOIN_ID_FIELD].as_str().unwrap()
+        ));
         // No spec field survives: this event serves one dialect only.
         assert!(legacy.get("slot_id").is_none());
         assert!(legacy.get("member").is_none());
@@ -1172,6 +1337,15 @@ mod tests {
             first["created_ts"],
             dialect.clone().member_content(&spec, Some(60_000))["created_ts"],
         );
+    }
+
+    #[test]
+    fn a_legacy_join_id_survives_refreshes_and_clones() {
+        let legacy = dialect();
+        let spec = content(SPEC_JOIN);
+        let first = legacy.member_content(&spec, Some(60_000));
+        let refreshed = legacy.clone().member_content(&spec, Some(90_000));
+        assert_eq!(first[LEGACY_JOIN_ID_FIELD], refreshed[LEGACY_JOIN_ID_FIELD]);
     }
 
     /// The deadline peers compute is `created_ts + expires`, and `created_ts`
@@ -1269,9 +1443,11 @@ mod tests {
             room_id: "!room:example.io".to_owned(),
             event_id: membership.event_id,
             sender: membership.sender,
-            origin: EventOrigin::claimed(membership.claimed_device_id),
+            origin: EventOrigin::RoomState {
+                device_id: membership.claimed_device_id,
+            },
             event_type: "m.rtc.member".to_owned(),
-            origin_server_ts: None,
+            origin_server_ts: Some(membership.origin_server_ts),
             content,
         };
 
@@ -1285,6 +1461,7 @@ mod tests {
 
         assert_eq!(joined.slot_id, "m.call#room");
         assert_eq!(joined.sender, "@alice:example.io");
+        assert_eq!(joined.origin_server_ts, Some(now));
         assert_eq!(joined.member_id, "@alice:example.io:V5cP8FErcB");
         assert_eq!(joined.sticky_key, joined.member_id);
         assert_eq!(joined.application.application_type(), Some("m.call"));

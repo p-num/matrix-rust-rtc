@@ -554,6 +554,239 @@ async fn joining_a_slot_held_by_a_live_session_is_refused() {
 }
 
 #[tokio::test]
+async fn a_queued_leave_ends_media_before_locking_the_room_and_blocks_a_replacement() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open(&client, &mock, ROOM).await;
+    let options = CallJoinOptions::new().transport(JoinTransport::ReceiveOnly);
+    let call = room.join_call(options.clone()).await.expect("join");
+    let ended = call.subscribe_ended();
+
+    let state = room.state.lock().await;
+    let replacement = room.join_call(options);
+    tokio::pin!(replacement);
+    assert!(
+        tokio::time::timeout(Duration::ZERO, &mut replacement)
+            .await
+            .is_err()
+    );
+
+    let leave = call.leave(LeaveSessionParams::new());
+    tokio::pin!(leave);
+    assert!(
+        tokio::time::timeout(Duration::ZERO, &mut leave)
+            .await
+            .is_err()
+    );
+    assert!(!call.is_live());
+    assert_eq!(
+        ended.borrow().as_ref().map(|reason| &reason.code),
+        Some(&LeaveCode::Leave)
+    );
+
+    drop(state);
+    assert!(matches!(
+        replacement.await,
+        Err(RtcError::Join(JoinError::AlreadyJoined(_)))
+    ));
+    leave.await.expect("issue the original leave");
+}
+
+async fn open_legacy(client: &RtcClient<MockBackend>, mock: &MockBackend) -> RtcRoom<MockBackend> {
+    use matrix_rtc_core::compat::STATE_MEMBER_EVENT_TYPE;
+
+    let room = client
+        .room(
+            ROOM,
+            RoomOptions {
+                format: MembershipFormat::RoomState,
+            },
+        )
+        .await
+        .expect("open");
+    let sink = mock.room_subscription(ROOM).unwrap().sink.clone();
+    sink.on_encryption(false);
+    sink.on_joined_members(vec![mock.user_id.clone()]);
+    sink.on_sticky_events(Vec::new());
+    sink.on_state_events(STATE_MEMBER_EVENT_TYPE.to_owned(), Vec::new());
+    room.seeded().await;
+    room
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_retained_legacy_call_cannot_write_after_its_room_is_reopened() {
+    use matrix_rtc_core::compat::LEGACY_JOIN_ID_FIELD;
+
+    let now = tokio::time::Instant::now();
+    let outbox = Outbox::with_clock(Arc::new(move || 10_000 + now.elapsed().as_millis() as u64));
+    let mock = mock();
+    let client = RtcClient::with_outbox(mock.clone(), outbox);
+    let room = open_legacy(&client, &mock).await;
+    let mut options = CallJoinOptions::new().transport(JoinTransport::ReceiveOnly);
+    options.join.keep_alive_interval_ms = Some(50);
+    options.join.sticky_duration_ms = Some(300);
+    let first = room.join_call(options).await.expect("first join");
+    let first_id = first.legacy_join_id().unwrap();
+    let ended = first.subscribe_ended();
+
+    mock.script(
+        MockMethod::StateEvent,
+        [MockOutcome::After(
+            Duration::from_millis(300),
+            Box::new(MockOutcome::Ok),
+        )],
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(mock.calls_to(MockMethod::StateEvent).len(), 2);
+    assert_eq!(
+        mock.state_events.lock().unwrap().len(),
+        1,
+        "old refresh still in flight"
+    );
+    drop(room);
+    assert!(!first.is_live());
+    assert!(ended.borrow().is_some());
+
+    let reopened = open_legacy(&client, &mock).await;
+    let second = reopened
+        .join_call(CallJoinOptions::new().transport(JoinTransport::ReceiveOnly))
+        .await
+        .expect("second join");
+    let second_id = second.legacy_join_id().unwrap();
+    assert_ne!(first_id, second_id);
+    assert!(matches!(
+        first.leave(LeaveSessionParams::new()).await,
+        Err(RtcError::SessionOver)
+    ));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let sent = mock.state_events.lock().unwrap();
+    assert_eq!(sent.len(), 3);
+    assert_eq!(sent[0].3[LEGACY_JOIN_ID_FIELD], first_id);
+    assert_eq!(sent[1].3[LEGACY_JOIN_ID_FIELD], first_id);
+    assert_eq!(sent[2].3[LEGACY_JOIN_ID_FIELD], second_id);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_legacy_rejoin_cancels_the_old_delayed_leave_armed_during_cleanup() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open_legacy(&client, &mock).await;
+    let options = CallJoinOptions::new().transport(JoinTransport::ReceiveOnly);
+    let mut first_options = options.clone();
+    first_options.join.keep_alive_interval_ms = Some(100);
+    let first = room.join_call(first_options).await.expect("first join");
+    let first_id = first.legacy_join_id().unwrap().to_owned();
+
+    mock.script(
+        MockMethod::RestartDelayedEvent,
+        [MockOutcome::Fail(BackendError::with_matrix_error(
+            Some("M_NOT_FOUND".to_owned()),
+            Some(404),
+            "old delayed leave already fired",
+        ))],
+    );
+    mock.script(
+        MockMethod::DelayedEvent,
+        [MockOutcome::After(
+            Duration::from_secs(1),
+            Box::new(MockOutcome::Ok),
+        )],
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let delayed_starts = mock.calls_to(MockMethod::DelayedEvent);
+    assert_eq!(delayed_starts.len(), 2);
+    assert_eq!(mock.delayed_events.lock().unwrap().len(), 1);
+
+    drop(first);
+    let second = room.join_call(options).await.expect("replacement joins");
+    assert_ne!(second.legacy_join_id(), Some(first_id.as_str()));
+
+    let delayed_calls: Vec<_> = mock
+        .calls()
+        .into_iter()
+        .map(|call| call.method)
+        .filter(|method| {
+            matches!(
+                method,
+                MockMethod::DelayedEvent | MockMethod::CancelDelayedEvent
+            )
+        })
+        .collect();
+    assert_eq!(
+        delayed_calls,
+        [
+            MockMethod::DelayedEvent,
+            MockMethod::DelayedEvent,
+            MockMethod::CancelDelayedEvent,
+            MockMethod::DelayedEvent,
+        ],
+        "the old rearm must be canceled before the new participation arms its leave",
+    );
+    assert!(
+        mock.calls_to(MockMethod::CancelDelayedEvent)[0]
+            >= delayed_starts[1] + Duration::from_secs(1),
+        "cancellation must wait until the old rearm returns its ID",
+    );
+    let delayed = mock.delayed_events.lock().unwrap();
+    assert_eq!(delayed.len(), 3);
+    assert_eq!(delayed[1].2, delayed[2].2, "both target the same state key");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_join_timeout_does_not_abandon_legacy_cleanup() {
+    use matrix_rtc_core::compat::LEGACY_JOIN_ID_FIELD;
+
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open_legacy(&client, &mock).await;
+    let options = CallJoinOptions::new().transport(JoinTransport::ReceiveOnly);
+    let first = room.join_call(options.clone()).await.expect("first join");
+    let first_id = first.legacy_join_id().unwrap().to_owned();
+    drop(first);
+
+    // The leave will land five seconds after the join budget runs out, but
+    // before the leave's own attempt times out.
+    let state = room.state.lock().await;
+    mock.script(
+        MockMethod::StateEvent,
+        [MockOutcome::After(
+            Duration::from_secs(25),
+            Box::new(MockOutcome::Ok),
+        )],
+    );
+    let started = tokio::time::Instant::now();
+    {
+        let replacement = room.join_call(options.clone());
+        tokio::pin!(replacement);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), replacement.as_mut())
+                .await
+                .is_err()
+        );
+        drop(state);
+        assert!(matches!(
+            replacement.await,
+            Err(RtcError::Join(JoinError::TimedOut))
+        ));
+    }
+    assert_eq!(started.elapsed(), JOIN_BUDGET);
+    assert_eq!(mock.calls_to(MockMethod::StateEvent).len(), 2);
+    assert_eq!(mock.state_events.lock().unwrap().len(), 1);
+    drop(room);
+
+    let reopened = open_legacy(&client, &mock).await;
+    let second = reopened.join_call(options).await.expect("retry joins");
+    let second_id = second.legacy_join_id().unwrap();
+    assert_ne!(first_id, second_id);
+    let sent = mock.state_events.lock().unwrap();
+    assert_eq!(sent.len(), 3, "the pending leave landed before the retry");
+    assert_eq!(sent[0].3[LEGACY_JOIN_ID_FIELD], first_id);
+    assert_eq!(sent[1].3, json!({}));
+    assert_eq!(sent[2].3[LEGACY_JOIN_ID_FIELD], second_id);
+}
+
+#[tokio::test]
 async fn a_slot_id_of_another_application_is_refused() {
     let mock = mock();
     let client = RtcClient::new(mock.clone());

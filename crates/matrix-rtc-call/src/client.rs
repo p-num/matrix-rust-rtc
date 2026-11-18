@@ -29,10 +29,10 @@ use matrix_rtc_core::{
     EncryptionConfig, EncryptionKeySignalHandler, JoinError, JoinSessionParams, JoinedMembership,
     LeaveCode, LeaveError, LeaveReason, LeaveSessionParams, MatrixBackend, OpenError, Outbox,
     ROOM_APPLICATION_SLOT_ID, RtcIdentityMapper, SignallingHealth, SlotEncryption, SlotState,
-    TransportIntent,
-    executor::{self, AbortHandle, AbortOnDrop, JoinHandleExt},
+    TransportIntent, UpkeepStopHandle,
+    executor::{self, AbortOnDrop, JoinHandleExt},
 };
-use tokio::sync::{Mutex, broadcast, watch};
+use tokio::sync::{Mutex, OwnedMutexGuard, broadcast, watch};
 
 use crate::direct_call::{CallKind, DirectCall, DirectCallEnd, DirectCallState};
 use crate::intent::{CallIntent, CallIntentConsensus};
@@ -43,7 +43,7 @@ use crate::room_state::{CallJoinParams, CallRoomState, HandNext};
 use crate::status::{CallStatus, CallStatusCell, MediaStatusReporter};
 use crate::transports::{self, JoinTransport};
 use matrix_rtc_core::RoomOptions;
-use matrix_rtc_core::compat::{DialectBackend, MembershipFormat};
+use matrix_rtc_core::compat::{DialectBackend, DialectHold, MembershipFormat};
 use matrix_rtc_core::feeder::RoomAlreadyOpen;
 use matrix_rtc_core::outbox::{BACKOFF_INITIAL, BACKOFF_MAX};
 
@@ -325,7 +325,7 @@ impl<B: MatrixBackend + 'static> RtcClient<B> {
 }
 
 /// One open room (R3). Dropping it without [`close`](Self::close) ends its
-/// subscriptions only (R4): no leave is sent, and a membership left behind
+/// subscriptions and local participation (R4): a membership left behind
 /// expires through its delayed leave.
 pub struct RtcRoom<B: MatrixBackend + 'static> {
     room_id: String,
@@ -427,16 +427,23 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         let deadline = executor::Instant::now() + JOIN_BUDGET;
         let slot_id = options.slot_id.clone();
         let transport = self.transport(options.transport.clone(), deadline).await?;
-        let mut state = self.state.lock().await;
-        let params = self
-            .prepare_join(&mut state, options, transport.clone())
+        let (mut state, params, legacy_join_id) = self
+            .prepare_join(options, transport.clone(), deadline)
             .await?;
         let member_id = params.membership_id();
         state.rtc_mut().join_within(params, Some(deadline)).await?;
-        let upkeep = state.rtc().upkeep_abort_handle(&slot_id);
+        let upkeep = state.rtc().upkeep_stop_handle(&slot_id);
         let auto_leaves = state.rtc().subscribe_auto_leaves(&slot_id);
+        let session = self.session(
+            slot_id,
+            member_id,
+            legacy_join_id,
+            transport,
+            upkeep,
+            auto_leaves,
+        );
         drop(state);
-        Ok(self.session(slot_id, member_id, transport, upkeep, auto_leaves))
+        Ok(session)
     }
 
     /// Joins a call slot: the generic join, then the call layer — reactions
@@ -462,10 +469,8 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         }
         let slot_id = join.slot_id.clone();
         let transport = self.transport(join.transport.clone(), deadline).await?;
-        let mut state = self.state.lock().await;
-        let rtc = self
-            .prepare_join(&mut state, join, transport.clone())
-            .await?;
+        let (mut state, rtc, legacy_join_id) =
+            self.prepare_join(join, transport.clone(), deadline).await?;
         let member_id = rtc.membership_id();
         let joined = state
             .join_within(
@@ -478,13 +483,20 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
                 Some(deadline),
             )
             .await?;
-        let upkeep = state.rtc().upkeep_abort_handle(&slot_id);
+        let upkeep = state.rtc().upkeep_stop_handle(&slot_id);
         let auto_leaves = state.rtc().subscribe_auto_leaves(&slot_id);
         let event_moves = state.rtc().subscribe_own_membership_event_id(&slot_id);
         let hand_requests = state.subscribe_hand_requests(&slot_id);
         let outbox = state.rtc().outbox().clone();
+        let session = self.session(
+            slot_id.clone(),
+            member_id,
+            legacy_join_id,
+            transport,
+            upkeep,
+            auto_leaves,
+        );
         drop(state);
-        let session = self.session(slot_id.clone(), member_id, transport, upkeep, auto_leaves);
         session.end.report_to(joined.status.clone());
         // After the lock is released: the ring may be retried for seconds, and
         // a pickup or a decline must be able to arrive meanwhile.
@@ -563,10 +575,10 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
     /// another join of the slot.
     async fn prepare_join(
         &self,
-        state: &mut State<B>,
         options: JoinOptions,
         transport: TransportIntent,
-    ) -> Result<JoinSessionParams, RtcError> {
+        deadline: executor::Instant,
+    ) -> Result<(OwnedMutexGuard<State<B>>, JoinSessionParams, Option<String>), RtcError> {
         let JoinOptions {
             slot_id,
             application,
@@ -587,7 +599,11 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             return Err(JoinError::InvalidSlotId { slot_id, reason }.into());
         }
 
-        if self.live_session(&slot_id) {
+        let remaining = || deadline.saturating_duration_since(executor::Instant::now());
+        let mut state = executor::timeout(remaining(), self.state.clone().lock_owned())
+            .await
+            .map_err(|_| JoinError::TimedOut)?;
+        if self.session_blocks_join(&slot_id) {
             return Err(JoinError::AlreadyJoined(
                 state.rtc().own_member_id(&slot_id).unwrap_or_default(),
             )
@@ -595,13 +611,42 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         }
         // Joined in the core with no live session object: the host dropped
         // it without leaving. Leave that participation first rather than
-        // refusing the slot until its delayed leave fires.
-        if state.rtc().own_member_id(&slot_id).is_some() {
+        // refusing the next join until its delayed leave fires.
+        let previous_slot = if self.mode == MembershipFormat::RoomState {
+            state.rtc().joined_slots().into_iter().next()
+        } else {
+            state.rtc().own_member_id(&slot_id).map(|_| slot_id.clone())
+        };
+        if let Some(previous_slot) = previous_slot {
+            if self.session_blocks_join(&previous_slot) {
+                return Err(JoinError::AlreadyJoined(
+                    state
+                        .rtc()
+                        .own_member_id(&previous_slot)
+                        .unwrap_or_default(),
+                )
+                .into());
+            }
             log::info!(
-                "[{}/{slot_id}] leaving a participation whose session was dropped",
+                "[{}/{previous_slot}] leaving a participation whose session was dropped",
                 self.room_id,
             );
-            state.leave(&slot_id, LeaveSessionParams::new()).await?;
+            // Keep the old membership's lane and dialect until its leave
+            // finishes, even if this join runs out of time or the room closes.
+            let dialect = self.backend.hold_dialect(&self.room_id);
+            let cleanup = executor::spawn(async move {
+                let _dialect = dialect;
+                state
+                    .leave(&previous_slot, LeaveSessionParams::new())
+                    .await?;
+                Ok::<_, LeaveError>(state)
+            });
+            state = executor::timeout(remaining(), cleanup)
+                .await
+                .map_err(|_| JoinError::TimedOut)?
+                .map_err(|error| {
+                    CommandError::from_message(format!("stale RTC leave task: {error}"))
+                })??;
         }
 
         let mut params = JoinSessionParams {
@@ -616,10 +661,11 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             encryption_config,
         };
         // The `member.id` and our sends' dialect, in the room's format.
-        if let Some(handle) = &self.handle {
-            handle.prepare_join(&mut params);
-        }
-        Ok(params)
+        let legacy_join_id = match &self.handle {
+            Some(handle) => handle.prepare_join(&mut params, deadline).await?,
+            None => None,
+        };
+        Ok((state, params, legacy_join_id))
     }
 
     fn sessions(&self) -> MutexGuard<'_, HashMap<String, Arc<SessionEnd>>> {
@@ -628,10 +674,10 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn live_session(&self, slot_id: &str) -> bool {
+    fn session_blocks_join(&self, slot_id: &str) -> bool {
         self.sessions()
             .get(slot_id)
-            .is_some_and(|end| end.is_live())
+            .is_some_and(|end| end.blocks_join())
     }
 
     /// The session object for a join that just succeeded. `upkeep` is the
@@ -642,11 +688,12 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         &self,
         slot_id: String,
         member_id: String,
+        legacy_join_id: Option<String>,
         transport: TransportIntent,
-        upkeep: Option<AbortHandle>,
+        upkeep: Option<UpkeepStopHandle>,
         auto_leaves: Option<broadcast::Receiver<LeaveReason>>,
     ) -> RtcSession<B> {
-        let end = Arc::new(SessionEnd::new());
+        let end = Arc::new(SessionEnd::new(upkeep));
         self.sessions().insert(slot_id.clone(), end.clone());
         RtcSession {
             _follow_auto_leave: auto_leaves.map(|leaves| {
@@ -655,11 +702,12 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             room_id: self.room_id.clone(),
             slot_id,
             member_id,
+            legacy_join_id,
             transport,
             format: self.mode,
+            backend: self.backend.clone(),
             state: self.state.clone(),
             end,
-            upkeep,
         }
     }
 
@@ -728,6 +776,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
     ) -> AbortOnDrop<()> {
         let state = self.state.clone();
         let room_id = self.room_id.clone();
+        let backend = self.backend.clone();
         executor::spawn(async move {
             let mut states = direct.subscribe();
             let mut ended = end.ended.subscribe();
@@ -746,11 +795,12 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
             if reason == DirectCallEnd::Left {
                 return;
             }
-            // Ended before the send, as a host leave is, so media stops at once.
             let leave_reason = LeaveReason::with_reason(LeaveCode::Leave, reason.as_str());
-            if !end.end(leave_reason.clone()) {
+            let Some(_reservation) = end.reserve_leave(&backend, &room_id, || {
+                end.end(leave_reason.clone())
+            }) else {
                 return;
-            }
+            };
             log::info!("[{room_id}/{slot_id}] leaving: {}", reason.as_str());
             let params = LeaveSessionParams {
                 leave_reason: Some(leave_reason),
@@ -776,7 +826,9 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         let mut losses = status.follow_losses();
         let mut moves = status.follow_moves();
         let state = self.state.clone();
-        let tag = format!("{}/{slot_id}", self.room_id);
+        let room_id = self.room_id.clone();
+        let backend = self.backend.clone();
+        let tag = format!("{room_id}/{slot_id}");
         executor::spawn(async move {
             let mut ended = end.ended.subscribe();
             let (reason, message) = loop {
@@ -809,14 +861,16 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
                 LeaveCode::Other("connection_lost".to_owned()),
                 message.clone(),
             );
-            if !end.end_quietly(leave_reason.clone()) {
+            let Some(reservation) =
+                end.reserve_leave(&backend, &room_id, || end.end_quietly(leave_reason.clone()))
+            else {
                 return;
-            }
+            };
             log::warn!("[{tag}] our media connection was given up ({reason:?}): leaving");
             let params = LeaveSessionParams {
                 leave_reason: Some(leave_reason),
             };
-            issue_leave(&state, &slot_id, tag, params).await;
+            issue_leave(&state, &slot_id, tag, params, reservation).await;
             status.connection_closed(reason, message);
         })
         .abort_on_drop()
@@ -832,17 +886,21 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
 /// The one place a participation becomes over and says why, whatever ended it.
 struct SessionEnd {
     live: AtomicBool,
+    pending_leave: AtomicBool,
     ended: watch::Sender<Option<LeaveReason>>,
     /// A call's status, told the end as it happens.
     status: StdMutex<Option<Arc<CallStatusCell>>>,
+    upkeep: Option<UpkeepStopHandle>,
 }
 
 impl SessionEnd {
-    fn new() -> Self {
+    fn new(upkeep: Option<UpkeepStopHandle>) -> Self {
         Self {
             live: AtomicBool::new(true),
+            pending_leave: AtomicBool::new(false),
             ended: watch::channel(None).0,
             status: StdMutex::new(None),
+            upkeep,
         }
     }
 
@@ -860,6 +918,28 @@ impl SessionEnd {
 
     fn is_live(&self) -> bool {
         self.live.load(Ordering::SeqCst)
+    }
+
+    fn blocks_join(&self) -> bool {
+        self.is_live() || self.pending_leave.load(Ordering::SeqCst)
+    }
+
+    /// Keeps this participation's machine reserved while a leave waits for
+    /// the room lock. Media can stop as soon as the leave is requested.
+    fn reserve_leave<B: MatrixBackend>(
+        &self,
+        backend: &Arc<DialectBackend<B>>,
+        room_id: &str,
+        end: impl FnOnce() -> bool,
+    ) -> Option<PendingSessionLeave<'_, B>> {
+        if self.pending_leave.swap(true, Ordering::SeqCst) {
+            return None;
+        }
+        let reservation = PendingSessionLeave {
+            session: self,
+            dialect: Some(backend.hold_dialect(room_id)),
+        };
+        end().then_some(reservation)
     }
 
     /// [`Self::end`], leaving the call's status to the caller, which reports
@@ -894,6 +974,17 @@ impl SessionEnd {
     }
 }
 
+struct PendingSessionLeave<'a, B> {
+    session: &'a SessionEnd,
+    dialect: Option<DialectHold<B>>,
+}
+
+impl<B> Drop for PendingSessionLeave<'_, B> {
+    fn drop(&mut self) {
+        self.session.pending_leave.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Our participation's part of a leave under the room's lock, then its one
 /// send attempt detached (034 R8): returns once the leave is issued, never
 /// waiting for its outcome.
@@ -902,16 +993,14 @@ async fn issue_leave<B: MatrixBackend + 'static>(
     slot_id: &str,
     tag: String,
     params: LeaveSessionParams,
+    mut reservation: PendingSessionLeave<'_, B>,
 ) {
-    let (pending, dialect) = {
+    let dialect = reservation.dialect.take();
+    let pending = {
         let mut state = state.lock().await;
-        // The room may be shut down before this goes out, and that forgets
-        // the format the leave has to be written in.
-        let dialect = state
-            .rtc()
-            .backend()
-            .map(|backend| backend.hold_dialect(state.rtc().room_id()));
-        (state.begin_leave(slot_id, params).await, dialect)
+        let pending = state.begin_leave(slot_id, params).await;
+        drop(reservation);
+        pending
     };
     let send = async move {
         let _dialect = dialect;
@@ -968,6 +1057,12 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
 
 impl<B: MatrixBackend + 'static> Drop for RtcRoom<B> {
     fn drop(&mut self) {
+        for (_, end) in self.sessions().drain() {
+            end.end(LeaveReason::new(LeaveCode::Leave));
+            if let Some(upkeep) = &end.upkeep {
+                upkeep.stop();
+            }
+        }
         self.detach();
     }
 }
@@ -981,13 +1076,12 @@ pub struct RtcSession<B: MatrixBackend + 'static> {
     room_id: String,
     slot_id: String,
     member_id: String,
+    legacy_join_id: Option<String>,
     transport: TransportIntent,
     format: MembershipFormat,
+    backend: Arc<DialectBackend<B>>,
     state: SharedState<B>,
     end: Arc<SessionEnd>,
-    /// The core's upkeep for this join, aborted when the session object
-    /// drops: a dropped session sends no leave and stops keeping alive.
-    upkeep: Option<AbortHandle>,
     _follow_auto_leave: Option<AbortOnDrop<()>>,
 }
 
@@ -1003,6 +1097,11 @@ impl<B: MatrixBackend + 'static> RtcSession<B> {
     /// Our `member.id` in this participation.
     pub fn member_id(&self) -> &str {
         &self.member_id
+    }
+
+    /// The explicit join ID this session publishes in the legacy format.
+    pub fn legacy_join_id(&self) -> Option<&str> {
+        self.legacy_join_id.as_deref()
     }
 
     /// The membership format this session was joined in.
@@ -1110,13 +1209,12 @@ impl<B: MatrixBackend + 'static> RtcSession<B> {
             .leave_reason
             .clone()
             .unwrap_or_else(|| LeaveReason::new(LeaveCode::Leave));
-        // Ended before the send, so media stops publishing at once rather than
-        // after a slow or failing one.
-        if !self.end.end(reason) {
-            return Err(RtcError::SessionOver);
-        }
+        let reservation = self
+            .end
+            .reserve_leave(&self.backend, &self.room_id, || self.end.end(reason))
+            .ok_or(RtcError::SessionOver)?;
         let tag = format!("{}/{}", self.room_id, self.slot_id);
-        issue_leave(&self.state, &self.slot_id, tag, params).await;
+        issue_leave(&self.state, &self.slot_id, tag, params, reservation).await;
         Ok(())
     }
 
@@ -1132,8 +1230,8 @@ impl<B: MatrixBackend + 'static> RtcSession<B> {
 impl<B: MatrixBackend + 'static> Drop for RtcSession<B> {
     fn drop(&mut self) {
         self.end.abandon();
-        if let Some(upkeep) = &self.upkeep {
-            upkeep.abort();
+        if let Some(upkeep) = &self.end.upkeep {
+            upkeep.stop();
         }
     }
 }
