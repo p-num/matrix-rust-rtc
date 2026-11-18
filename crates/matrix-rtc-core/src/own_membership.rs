@@ -985,39 +985,32 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
         }
         self.latest_event_id.send_replace(None);
 
-        // Cancel the delayed leave event if one exists
-        if let Some(event_id) = self.delayed_event_id() {
-            log::debug!("[{}] Canceling delayed leave event: {}", room_id, event_id);
-            // Deliberately not propagated. The leave event above already went
-            // through, so we *have* left; the cancellation is only tidying up a
-            // safety net that is now redundant. The common failure is a 404
-            // because the delay already fired — which is the outcome we wanted
-            // anyway. Failing the whole leave here would leave the machine
-            // stuck in `Leaving` after a successful leave.
-            match self
+        // An arm already at the host can still return a new delay ID. Take
+        // the lane before reading it so that ID cannot escape cancellation.
+        if self.arming.load(Ordering::SeqCst) || self.delayed_event_id().is_some() {
+            let cancelled = self
                 .outbox
                 .send(
                     self.key(SendKind::DelayedLeave),
                     SendPolicy::single_attempt(),
-                    || {
+                    || async {
+                        let info = self.keep_alive_info.lock().unwrap().take();
+                        let Some(KeepAliveInfo {
+                            delayed_event_id, ..
+                        }) = info
+                        else {
+                            return Ok(());
+                        };
+                        log::debug!("[{room_id}] cancelling delayed leave {delayed_event_id}");
                         self.backend
-                            .cancel_delayed_event(room_id.clone(), event_id.clone())
+                            .cancel_delayed_event(room_id.clone(), delayed_event_id)
+                            .await
                     },
                 )
-                .await
-            {
-                Ok(()) => log::debug!("[{}] Delayed leave event canceled", room_id),
-                Err(error) => log::debug!(
-                    "[{room_id}] Delayed leave {event_id} could not be canceled ({error}); \
-                     it has most likely already fired, which leaves us departed either way.",
-                ),
-            }
-
-            // Clear the stored event ID regardless: either it is canceled, or
-            // it fired and no longer exists.
-            {
-                let mut info_guard = self.keep_alive_info.lock().unwrap();
-                *info_guard = None;
+                .await;
+            // Our leave landed. Cancellation can fail if the delay already fired.
+            if let Err(error) = cancelled {
+                log::debug!("[{room_id}] our delayed leave could not be cancelled ({error})");
             }
         }
 
@@ -1455,24 +1448,30 @@ impl<T: MatrixBackend + 'static> OwnMembershipMachine<T> {
             keep_alive_timeout_ms
         );
         let delayed_content = self.build_delayed_leave_content(&self.slot_id, &self.sticky_key);
-        let delayed_event_id = pending
-            .run(policy, || {
-                self.backend.send_delayed_sticky_event(
-                    self.room_id.clone(),
-                    "m.rtc.member".to_string(),
-                    delayed_content.clone(),
-                    self.sticky_duration_ms,
-                    keep_alive_timeout_ms,
-                )
+        pending
+            .run(policy, || async {
+                let delayed_event_id = self
+                    .backend
+                    .send_delayed_sticky_event(
+                        self.room_id.clone(),
+                        "m.rtc.member".to_string(),
+                        delayed_content.clone(),
+                        self.sticky_duration_ms,
+                        keep_alive_timeout_ms,
+                    )
+                    .await?;
+                // Preserve the acknowledgement before releasing the lane, even
+                // when the leave cancels this send while the host is answering.
+                *self.delayed_support.lock().unwrap() = DelayedLeaveSupport::Supported;
+                *self.keep_alive_info.lock().unwrap() = Some(KeepAliveInfo {
+                    delayed_event_id,
+                    timeout_ms: keep_alive_timeout_ms,
+                    last_restart_ms: self.now_ms(),
+                });
+                Ok(())
             })
             .await?;
 
-        *self.delayed_support.lock().unwrap() = DelayedLeaveSupport::Supported;
-        *self.keep_alive_info.lock().unwrap() = Some(KeepAliveInfo {
-            delayed_event_id,
-            timeout_ms: keep_alive_timeout_ms,
-            last_restart_ms: self.now_ms(),
-        });
         self.update_lapsed();
         log::trace!("[{}] Delayed leave scheduled successfully", self.room_id);
         Ok(())

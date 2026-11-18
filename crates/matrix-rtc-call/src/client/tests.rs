@@ -668,6 +668,72 @@ async fn a_retained_legacy_call_cannot_write_after_its_room_is_reopened() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_legacy_rejoin_cancels_the_old_delayed_leave_armed_during_cleanup() {
+    let mock = mock();
+    let client = RtcClient::new(mock.clone());
+    let room = open_legacy(&client, &mock).await;
+    let options = CallJoinOptions::new().transport(JoinTransport::ReceiveOnly);
+    let mut first_options = options.clone();
+    first_options.join.keep_alive_interval_ms = Some(100);
+    let first = room.join_call(first_options).await.expect("first join");
+    let first_id = first.legacy_join_id().unwrap().to_owned();
+
+    mock.script(
+        MockMethod::RestartDelayedEvent,
+        [MockOutcome::Fail(BackendError::with_matrix_error(
+            Some("M_NOT_FOUND".to_owned()),
+            Some(404),
+            "old delayed leave already fired",
+        ))],
+    );
+    mock.script(
+        MockMethod::DelayedEvent,
+        [MockOutcome::After(
+            Duration::from_secs(1),
+            Box::new(MockOutcome::Ok),
+        )],
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let delayed_starts = mock.calls_to(MockMethod::DelayedEvent);
+    assert_eq!(delayed_starts.len(), 2);
+    assert_eq!(mock.delayed_events.lock().unwrap().len(), 1);
+
+    drop(first);
+    let second = room.join_call(options).await.expect("replacement joins");
+    assert_ne!(second.legacy_join_id(), Some(first_id.as_str()));
+
+    let delayed_calls: Vec<_> = mock
+        .calls()
+        .into_iter()
+        .map(|call| call.method)
+        .filter(|method| {
+            matches!(
+                method,
+                MockMethod::DelayedEvent | MockMethod::CancelDelayedEvent
+            )
+        })
+        .collect();
+    assert_eq!(
+        delayed_calls,
+        [
+            MockMethod::DelayedEvent,
+            MockMethod::DelayedEvent,
+            MockMethod::CancelDelayedEvent,
+            MockMethod::DelayedEvent,
+        ],
+        "the old rearm must be canceled before the new participation arms its leave",
+    );
+    assert!(
+        mock.calls_to(MockMethod::CancelDelayedEvent)[0]
+            >= delayed_starts[1] + Duration::from_secs(1),
+        "cancellation must wait until the old rearm returns its ID",
+    );
+    let delayed = mock.delayed_events.lock().unwrap();
+    assert_eq!(delayed.len(), 3);
+    assert_eq!(delayed[1].2, delayed[2].2, "both target the same state key");
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_join_timeout_does_not_abandon_legacy_cleanup() {
     use matrix_rtc_core::compat::LEGACY_JOIN_ID_FIELD;
 

@@ -226,6 +226,18 @@ struct Slot {
     waiting: usize,
 }
 
+impl Slot {
+    fn ended(&self, generation: u64) -> Option<SendFailure> {
+        if self.generation == generation {
+            None
+        } else if generation <= self.cancelled_through {
+            Some(SendFailure::Cancelled)
+        } else {
+            Some(SendFailure::Superseded)
+        }
+    }
+}
+
 impl Default for Outbox {
     fn default() -> Self {
         Self::new()
@@ -501,24 +513,15 @@ impl Outbox {
     }
 
     fn ended(&self, key: &SlotKey, generation: u64) -> Option<SendFailure> {
-        let slots = self.slots();
-        let slot = slots.get(key)?;
-        if slot.generation == generation {
-            None
-        } else if generation <= slot.cancelled_through {
-            Some(SendFailure::Cancelled)
-        } else {
-            Some(SendFailure::Superseded)
-        }
+        self.slots().get(key)?.ended(generation)
     }
 
     fn claim(&self, key: &SlotKey, generation: u64) -> Claim {
-        if let Some(failure) = self.ended(key, generation) {
-            return Claim::Ended(failure);
-        }
         let mut slots = self.slots();
         let slot = slots.entry(key.clone()).or_default();
-        if slot.in_flight {
+        if let Some(failure) = slot.ended(generation) {
+            Claim::Ended(failure)
+        } else if slot.in_flight {
             Claim::Busy
         } else {
             slot.in_flight = true;
