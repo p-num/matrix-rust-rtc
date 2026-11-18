@@ -8,6 +8,8 @@ log only.
 
 ## Unreleased
 
+## v0.5.0-rc.11-letro.1 - 2026-11-18
+
 ### Added
 
 - Native membership snapshots expose join timestamps and conservative per-participation identity metadata (p-num/element-x-ios#411).
