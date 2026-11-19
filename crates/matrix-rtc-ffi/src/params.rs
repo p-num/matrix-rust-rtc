@@ -146,6 +146,9 @@ impl From<FfiCallKind> for matrix_rtc_call::CallKind {
 /// FFI-friendly join session parameters.
 #[derive(Clone, Debug, uniffi::Record)]
 pub struct FfiJoinSessionParams {
+    /// Opaque local routing context for this participation, never sent to Matrix.
+    #[uniffi(default = None)]
+    pub request_scope_id: Option<String>,
     /// The call slot to join, `m.call#{application_slot_id}`. `None` is the
     /// room-wide call, `room`.
     #[uniffi(default = None)]
@@ -330,6 +333,7 @@ impl FfiJoinSessionParams {
             options = options.slot(name);
         }
         let join = &mut options.join;
+        join.request_scope_id = self.request_scope_id;
         join.transport = self.transport.try_into()?;
         join.encryption_config = self.encryption_config.map(Into::into);
         join.keep_alive_timeout_ms = self.keep_alive_timeout_ms;

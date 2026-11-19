@@ -1,0 +1,11 @@
+# Copyright 2026 Element Creations Ltd.
+#
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+# Please see LICENSE in the repository root for full details.
+
+[bindings.kotlin]
+package_name = "org.matrix.rtc"
+cdylib_name = "matrix_rtc_ffi"
+android = false
+kotlin_target_version = "1.9"
+omit_checksums = true

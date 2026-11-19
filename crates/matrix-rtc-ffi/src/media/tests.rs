@@ -100,6 +100,7 @@ fn joined_call(mock: &Arc<MockHost>, transport: FfiJoinTransport) -> (Arc<RtcRoo
         let call = room
             .clone()
             .join_call(FfiJoinSessionParams {
+                request_scope_id: None,
                 application_slot_id: None,
                 call_intent: None,
                 transport,

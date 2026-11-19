@@ -210,10 +210,18 @@ impl<B: MatrixBackend + 'static> MatrixBackend for DialectBackend<B> {
         self.inner.own_device_id()
     }
 
-    fn for_own_membership(self: Arc<Self>, room_id: &str) -> Arc<Self> {
+    fn for_own_membership(
+        self: Arc<Self>,
+        room_id: &str,
+        request_scope_id: Option<&str>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             membership_dialect: Some(self.dialect(room_id)),
-            ..Self::new(self.inner.clone())
+            ..Self::new(
+                self.inner
+                    .clone()
+                    .for_own_membership(room_id, request_scope_id),
+            )
         })
     }
 

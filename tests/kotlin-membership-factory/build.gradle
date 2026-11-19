@@ -1,0 +1,52 @@
+// Copyright 2026 Element Creations Ltd.
+//
+// SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+// Please see LICENSE in the repository root for full details.
+
+repositories { mavenCentral() }
+
+configurations {
+    kotlinCompiler
+    fixtureRuntime
+}
+
+dependencies {
+    kotlinCompiler 'org.jetbrains.kotlin:kotlin-compiler-embeddable:1.9.25'
+    fixtureRuntime 'org.jetbrains.kotlin:kotlin-stdlib:1.9.25'
+    fixtureRuntime 'org.jetbrains.kotlinx:kotlinx-coroutines-core-jvm:1.7.3'
+    fixtureRuntime 'net.java.dev.jna:jna:5.19.1'
+}
+
+def fixtureJar = layout.buildDirectory.file('membership-factory-roundtrip.jar')
+def generated = layout.buildDirectory.file('generated/org/matrix/rtc/matrix_rtc_ffi.kt')
+def initializerSources = files(
+    '../../mobile/android/matrixrtc/src/main/kotlin/org/matrix/rtc/MatrixRtc.kt',
+    '../../mobile/android/matrixrtc/src/slim/kotlin/org/matrix/rtc/MediaCallbackThreads.kt',
+)
+
+tasks.register('compileFixture', JavaExec) {
+    classpath = configurations.kotlinCompiler
+    mainClass = 'org.jetbrains.kotlin.cli.jvm.K2JVMCompiler'
+    maxHeapSize = '2g'
+    inputs.files(generated, file('MembershipBackendFactoryRoundtrip.kt'), initializerSources)
+    outputs.file(fixtureJar)
+    doFirst {
+        args = ['-no-stdlib', '-no-reflect', '-jvm-target', '17', '-Xbackend-threads=2',
+                '-classpath', configurations.fixtureRuntime.asPath,
+                '-d', fixtureJar.get().asFile.absolutePath,
+                generated.get().asFile.absolutePath,
+                file('MembershipBackendFactoryRoundtrip.kt').absolutePath] + initializerSources.files.collect { it.absolutePath }
+    }
+}
+
+tasks.register('foreignFactoryRoundtrip', JavaExec) {
+    dependsOn 'compileFixture'
+    classpath = files(fixtureJar) + configurations.fixtureRuntime
+    mainClass = 'MembershipBackendFactoryRoundtripKt'
+    maxHeapSize = '1g'
+    systemProperty 'uniffi.component.matrix_rtc_ffi.libraryOverride', providers.gradleProperty('nativeLibrary').get()
+    systemProperty 'java.library.path', file(providers.gradleProperty('nativeLibrary').get()).parent
+    systemProperty 'kotlinx.coroutines.scheduler.core.pool.size', '2'
+    systemProperty 'kotlinx.coroutines.scheduler.max.pool.size', '2'
+    systemProperty 'kotlinx.coroutines.io.parallelism', '2'
+}

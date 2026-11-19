@@ -93,6 +93,8 @@ impl From<OpenError> for RtcError {
 /// A join into any application's slot.
 #[derive(Clone, Debug)]
 pub struct JoinOptions {
+    /// Opaque local backend-routing context; never part of membership content.
+    pub request_scope_id: Option<String>,
     /// Must start with `{application_type}#` (MSC4143).
     pub slot_id: String,
     pub application: ApplicationInfo,
@@ -115,6 +117,7 @@ impl JoinOptions {
     pub fn application(application: impl Into<ApplicationInfo>) -> Self {
         let application = application.into();
         Self {
+            request_scope_id: None,
             slot_id: matrix_rtc_core::slot_id_of(&application, ROOM_APPLICATION_SLOT_ID),
             application,
             transport: JoinTransport::Advertised,
@@ -580,6 +583,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         deadline: executor::Instant,
     ) -> Result<(OwnedMutexGuard<State<B>>, JoinSessionParams, Option<String>), RtcError> {
         let JoinOptions {
+            request_scope_id,
             slot_id,
             application,
             transport: _,
@@ -650,6 +654,7 @@ impl<B: MatrixBackend + 'static> RtcRoom<B> {
         }
 
         let mut params = JoinSessionParams {
+            request_scope_id,
             membership_id: None,
             slot_id,
             application,

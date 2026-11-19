@@ -129,6 +129,8 @@ pub enum TransportIntent {
 /// timings. The user and device are the backend's.
 #[derive(Clone, Debug)]
 pub struct JoinSessionParams {
+    /// Opaque local backend-routing context; never part of membership content.
+    pub request_scope_id: Option<String>,
     /// The `member.id` (and sticky key) for this join.
     ///
     /// MSC4143 requires this to be unique for *each* join, so that leaving and
@@ -190,6 +192,7 @@ impl JoinSessionParams {
         let application = application.into();
         let slot_id = slot_id_of(&application, ROOM_APPLICATION_SLOT_ID);
         Self {
+            request_scope_id: None,
             membership_id: None,
             slot_id,
             application,

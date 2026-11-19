@@ -323,7 +323,11 @@ pub trait MatrixBackend: MaybeSend {
 
     /// Captures routing for one participation, where the backend has mutable
     /// per-room configuration.
-    fn for_own_membership(self: Arc<Self>, _room_id: &str) -> Arc<Self>
+    fn for_own_membership(
+        self: Arc<Self>,
+        _room_id: &str,
+        _request_scope_id: Option<&str>,
+    ) -> Arc<Self>
     where
         Self: Sized,
     {

@@ -460,7 +460,9 @@ impl<T: MatrixBackend + 'static> SlotSession<T> {
             JoinError::CommandError(CommandError::from_message("no backend configured"))
         })?;
 
-        let backend = backend.clone().for_own_membership(&self.room_id);
+        let backend = backend
+            .clone()
+            .for_own_membership(&self.room_id, params.request_scope_id.as_deref());
         let membership_id = params.membership_id();
         let user_id = backend.own_user_id();
         let device_id = backend.own_device_id();

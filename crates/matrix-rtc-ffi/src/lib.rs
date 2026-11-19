@@ -33,7 +33,7 @@ mod runtime;
 pub use backend::{
     BackendSubscription, FfiBackend, FfiBackendError, FfiEventEncryption, FfiEventIn,
     FfiOpenIdToken, FfiRoomSubjects, FfiToDeviceDelivery, FfiToDeviceMessageIn,
-    FfiToDeviceRecipient, MatrixBackend, RoomSink, ToDeviceSink,
+    FfiToDeviceRecipient, MatrixBackend, MembershipBackendFactory, RoomSink, ToDeviceSink,
 };
 pub use compat::FfiMembershipFormat;
 pub use logging::{
@@ -364,6 +364,20 @@ impl RtcClient {
         log::info!("client: created over the host backend");
         Arc::new(Self {
             client: call::RtcClient::new(Arc::new(FfiBackend::new(backend))),
+        })
+    }
+
+    /// Uses a separately captured host endpoint for each joined participation.
+    #[uniffi::constructor]
+    pub fn new_with_membership_factory(
+        backend: Arc<dyn MatrixBackend>,
+        memberships: Arc<dyn MembershipBackendFactory>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            client: call::RtcClient::new(Arc::new(FfiBackend::with_membership_factory(
+                backend,
+                memberships,
+            ))),
         })
     }
 
@@ -1169,6 +1183,8 @@ uniffi::setup_scaffolding!();
 
 #[cfg(test)]
 mod tests {
+    mod membership_scope;
+
     use super::*;
     use crate::backend::test_support::{Carrier, MockHost};
     use crate::backend::{FfiEventEncryption, FfiEventIn};
@@ -1291,6 +1307,7 @@ mod tests {
 
     fn join_params() -> FfiJoinSessionParams {
         FfiJoinSessionParams {
+            request_scope_id: None,
             application_slot_id: None,
             call_intent: None,
             transport: FfiJoinTransport::Publish {

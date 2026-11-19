@@ -483,20 +483,74 @@ impl CoreSubscription for FfiSubscription {
     }
 }
 
+/// Selects one immutable host endpoint for a participation. Missing or retired
+/// scopes must resolve to a deny-joining view; the library never falls back.
+#[uniffi::export(with_foreign)]
+pub trait MembershipBackendFactory: Send + Sync {
+    fn for_membership(
+        &self,
+        room_id: String,
+        request_scope_id: Option<String>,
+    ) -> Arc<dyn MatrixBackend>;
+}
+
 /// The core's backend over the host's. Dialects and wire types are the
 /// wrapper's business (`DialectBackend`), so this only carries.
 pub struct FfiBackend {
     host: Arc<dyn MatrixBackend>,
+    memberships: Option<Arc<dyn MembershipBackendFactory>>,
+    #[cfg(test)]
+    send_barrier: Option<Arc<test_support::SendBarrier>>,
 }
 
 impl FfiBackend {
     pub fn new(host: Arc<dyn MatrixBackend>) -> Self {
-        Self { host }
+        Self {
+            host,
+            memberships: None,
+            #[cfg(test)]
+            send_barrier: None,
+        }
+    }
+
+    pub fn with_membership_factory(
+        host: Arc<dyn MatrixBackend>,
+        memberships: Arc<dyn MembershipBackendFactory>,
+    ) -> Self {
+        Self {
+            host,
+            memberships: Some(memberships),
+            #[cfg(test)]
+            send_barrier: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_send_barrier(mut self, barrier: Arc<test_support::SendBarrier>) -> Self {
+        self.send_barrier = Some(barrier);
+        self
     }
 }
 
 #[async_trait]
 impl CoreBackend for FfiBackend {
+    fn for_own_membership(
+        self: Arc<Self>,
+        room_id: &str,
+        request_scope_id: Option<&str>,
+    ) -> Arc<Self> {
+        match &self.memberships {
+            Some(factory) => Arc::new(Self {
+                host: factory
+                    .for_membership(room_id.to_owned(), request_scope_id.map(str::to_owned)),
+                memberships: None,
+                #[cfg(test)]
+                send_barrier: self.send_barrier.clone(),
+            }),
+            None => self,
+        }
+    }
+
     fn own_user_id(&self) -> String {
         self.host.own_user_id()
     }
@@ -515,6 +569,10 @@ impl CoreBackend for FfiBackend {
         let content_json = to_json(&content)?;
         let what = format!("sticky [{room_id}] type={event_type}");
         trace_command_content(&what, &content);
+        #[cfg(test)]
+        if let Some(barrier) = &self.send_barrier {
+            barrier.before_host(&room_id, &content).await;
+        }
         log_command(
             &what,
             self.host
@@ -653,6 +711,10 @@ impl CoreBackend for FfiBackend {
         let content_json = to_json(&content)?;
         let what = format!("state [{room_id}] type={event_type} state_key={state_key}");
         trace_command_content(&what, &content);
+        #[cfg(test)]
+        if let Some(barrier) = &self.send_barrier {
+            barrier.before_host(&room_id, &content).await;
+        }
         log_command(
             &what,
             self.host
@@ -671,6 +733,10 @@ impl CoreBackend for FfiBackend {
         let content_json = to_json(&content)?;
         let what = format!("room event [{room_id}] type={event_type}");
         trace_command_content(&what, &content);
+        #[cfg(test)]
+        if let Some(barrier) = &self.send_barrier {
+            barrier.before_host(&room_id, &content).await;
+        }
         log_command(
             &what,
             self.host
@@ -820,8 +886,83 @@ pub(crate) mod test_support {
         }
     }
 
+    #[derive(Clone, Debug)]
+    pub(crate) struct EndpointSend {
+        pub endpoint: String,
+        pub send: Send,
+    }
+
+    pub(crate) type SendTrace = Arc<Mutex<Vec<EndpointSend>>>;
+
+    #[derive(Default)]
+    pub(crate) struct SendBarrier {
+        armed: Mutex<Option<Arc<SendGate>>>,
+    }
+
+    struct SendGate {
+        room: String,
+        entered: tokio::sync::watch::Sender<bool>,
+        released: tokio::sync::watch::Sender<bool>,
+    }
+
+    pub(crate) struct SendHold(Arc<SendGate>);
+
+    impl SendHold {
+        pub async fn held(&self) {
+            let mut entered = self.0.entered.subscribe();
+            entered.wait_for(|held| *held).await.unwrap();
+        }
+        pub fn release(&self) {
+            self.0.released.send_replace(true);
+        }
+        pub fn is_released(&self) -> bool {
+            *self.0.released.borrow()
+        }
+    }
+
+    impl Drop for SendHold {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    impl SendBarrier {
+        pub fn arm(&self, room: &str) -> SendHold {
+            let gate = Arc::new(SendGate {
+                room: room.to_owned(),
+                entered: tokio::sync::watch::Sender::new(false),
+                released: tokio::sync::watch::Sender::new(false),
+            });
+            assert!(self.armed.lock().unwrap().replace(gate.clone()).is_none());
+            SendHold(gate)
+        }
+        pub(super) async fn before_host(&self, room: &str, content: &Value) {
+            let joining = content
+                .pointer("/member/membership")
+                .and_then(Value::as_str)
+                == Some("join")
+                || content.get(LEGACY_JOIN_ID_FIELD).is_some();
+            let gate = {
+                let mut armed = self.armed.lock().unwrap();
+                if joining && armed.as_ref().is_some_and(|gate| gate.room == room) {
+                    armed.take()
+                } else {
+                    None
+                }
+            };
+            if let Some(gate) = gate {
+                gate.entered.send_replace(true);
+                let mut release = gate.released.subscribe();
+                release.wait_for(|released| *released).await.unwrap();
+            }
+        }
+    }
+
     #[derive(Default)]
     pub(crate) struct MockHost {
+        pub sends_changed: tokio::sync::Notify,
+        pub endpoint_trace: Mutex<Option<(String, SendTrace)>>,
+        pub fail_sticky_once: Mutex<Option<FfiBackendError>>,
         pub sent_types: Mutex<Vec<String>>,
         pub sticky_duration_ms: Mutex<Option<u64>>,
         pub to_device: Mutex<Vec<ToDeviceSend>>,
@@ -863,12 +1004,17 @@ pub(crate) mod test_support {
             state_key: Option<String>,
             content_json: &str,
         ) {
-            self.sends.lock().unwrap().push(Send {
+            let send = Send {
                 carrier,
                 event_type: event_type.to_owned(),
                 state_key,
                 content: serde_json::from_str(content_json).unwrap_or(Value::Null),
-            });
+            };
+            self.sends.lock().unwrap().push(send.clone());
+            if let Some((endpoint, trace)) = self.endpoint_trace.lock().unwrap().clone() {
+                trace.lock().unwrap().push(EndpointSend { endpoint, send });
+            }
+            self.sends_changed.notify_waiters();
         }
 
         pub fn sends(&self) -> Vec<Send> {
@@ -974,6 +1120,9 @@ pub(crate) mod test_support {
             self.record(&event_type);
             *self.sticky_duration_ms.lock().unwrap() = Some(duration_ms);
             self.record_send(Carrier::Sticky, &event_type, None, &content_json);
+            if let Some(error) = self.fail_sticky_once.lock().unwrap().take() {
+                return Err(error);
+            }
             Ok(format!("$sticky-{}", self.sends.lock().unwrap().len()))
         }
 
