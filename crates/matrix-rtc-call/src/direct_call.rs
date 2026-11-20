@@ -497,6 +497,75 @@ impl RingJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::status::{CallEnd, CallStatus};
+    use matrix_rtc_core::{ApplicationInfo, EventOrigin};
+
+    const BOB: &str = "@bob:example.org";
+
+    fn sending_call() -> Arc<DirectCall> {
+        let clock: Clock = Arc::new(|| 1_000);
+        let status =
+            CallStatusCell::new_direct(clock.clone(), BOB.to_owned(), DirectCallState::Sending);
+        DirectCall::new(
+            "outgoing".to_owned(),
+            "@alice:example.org".to_owned(),
+            BOB.to_owned(),
+            clock,
+            &[],
+            DirectCallState::Sending,
+            status,
+        )
+    }
+
+    #[test]
+    fn a_successful_ring_response_after_pickup_keeps_the_call_connecting() {
+        let call = sending_call();
+        call.on_roster(&[JoinedMembership {
+            room_id: "!room:example.org".to_owned(),
+            slot_id: "m.call#room".to_owned(),
+            sender: BOB.to_owned(),
+            origin: EventOrigin::encrypted(Some("BOBDEV".to_owned())),
+            sticky_key: "bob-desktop".to_owned(),
+            member_id: "bob-desktop".to_owned(),
+            membership_event_id: Some("$pickup".to_owned()),
+            membership_ts: None,
+            legacy_join_id: Default::default(),
+            origin_server_ts: None,
+            application: ApplicationInfo::new("m.call"),
+            transports: Vec::new(),
+            can_subscribe: Vec::new(),
+        }]);
+        let status = call.status.subscribe();
+        assert_eq!(*status.borrow(), CallStatus::Connecting);
+
+        call.on_ring_sent("$late-ring".to_owned(), 1_005, 90_000);
+
+        assert_eq!(call.state(), DirectCallState::InCall { since_ms: 1_000 });
+        assert!(!status.has_changed().unwrap());
+    }
+
+    #[test]
+    fn a_successful_ring_response_after_leave_keeps_the_call_ended() {
+        let call = sending_call();
+        call.finish_left();
+        let status = call.status.subscribe();
+        assert_eq!(
+            *status.borrow(),
+            CallStatus::Ended {
+                reason: CallEnd::Left
+            }
+        );
+
+        call.on_ring_sent("$late-ring".to_owned(), 1_005, 90_000);
+
+        assert_eq!(
+            call.state(),
+            DirectCallState::Ended {
+                reason: DirectCallEnd::Left
+            }
+        );
+        assert!(!status.has_changed().unwrap());
+    }
 
     #[test]
     fn the_callee_is_the_only_other_joined_member() {

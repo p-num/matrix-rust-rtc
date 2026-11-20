@@ -407,6 +407,7 @@ mod tests {
         );
         media.connected();
         cell.on_direct(&DirectCallState::Ringing {
+            event_id: "$ring".to_owned(),
             sent_at_ms: 10,
             lifetime_ms: 90_000,
         });
@@ -415,6 +416,7 @@ mod tests {
             CallStatus::Calling {
                 callee: BOB.to_owned(),
                 ring: RingPhase::Ringing {
+                    event_id: "$ring".to_owned(),
                     sent_at_ms: 10,
                     lifetime_ms: 90_000
                 },

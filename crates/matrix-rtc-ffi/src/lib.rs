@@ -2036,6 +2036,33 @@ mod tests {
         room.shutdown().await;
     }
 
+    #[test]
+    fn ringing_status_preserves_each_calls_event_id_and_timing() {
+        for (event_id, sent_at_ms) in [("$first", 10), ("$redial", 40)] {
+            let status = call::CallStatus::Calling {
+                callee: "@bob:example.org".to_owned(),
+                ring: call::RingPhase::Ringing {
+                    event_id: event_id.to_owned(),
+                    sent_at_ms,
+                    lifetime_ms: 90_000,
+                },
+                media: call::MediaPhase::Connecting,
+            };
+            assert_eq!(
+                FfiCallStatus::from(status),
+                FfiCallStatus::Calling {
+                    callee: "@bob:example.org".to_owned(),
+                    ring: FfiRingPhase::Ringing {
+                        event_id: event_id.to_owned(),
+                        sent_at_ms,
+                        lifetime_ms: 90_000,
+                    },
+                    media: FfiMediaPhase::Connecting,
+                }
+            );
+        }
+    }
+
     /// The first `next` is the status now, and nothing follows `Ended`, so a
     /// host's loop over the subscription ends with the call.
     #[tokio::test]

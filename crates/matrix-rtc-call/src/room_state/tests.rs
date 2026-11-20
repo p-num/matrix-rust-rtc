@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use matrix_rtc_core::compat::ingest::outbound_dialect;
 use matrix_rtc_core::compat::{DialectBackend, MembershipFormat};
-use matrix_rtc_core::testing::MockBackend;
+use matrix_rtc_core::testing::{MockBackend, MockMethod, MockOutcome};
 use matrix_rtc_core::wire_event_type;
 use matrix_rtc_core::{
     ApplicationInfo, EventOrigin, JoinSessionParams, LeaveSessionParams, LiveKitTransport,
@@ -27,6 +27,7 @@ use crate::direct_call::{GroupNotify, RingConfig};
 use crate::intent::{CALL_INTENT_KEY, CallIntent};
 use crate::notification::{DEFAULT_RING_LIFETIME_MS, NOTIFICATION_EVENT_TYPE};
 use crate::reactions::ReactionSound;
+use crate::status::{CallEnd, CallStatus, RingPhase};
 
 const ROOM: &str = "!room:example.org";
 const SLOT: &str = "m.call#room";
@@ -1163,9 +1164,10 @@ async fn a_dm_call_rings_the_room_once_its_membership_is_sent() {
     assert!(matches!(
         state(&joined),
         DirectCallState::Ringing {
+            event_id,
             lifetime_ms: 90_000,
             ..
-        }
+        } if event_id == RING
     ));
 }
 
@@ -1276,7 +1278,11 @@ async fn a_dm_call_rings_with_a_room_event_in_the_room_state_format() {
     let sent = sender.room_events.lock().unwrap().clone();
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].1, wire_event_type(NOTIFICATION_EVENT_TYPE));
-    assert!(matches!(state(&joined), DirectCallState::Ringing { .. }));
+    assert!(matches!(
+        joined.status.status(),
+        CallStatus::Calling { ring: RingPhase::Ringing { event_id, .. }, .. }
+            if event_id == "$room-1"
+    ));
 
     call.on_timeline_events(&[decline("$from-bob", BOB, "$room-1")]);
     assert_eq!(state(&joined), ended(DirectCallEnd::Declined));
@@ -1286,17 +1292,46 @@ async fn a_dm_call_rings_with_a_room_event_in_the_room_state_format() {
 #[tokio::test(start_paused = true)]
 async fn a_decline_that_arrives_before_the_rings_id_still_counts() {
     let (mut call, sender, mut joined) = dm(&[BOB], Vec::new(), ring()).await;
-    *sender.sticky_event_error.lock().unwrap() = Some("offline".to_owned());
-    let _ring = start_ring(&call, &mut joined);
+    let previous_sends = sender.calls_to(MockMethod::StickyEvent).len();
+    sender.script(
+        MockMethod::StickyEvent,
+        [MockOutcome::After(
+            Duration::from_secs(1),
+            Box::new(MockOutcome::Ok),
+        )],
+    );
+    let ring = start_ring(&call, &mut joined);
     settle().await;
-
+    assert_eq!(
+        sender.calls_to(MockMethod::StickyEvent).len(),
+        previous_sends + 1
+    );
+    assert!(notifications_sent(&sender).is_empty());
+    let status = joined.status.subscribe();
     call.on_timeline_events(&[decline("$from-bob", BOB, RING)]);
     assert_eq!(state(&joined), DirectCallState::Sending);
+    assert!(matches!(
+        &*status.borrow(),
+        CallStatus::Calling {
+            ring: RingPhase::Sending,
+            ..
+        }
+    ));
+    assert!(!status.has_changed().unwrap());
 
-    *sender.sticky_event_error.lock().unwrap() = None;
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    ring.await.unwrap();
+    assert_eq!(
+        sender.calls_to(MockMethod::StickyEvent).len(),
+        previous_sends + 1
+    );
     assert_eq!(notifications_sent(&sender).len(), 1);
     assert_eq!(state(&joined), ended(DirectCallEnd::Declined));
+    assert_eq!(
+        joined.status.status(),
+        CallStatus::Ended {
+            reason: CallEnd::Declined
+        }
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -1330,7 +1365,62 @@ async fn a_ring_that_cannot_go_out_in_time_ends_the_call() {
     assert_eq!(state(&joined), DirectCallState::Sending);
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(state(&joined), ended(DirectCallEnd::RingNotSent));
+    assert_eq!(
+        joined.status.status(),
+        CallStatus::Ended {
+            reason: CallEnd::RingNotSent
+        }
+    );
     assert!(notifications_sent(&sender).is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn pickup_while_the_ring_send_is_pending_keeps_the_call_connecting() {
+    let (mut call, sender, mut joined) = dm(&[BOB], Vec::new(), ring()).await;
+    sender.script(MockMethod::StickyEvent, [MockOutcome::Hang]);
+    let sending = start_ring(&call, &mut joined);
+    settle().await;
+    assert!(matches!(
+        joined.status.status(),
+        CallStatus::Calling {
+            ring: RingPhase::Sending,
+            ..
+        }
+    ));
+
+    set_roster(
+        &mut call,
+        vec![member_event(BOB, Some("BOBDEV"), BOB_MEMBER, "$pickup")],
+    )
+    .await;
+    sending.await.unwrap();
+
+    assert_eq!(joined.status.status(), CallStatus::Connecting);
+    assert!(notifications_sent(&sender).is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn leaving_while_the_ring_send_is_pending_retires_the_attempt() {
+    let (mut call, sender, mut joined) = dm(&[BOB], Vec::new(), ring()).await;
+    sender.script(MockMethod::StickyEvent, [MockOutcome::Hang]);
+    let sending = start_ring(&call, &mut joined);
+    settle().await;
+    assert_eq!(state(&joined), DirectCallState::Sending);
+
+    call.leave(SLOT, LeaveSessionParams::new()).await.unwrap();
+    sending.await.unwrap();
+
+    assert_eq!(
+        joined.status.status(),
+        CallStatus::Ended {
+            reason: CallEnd::Left
+        }
+    );
+    assert!(
+        notifications_sent(&sender)
+            .iter()
+            .all(|(content, _)| content.get("lifetime").is_none())
+    );
 }
 
 #[tokio::test(start_paused = true)]

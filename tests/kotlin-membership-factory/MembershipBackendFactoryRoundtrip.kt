@@ -21,17 +21,18 @@ private const val STATE_MEMBER = "org.matrix.msc3401.call.member"
 private data class Send(val sequence: Int, val endpoint: String, val type: String, val content: String) {
     val joining get() = content.contains("\"membership\":\"join\"") || content.contains("\"io.letro.call.join_id\"")
     val membership get() = !type.startsWith("delayed:") && (type.endsWith("rtc.member") || type == STATE_MEMBER)
+    val ring get() = type == "org.matrix.msc4075.rtc.notification" && "\"lifetime\"" in content
 }
 
 private class Sends {
     private val sequence = AtomicInteger()
     val values = CopyOnWriteArrayList<Send>()
     private val events = Channel<Send>(Channel.UNLIMITED)
-    fun record(endpoint: String, type: String, content: String): String {
+    fun record(endpoint: String, type: String, content: String): Send {
         val send = Send(sequence.incrementAndGet(), endpoint, type, content)
         values += send
         check(events.trySend(send).isSuccess)
-        return "\$event-${send.sequence}"
+        return send
     }
     fun joins(endpoint: String) = values.filter { it.endpoint == endpoint && it.membership && it.joining }
     suspend fun await(predicate: (Send) -> Boolean) = withTimeout(6_000) {
@@ -41,12 +42,19 @@ private class Sends {
     }
 }
 
-private class Host(private val endpoint: String, private val sends: Sends, private val denied: Boolean = false) : MatrixBackend {
+private class Host(
+    private val endpoint: String,
+    private val sends: Sends,
+    private val denied: Boolean = false,
+    private val ringResponses: Channel<String>? = null,
+) : MatrixBackend {
     override fun ownUserId() = "@alice:example.org"
     override fun ownDeviceId() = "DEVICE"
-    private fun send(type: String, content: String): String {
+    private suspend fun send(type: String, content: String): String {
         if (denied) throw FfiBackendException.Failed("M_FORBIDDEN", 403u.toUShort(), null, true, "scope denied")
-        return sends.record(endpoint, type, content)
+        val sent = sends.record(endpoint, type, content)
+        if (sent.ring && ringResponses != null) return ringResponses.receive()
+        return "\$event-${sent.sequence}"
     }
     override suspend fun sendStickyEvent(roomId: String, eventType: String, contentJson: String, durationMs: ULong) = send(eventType, contentJson)
     override suspend fun sendStateEvent(roomId: String, eventType: String, stateKey: String, contentJson: String) = send(eventType, contentJson)
@@ -176,6 +184,39 @@ private suspend fun legacyConstructor(format: FfiMembershipFormat) {
     println("FOREIGN_FACTORY_LEGACY_CONSTRUCTOR $format PASS")
 }
 
+private suspend fun directRingStatus(format: FfiMembershipFormat) {
+    val sends = Sends()
+    val responses = Channel<String>()
+    val client = RtcClient(Host("caller", sends, ringResponses = responses))
+    val room = client.room(ROOM, FfiRoomOptions(format))
+    for (eventId in listOf("\$first-ring-from-server", "\$redial-ring-from-server")) {
+        val call = room.joinCall(params().copy(kind = FfiCallKind.Direct(FfiRingConfig())))
+        sends.await { it.ring }
+        val subscription = call.subscribeStatus()
+        val sending = call.status()
+        check(sending is FfiCallStatus.Calling && sending.callee == "@bob:example.org" && sending.ring == FfiRingPhase.Sending)
+        check(withTimeout(6_000) { subscription.next() } == sending)
+
+        withTimeout(6_000) { responses.send(eventId) }
+        val acknowledged = withTimeout(6_000) { subscription.next() }
+        check(acknowledged is FfiCallStatus.Calling && acknowledged.callee == sending.callee)
+        val ring = acknowledged.ring
+        check(ring is FfiRingPhase.Ringing && ring.eventId == eventId) { "Expected $eventId, received $ring" }
+        check(call.status() == acknowledged)
+
+        call.leave(FfiLeaveSessionParams(null))
+        val ended = FfiCallStatus.Ended(FfiCallEnd.Left)
+        check(withTimeout(6_000) { subscription.next() } == ended)
+        check(call.status() == ended)
+        subscription.close()
+        call.close()
+    }
+    room.shutdown()
+    room.close()
+    client.close()
+    println("DIRECT_RING_STATUS $format PASS sameRoomRedial=2 getter+subscription")
+}
+
 private fun factoryCallbacksStayAttached() {
     MatrixRtc.initialize()
     MatrixRtc.initialize()
@@ -197,6 +238,8 @@ private fun factoryCallbacksStayAttached() {
 
 fun main() = runBlocking {
     factoryCallbacksStayAttached()
+    directRingStatus(FfiMembershipFormat.ROOM_STATE)
+    directRingStatus(FfiMembershipFormat.MSC)
     for (format in listOf(FfiMembershipFormat.MSC, FfiMembershipFormat.ROOM_STATE)) {
         legacyConstructor(format)
         capturedViews(format)
