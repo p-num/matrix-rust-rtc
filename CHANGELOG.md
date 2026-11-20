@@ -8,6 +8,10 @@ log only.
 
 ## Unreleased
 
+### Added
+
+- Outgoing direct-call status exposes the Matrix event ID of the ring sent by that call (p-num/element-x-ios#425).
+
 ## v0.5.0-rc.11-letro.1 - 2026-11-18
 
 ### Added

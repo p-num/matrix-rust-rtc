@@ -63,6 +63,7 @@ impl From<CallStatus> for WasmCallStatus {
                     RingPhase::Ringing {
                         sent_at_ms,
                         lifetime_ms,
+                        ..
                     } => WasmRingPhase::Ringing {
                         sent_at_ms,
                         lifetime_ms,

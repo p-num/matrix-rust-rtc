@@ -940,9 +940,13 @@ impl From<call::CallEnd> for FfiCallEnd {
 pub enum FfiRingPhase {
     /// The ring is being sent: show that we are calling, without a ringback.
     Sending,
-    /// The ring went out at `sent_at_ms` and lasts `lifetime_ms`: play the
-    /// ringback.
-    Ringing { sent_at_ms: u64, lifetime_ms: u64 },
+    /// The homeserver accepted this call's ring as `event_id`. Play ringback
+    /// for `lifetime_ms` starting at `sent_at_ms`.
+    Ringing {
+        event_id: String,
+        sent_at_ms: u64,
+        lifetime_ms: u64,
+    },
 }
 
 impl From<call::RingPhase> for FfiRingPhase {
@@ -950,9 +954,11 @@ impl From<call::RingPhase> for FfiRingPhase {
         match value {
             call::RingPhase::Sending => Self::Sending,
             call::RingPhase::Ringing {
+                event_id,
                 sent_at_ms,
                 lifetime_ms,
             } => Self::Ringing {
+                event_id,
                 sent_at_ms,
                 lifetime_ms,
             },

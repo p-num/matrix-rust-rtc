@@ -156,8 +156,8 @@ pub(crate) enum DirectCallState {
     /// The ring is being sent. The host shows it is calling, without a
     /// ringback yet.
     Sending,
-    /// The ring went out at `sent_at_ms` and lasts `lifetime_ms`.
     Ringing {
+        event_id: String,
         sent_at_ms: u64,
         lifetime_ms: u64,
     },
@@ -200,9 +200,7 @@ struct Machine {
     /// Whether anyone but us has been in the call. Only then can the call end
     /// because they all left (spec 030 R26, R28).
     other_user_seen: bool,
-    /// Our ring, once sent: what a decline must relate to.
-    ring_event_id: Option<String>,
-    /// The callee's declines that arrived before `ring_event_id` was known.
+    /// The callee's declines that arrived before the ring's event ID was known.
     /// The sync carrying one can beat the response carrying the id.
     held_declines: Vec<RawTimelineEvent>,
 }
@@ -226,7 +224,6 @@ impl DirectCall {
                 callee,
                 clock,
                 other_user_seen,
-                ring_event_id: None,
                 held_declines: Vec::new(),
             }),
             state: watch::channel(initial).0,
@@ -316,15 +313,12 @@ impl DirectCall {
                     }
                     None
                 }
-                DirectCallState::Ringing { .. } => {
-                    let ring = machine.ring_event_id.as_deref()?;
-                    declines
-                        .into_iter()
-                        .any(|decline| relates_to(decline, ring))
-                        .then_some(DirectCallState::Ended {
-                            reason: DirectCallEnd::Declined,
-                        })
-                }
+                DirectCallState::Ringing { event_id, .. } => declines
+                    .into_iter()
+                    .any(|decline| relates_to(decline, event_id))
+                    .then_some(DirectCallState::Ended {
+                        reason: DirectCallEnd::Declined,
+                    }),
                 _ => None,
             }
         });
@@ -339,13 +333,13 @@ impl DirectCall {
                 .held_declines
                 .drain(..)
                 .any(|decline| relates_to(&decline, &event_id));
-            machine.ring_event_id = Some(event_id);
             Some(if declined {
                 DirectCallState::Ended {
                     reason: DirectCallEnd::Declined,
                 }
             } else {
                 DirectCallState::Ringing {
+                    event_id,
                     sent_at_ms,
                     lifetime_ms,
                 }

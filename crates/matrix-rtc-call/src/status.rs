@@ -54,8 +54,13 @@ pub enum RingPhase {
     /// The ring is being sent. The host shows it is calling, without a
     /// ringback yet.
     Sending,
-    /// The ring went out at `sent_at_ms` and lasts `lifetime_ms`.
-    Ringing { sent_at_ms: u64, lifetime_ms: u64 },
+    /// The homeserver accepted this call's ring as `event_id`. Its lifetime
+    /// starts at `sent_at_ms`.
+    Ringing {
+        event_id: String,
+        sent_at_ms: u64,
+        lifetime_ms: u64,
+    },
 }
 
 /// How far our own media has got.
@@ -169,14 +174,16 @@ impl Inputs {
             };
         }
         let ring = self.direct.as_ref().and_then(|direct| {
-            let ring = match direct.state {
+            let ring = match &direct.state {
                 DirectCallState::Sending => RingPhase::Sending,
                 DirectCallState::Ringing {
+                    event_id,
                     sent_at_ms,
                     lifetime_ms,
                 } => RingPhase::Ringing {
-                    sent_at_ms,
-                    lifetime_ms,
+                    event_id: event_id.clone(),
+                    sent_at_ms: *sent_at_ms,
+                    lifetime_ms: *lifetime_ms,
                 },
                 DirectCallState::InCall { .. } | DirectCallState::Ended { .. } => return None,
             };
